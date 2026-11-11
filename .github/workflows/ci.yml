@@ -97,22 +97,34 @@ jobs:
             pyproject.toml
             .python-version
           cache-suffix: ${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-locked
-      - name: Build once and capture digest
+      - name: Resolve exact distribution input identity
+        id: package
+        run: python3 scripts/ci_scope.py --distribution-key
+      - name: Restore exact distribution cache
+        id: distribution-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: dist/
+          key: dist-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ steps.package.outputs.input_hash }}
+      - name: Install locked build dependencies
+        run: uv sync --locked --no-install-project
+      - name: Build on exact cache miss
+        if: steps.distribution-cache.outputs.cache-hit != 'true'
         run: |
-          uv sync --locked --no-install-project
+          rm -rf dist
           uv build
-          python3 - <<'PY'
-          import hashlib, json
-          from pathlib import Path
-          wheels = list(Path('dist').glob('*.whl'))
-          assert len(wheels) == 1 and wheels[0].name.endswith('-py3-none-any.whl')
-          files = wheels + list(Path('dist').glob('*.tar.gz'))
-          assert len(files) == 2
-          Path('dist/digests.json').write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}))
-          PY
+          python3 scripts/ci_scope.py --record-dist dist
+      - name: Verify restored or built distribution
+        run: python3 scripts/ci_scope.py --verify-dist dist
+      - name: Save exact distribution cache
+        if: steps.distribution-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: dist/
+          key: dist-v1-${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-${{ steps.package.outputs.input_hash }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: distribution-${{ github.sha }}
+          name: distribution-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
@@ -141,25 +153,12 @@ jobs:
           cache-suffix: ${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-locked
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: distribution-${{ github.sha }}
+          name: distribution-${{ github.sha }}-${{ github.run_attempt }}
           path: dist/
       - name: Verify artifact bytes and install locked dependencies plus wheel
         shell: bash
         run: |
-          python3 - <<'PY'
-          import hashlib, json, os
-          from pathlib import Path
-          root = Path('dist')
-          manifest = json.loads((root / 'digests.json').read_text())
-          files = list(root.glob('*.whl')) + list(root.glob('*.tar.gz'))
-          assert {p.name for p in files} == set(manifest)
-          assert len(list(root.glob('*.whl'))) == 1
-          for path in files:
-              assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[path.name]
-          wheel = next(root.glob('*.whl')).resolve()
-          with open(os.environ['GITHUB_ENV'], 'a') as stream:
-              stream.write(f'VIDEOGENIE_TEST_WHEEL={wheel}\n')
-          PY
+          python3 scripts/ci_scope.py --verify-dist dist
           uv sync --locked --no-install-project
           uv pip install --python .venv/bin/python --no-deps dist/*.whl
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"

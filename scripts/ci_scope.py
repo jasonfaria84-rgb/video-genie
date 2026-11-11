@@ -1,10 +1,12 @@
 """Conservative CI selection and aggregate validation; no third-party dependencies."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict
 
@@ -212,6 +214,92 @@ def check_results(scope: Scope, results: dict[str, str]) -> bool:
     )
 
 
+PACKAGE_INPUTS = (
+    "src",
+    "tests",
+    "scripts",
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "LICENSE",
+    ".python-version",
+    ".github/workflows/ci.yml",
+)
+
+
+def distribution_input_hash(root: Path) -> str:
+    """Hash exact staged input paths, modes and blobs, independent of commit IDs."""
+    if git(root, "diff", "--name-only", "-z", "--", *PACKAGE_INPUTS):
+        raise ValueError("package inputs differ from the index")
+    if git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *PACKAGE_INPUTS):
+        raise ValueError("untracked package inputs")
+    entries = git(root, "ls-files", "--stage", "-z", "--", *PACKAGE_INPUTS)
+    if not entries:
+        raise ValueError("no package inputs")
+    for entry in entries.rstrip(b"\0").split(b"\0"):
+        header, separator, path = entry.partition(b"\t")
+        if not separator or not path or not re.fullmatch(rb"[0-7]{6} [0-9a-f]{40,64} 0", header):
+            raise ValueError("invalid or unmerged index entry")
+    return hashlib.sha256(entries).hexdigest()
+
+
+def distribution_names(root: Path) -> set[str]:
+    """Resolve the two expected distribution names from the package metadata."""
+    with (root / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    name, version = project["name"], project["version"]
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise ValueError("invalid package name")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9][A-Za-z0-9.!+_-]*", version):
+        raise ValueError("invalid package version")
+    name = re.sub(r"[-_.]+", "_", name).lower()
+    return {f"{name}-{version}-py3-none-any.whl", f"{name}-{version}.tar.gz"}
+
+
+def verify_distribution(root: Path, dist: Path) -> Path:
+    """Fail closed on missing, extra, symlinked or digest-mismatched cache artifacts."""
+    expected = distribution_names(root)
+    if dist.is_symlink() or not dist.is_dir():
+        raise ValueError("distribution directory missing or symlinked")
+    paths = list(dist.iterdir())
+    if {p.name for p in paths} != expected | {"digests.json"}:
+        raise ValueError("unexpected distribution files")
+    if any(p.is_symlink() or not p.is_file() for p in paths):
+        raise ValueError("distribution contains non-regular files")
+    manifest = json.loads((dist / "digests.json").read_text())
+    if not isinstance(manifest, dict) or set(manifest) != expected:
+        raise ValueError("invalid distribution manifest")
+    for name in expected:
+        digest = manifest[name]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid artifact digest")
+        if hashlib.sha256((dist / name).read_bytes()).hexdigest() != digest:
+            raise ValueError("artifact digest mismatch")
+    return next(dist.glob("*.whl")).resolve()
+
+
+def record_distribution(root: Path, dist: Path) -> None:
+    """Record freshly built outputs, then apply the same validation as a cache hit."""
+    expected = distribution_names(root)
+    if dist.is_symlink() or not dist.is_dir():
+        raise ValueError("build directory missing or symlinked")
+    # uv creates this output-directory marker; it is not a distribution artifact.
+    marker = dist / ".gitignore"
+    if marker.exists() or marker.is_symlink():
+        if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != b"*":
+            raise ValueError("unexpected build directory marker")
+        marker.unlink()
+    if dist.is_symlink() or {p.name for p in dist.iterdir()} != expected:
+        raise ValueError("unexpected build outputs")
+    if any(p.is_symlink() or not p.is_file() for p in dist.iterdir()):
+        raise ValueError("build outputs must be regular files")
+    manifest = {
+        name: hashlib.sha256((dist / name).read_bytes()).hexdigest() for name in sorted(expected)
+    }
+    (dist / "digests.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    verify_distribution(root, dist)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="")
@@ -219,7 +307,27 @@ def main() -> int:
     parser.add_argument("--pull-request", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--check-results", action="store_true")
+    parser.add_argument("--distribution-key", action="store_true")
+    parser.add_argument("--verify-dist", type=Path)
+    parser.add_argument("--record-dist", type=Path)
     args = parser.parse_args()
+    if args.distribution_key:
+        digest = distribution_input_hash(Path.cwd())
+        print(digest)
+        if output := os.environ.get("GITHUB_OUTPUT"):
+            with Path(output).open("a") as stream:
+                stream.write(f"input_hash={digest}\n")
+        return 0
+    if args.record_dist is not None:
+        record_distribution(Path.cwd(), args.record_dist)
+        return 0
+    if args.verify_dist is not None:
+        wheel = verify_distribution(Path.cwd(), args.verify_dist)
+        print(wheel)
+        if output := os.environ.get("GITHUB_ENV"):
+            with Path(output).open("a") as stream:
+                stream.write(f"VIDEOGENIE_TEST_WHEEL={wheel}\n")
+        return 0
     if args.check_results:
         try:
             scope = validate_scope(json.loads(os.environ["SCOPE_JSON"]))

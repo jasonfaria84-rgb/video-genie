@@ -155,3 +155,116 @@ def test_aggregate_requires_exact_required_results(root: Path) -> None:
     ):
         with pytest.raises(ValueError):
             module.validate_scope({**full, field: bad})
+
+
+@pytest.mark.parametrize("change", ["content", "rename", "delete", "mode"])
+def test_distribution_key_tracks_index_inputs(tmp_path: Path, change: str) -> None:
+    module = selector()
+
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(["git", *args], cwd=tmp_path)
+
+    git("init", "-q")
+    source = tmp_path / "src" / "sample.py"
+    source.parent.mkdir()
+    source.write_text("original\n")
+    (tmp_path / "README.md").write_text("readme\n")
+    git("add", ".")
+    before = module.distribution_input_hash(tmp_path)
+    if change == "content":
+        source.write_text("changed\n")
+        with pytest.raises(ValueError, match="differ from the index"):
+            module.distribution_input_hash(tmp_path)
+        git("add", ".")
+    elif change == "rename":
+        git("mv", "src/sample.py", "src/renamed.py")
+    elif change == "delete":
+        source.unlink()
+        git("add", "-u")
+    else:
+        source.chmod(0o755)
+        git("add", ".")
+    assert module.distribution_input_hash(tmp_path) != before
+
+
+def test_distribution_key_reuses_only_unchanged_package_inputs(tmp_path: Path) -> None:
+    module = selector()
+
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(["git", *args], cwd=tmp_path)
+
+    git("init", "-q")
+    git("config", "user.name", "CI test")
+    git("config", "user.email", "ci@example.invalid")
+    (tmp_path / "README.md").write_text("packaged metadata\n")
+    git("add", ".")
+    git("commit", "-qm", "initial")
+    first = module.distribution_input_hash(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("development guidance\n")
+    git("add", ".")
+    git("commit", "-qm", "non-package docs")
+    assert module.distribution_input_hash(tmp_path) == first
+    for name in module.PACKAGE_INPUTS:
+        if name in {"src", "tests", "scripts"}:
+            path = tmp_path / name / "added.py"
+        else:
+            path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("new package input\n")
+        git("add", ".")
+        current = module.distribution_input_hash(tmp_path)
+        assert current != first, name
+        first = current
+    untracked = tmp_path / "src" / "untracked.py"
+    untracked.write_text("untracked\n")
+    with pytest.raises(ValueError, match="untracked"):
+        module.distribution_input_hash(tmp_path)
+
+
+@pytest.fixture
+def distributions(tmp_path: Path) -> tuple[Path, Path]:
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "video-genie"\nversion = "0.1.0"\n')
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / ".gitignore").write_bytes(b"*")
+    for name in selector().distribution_names(tmp_path):
+        (dist / name).write_bytes(b"test artifact bytes")
+    selector().record_distribution(tmp_path, dist)
+    return tmp_path, dist
+
+
+def test_distribution_validation_roundtrip(distributions: tuple[Path, Path]) -> None:
+    root, dist = distributions
+    wheel = selector().verify_distribution(root, dist)
+    assert wheel == (dist / "video_genie-0.1.0-py3-none-any.whl").resolve()
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "extra", "wrong-name", "bytes", "manifest", "digest", "symlink"]
+)
+def test_distribution_validation_fails_closed(
+    distributions: tuple[Path, Path], damage: str
+) -> None:
+    root, dist = distributions
+    wheel = dist / "video_genie-0.1.0-py3-none-any.whl"
+    manifest = dist / "digests.json"
+    if damage == "missing":
+        wheel.unlink()
+    elif damage == "extra":
+        (dist / "unexpected.whl").write_bytes(b"extra")
+    elif damage == "wrong-name":
+        wheel.rename(dist / "video_genie-0.2.0-py3-none-any.whl")
+    elif damage == "bytes":
+        wheel.write_bytes(b"tampered")
+    elif damage == "manifest":
+        manifest.write_text('{"../escape": "wrong"}')
+    elif damage == "digest":
+        data = json.loads(manifest.read_text())
+        data[wheel.name] = "wrong"
+        manifest.write_text(json.dumps(data))
+    else:
+        target = root / "outside.whl"
+        wheel.rename(target)
+        wheel.symlink_to(target)
+    with pytest.raises(ValueError):
+        selector().verify_distribution(root, dist)
