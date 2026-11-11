@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run the complete public test suite
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: '0.11.28'
+  PYTHON_VERSION: '3.12.13'
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+      build: ${{ steps.scope.outputs.build }}
+      runtime: ${{ steps.scope.outputs.runtime }}
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select complete changed scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          FULL: ${{ inputs.full }}
+        run: |
+          args=(--base "$BASE" --head "$HEAD")
+          if [ "$EVENT" = pull_request ]; then args+=(--pull-request); fi
+          if [ "$EVENT" = schedule ] || [ "$EVENT" = merge_group ] || [ "$FULL" = true ]; then
+            args+=(--full)
+          fi
+          python3 scripts/ci_scope.py "${args[@]}"
+
+  qa:
+    needs: select
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/check_repository_hygiene.py
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        if: needs.select.outputs.mode != 'metadata'
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            .python-version
+          cache-suffix: ${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-locked
+      - if: needs.select.outputs.mode != 'metadata'
+        run: |
+          uv sync --locked
+          uv run --locked ruff check src tests scripts
+          uv run --locked ruff format --check src tests scripts
+          uv run --locked mypy .
+
+  build:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            .python-version
+          cache-suffix: ${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-locked
+      - name: Build once and capture digest
+        run: |
+          uv sync --locked --no-install-project
+          uv build
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          wheels = list(Path('dist').glob('*.whl'))
+          assert len(wheels) == 1 and wheels[0].name.endswith('-py3-none-any.whl')
+          files = wheels + list(Path('dist').glob('*.tar.gz'))
+          assert len(files) == 2
+          Path('dist/digests.json').write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: distribution-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  runtime:
+    needs: [select, build]
+    if: needs.select.outputs.runtime == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+            .python-version
+          cache-suffix: ${{ runner.os }}-${{ runner.arch }}-py${{ env.PYTHON_VERSION }}-uv${{ env.UV_VERSION }}-locked
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: distribution-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact bytes and install locked dependencies plus wheel
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('dist')
+          manifest = json.loads((root / 'digests.json').read_text())
+          files = list(root.glob('*.whl')) + list(root.glob('*.tar.gz'))
+          assert {p.name for p in files} == set(manifest)
+          assert len(list(root.glob('*.whl'))) == 1
+          for path in files:
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[path.name]
+          wheel = next(root.glob('*.whl')).resolve()
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'VIDEOGENIE_TEST_WHEEL={wheel}\n')
+          PY
+          uv sync --locked --no-install-project
+          uv pip install --python .venv/bin/python --no-deps dist/*.whl
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Ensure real media tools
+        if: needs.select.outputs.mode != 'metadata'
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            if [ "$RUNNER_OS" = Linux ]; then
+              sudo apt-get update
+              sudo apt-get install --yes ffmpeg
+            else
+              brew install ffmpeg
+            fi
+          fi
+          ffmpeg -version
+          ffprobe -version
+      - name: Verify installed package outside checkout
+        shell: bash
+        run: |
+          python="$PWD/.venv/bin/python"
+          cli="$PWD/.venv/bin/videogenie"
+          cd "$RUNNER_TEMP"
+          "$python" -I -c 'import videogenie; assert "site-packages" in videogenie.__file__; print(videogenie.__file__)'
+          "$cli" --version
+          "$python" -I -m videogenie --help
+      - name: Run selected suites against installed wheel
+        env:
+          SCOPE_JSON: ${{ needs.select.outputs.scope }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import importlib.util, json, os, subprocess, sys
+          spec = importlib.util.spec_from_file_location('ci_scope', 'scripts/ci_scope.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          scope = module.validate_scope(json.loads(os.environ['SCOPE_JSON']))
+          if scope['tests']:
+              subprocess.run([sys.executable, '-m', 'pytest', *scope['tests']], check=True)
+          elif scope['mode'] != 'metadata':
+              raise SystemExit('Empty runtime test scope')
+          PY
+
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [select, qa, build, runtime]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require every selected job to succeed
+        env:
+          SCOPE_JSON: ${{ needs.select.outputs.scope }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_scope.py --check-results

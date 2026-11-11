@@ -1,0 +1,46 @@
+# Media and project data never committed
+media/
+*.mov
+*.mp4
+*.mxf
+*.braw
+*.wav
+.env
+.env.*
+!.env.example
+
+# Local Python environments and generated artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
+# Keep production workspaces and local runtime state out of the product repo.
+/productions/
+/.videogenie/
+/.claude/scheduled_tasks.lock
+.venv-*/
+node_modules/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.cleobundle.tar.gz
+*.pem
+*.key
+.npmrc
+.pnpmrc
+
+# Local creative reference libraries; promote reusable code explicitly.
+/docs/creative/
+/docs/pilots/
+/docs/research/idall-ai-reference/
+/docs/research/higgsfield-ai-creation-course-reference.md
