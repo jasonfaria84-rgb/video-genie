@@ -1,0 +1,15 @@
+name: Request a VideoGenie capability
+description: Describe the workflow and expected result.
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and expected behavior
+      description: Include reproducible steps and relevant versions. Redact credentials and private media.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and related CLEO task
+      description: Include errors or verification output and a task ID when available.
