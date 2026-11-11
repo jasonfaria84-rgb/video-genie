@@ -268,3 +268,88 @@ def test_distribution_validation_fails_closed(
         wheel.symlink_to(target)
     with pytest.raises(ValueError):
         selector().verify_distribution(root, dist)
+
+
+@pytest.mark.parametrize(
+    "path", ["src/videogenie/cli/__init__.py", "src/videogenie/adapters/mcp_server.py"]
+)
+def test_transport_edits_cover_both_installed_consumers(root: Path, path: str) -> None:
+    module = selector()
+    changes = [{"status": "M", "old": None, "new": path}]
+    scope = module.select(changes, root)
+    assert scope["mode"] == "targeted"
+    assert {"tests/test_external_install.py", "tests/test_local_studio_install.py"} <= set(
+        scope["tests"]
+    )
+    (root / "tests/test_local_studio_install.py").unlink()
+    assert module.select(changes, root)["mode"] == "full"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_studio_contracts.py",
+        "test_studio.py",
+        "test_activity.py",
+        "test_local_studio_install.py",
+    ],
+)
+def test_studio_tests_are_known_and_selectable(root: Path, name: str) -> None:
+    path = "tests/" + name
+    module = selector()
+    scope = module.select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted" and scope["tests"] == [path]
+    assert module.validate_scope(scope) == scope
+    (root / path).unlink()
+    assert module.select([{"status": "M", "old": None, "new": path}], root)["mode"] == "full"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/videogenie/contracts/studio.py",
+        "src/videogenie/core/studio.py",
+        "src/videogenie/core/activity.py",
+    ],
+)
+def test_studio_shared_contracts_and_core_preserve_full_fallback(root: Path, path: str) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "full" and scope["tests"] == ["tests"]
+
+
+@pytest.mark.parametrize("path", ["scripts/dogfood_local_studio.py", "docs/local-studio-proof.md"])
+def test_studio_harness_and_proof_select_installed_consumer(root: Path, path: str) -> None:
+    module = selector()
+    changes = [{"status": "M", "old": None, "new": path}]
+    scope = module.select(changes, root)
+    assert scope["mode"] == "targeted"
+    assert scope["tests"] == ["tests/test_local_studio_install.py"]
+    (root / "tests/test_local_studio_install.py").unlink()
+    assert module.select(changes, root)["mode"] == "full"
+
+
+def test_legacy_discovery_requires_original_tools_and_allows_additions() -> None:
+    path = Path(__file__).resolve().parents[1] / "scripts/dogfood_external_agent.py"
+    spec = importlib.util.spec_from_file_location("legacy_consumer", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    required = {
+        "videogenie_capabilities",
+        "videogenie_project_create",
+        "videogenie_project_list",
+        "videogenie_project_get",
+        "videogenie_project_rename",
+        "videogenie_project_archive",
+        "videogenie_project_restore",
+        "videogenie_media_probe",
+        "videogenie_job_get",
+        "videogenie_job_resume",
+    }
+    assert module.LEGACY_TOOLS == required
+    additions = {"videogenie_client_create", "videogenie_project_duration"}
+    module.require_legacy_tools(required)
+    module.require_legacy_tools(required | additions)
+    for missing in required:
+        with pytest.raises(AssertionError, match="Missing legacy tools"):
+            module.require_legacy_tools((required - {missing}) | additions)
