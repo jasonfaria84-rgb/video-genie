@@ -214,7 +214,9 @@ class DurationReport(_DurationMetrics):
     project_id: Identifier
     as_of: Timestamp
     project_created_at: Timestamp
-    project_elapsed_seconds: Seconds
+    project_age_seconds: Seconds
+    project_elapsed_end_at: Timestamp | None
+    project_elapsed_seconds: Seconds | None
     cycle_elapsed_seconds: Seconds
     cycles: tuple[CycleDuration, ...]
     raw_wait_intervals: tuple[WaitInterval, ...]
@@ -223,8 +225,23 @@ class DurationReport(_DurationMetrics):
     @model_validator(mode="after")
     def anchored_report(self) -> Self:
         elapsed = _seconds(self.project_created_at, self.as_of)
-        if not isclose(self.project_elapsed_seconds, elapsed, rel_tol=0, abs_tol=1e-6):
-            raise ValueError("Project elapsed must retain its original creation anchor")
+        if not isclose(self.project_age_seconds, elapsed, rel_tol=0, abs_tol=1e-6):
+            raise ValueError("Project age must retain its original creation anchor")
+        if not self.cycles:
+            if self.project_elapsed_seconds is not None or self.project_elapsed_end_at is not None:
+                raise ValueError("No recorded cycles means completion elapsed is unknown")
+        else:
+            latest = self.cycles[-1]
+            endpoint = min(latest.closed_at or self.as_of, self.as_of, key=datetime.fromisoformat)
+            if self.project_elapsed_end_at != endpoint or self.project_elapsed_seconds is None:
+                raise ValueError("Project elapsed endpoint must reflect the latest visible cycle")
+            if not isclose(
+                self.project_elapsed_seconds,
+                _seconds(self.project_created_at, endpoint),
+                rel_tol=0,
+                abs_tol=1e-6,
+            ):
+                raise ValueError("Project elapsed must retain its original creation anchor")
         if self.cycle_elapsed_seconds > elapsed + 1e-6:
             raise ValueError("Cycle elapsed exceeds project elapsed")
         if not isclose(

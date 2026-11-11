@@ -1,6 +1,7 @@
 """Studio wire contracts distinguish observed time from unknown history."""
 
 import json
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -66,6 +67,8 @@ def report_payload() -> dict[str, object]:
         "project_id": PROJECT,
         "project_created_at": "2025-12-31T23:59:00Z",
         "as_of": END,
+        "project_age_seconds": 120.0,
+        "project_elapsed_end_at": END,
         "project_elapsed_seconds": 120.0,
         "cycle_elapsed_seconds": 60.0,
         "cycles": (summary,),
@@ -250,13 +253,88 @@ def test_legacy_duration_does_not_invent_zero_active_wait_or_idle() -> None:
         "unknown_seconds": 120.0,
         "coverage_notes": ("No explicit lifecycle coverage for historical project",),
         "activity_revision": 0,
+        "project_elapsed_seconds": None,
+        "project_elapsed_end_at": None,
     }
     report = DurationReport.model_validate(payload)
     decoded = json.loads(report.model_dump_json())
     assert decoded["processing_active_seconds_known"] is None
-    assert decoded["project_elapsed_seconds"] == decoded["unknown_seconds"] == 120
+    assert decoded["project_age_seconds"] == decoded["unknown_seconds"] == 120
+    assert decoded["project_elapsed_seconds"] is None
     with pytest.raises(ValidationError, match="coverage"):
         DurationReport.model_validate(payload | {"coverage_notes": ()})
+
+
+def test_completion_freezes_while_age_grows_and_reopening_preserves_prior_cycle() -> None:
+    def instant(second: int) -> str:
+        return (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=second)).isoformat()
+
+    first_id, second_id = str(uuid4()), str(uuid4())
+
+    def summary(cycle_id: str, ordinal: int, opened: int, closed: int, as_of: int) -> CycleDuration:
+        elapsed = float(min(closed, as_of) - opened)
+        return CycleDuration.model_validate(
+            {
+                "project_id": PROJECT,
+                "cycle_id": cycle_id,
+                "ordinal": ordinal,
+                "opened_at": instant(opened),
+                "closed_at": instant(closed),
+                "outcome": "completed",
+                **metrics(
+                    processing_active_seconds_known=0.0,
+                    processing_attempt_seconds_known=0.0,
+                    owner_wait_seconds=0.0,
+                    client_wait_seconds=0.0,
+                    input_wait_seconds=0.0,
+                    idle_seconds_known=elapsed,
+                    unknown_seconds=0.0,
+                    coverage_notes=(),
+                ),
+                "elapsed_seconds": elapsed,
+            }
+        )
+
+    for as_of, endpoint, expected in ((30, 20, 10), (35, 20, 10), (45, 45, 35), (60, 50, 40)):
+        cycles: tuple[CycleDuration, ...] = (summary(first_id, 1, 12, 20, as_of),)
+        if as_of >= 40:
+            cycles += (summary(second_id, 2, 40, 50, as_of),)
+        observed = sum(item.elapsed_seconds for item in cycles)
+        report = DurationReport.model_validate(
+            {
+                **report_payload(),
+                **metrics(
+                    processing_active_seconds_known=0.0,
+                    processing_attempt_seconds_known=0.0,
+                    owner_wait_seconds=0.0,
+                    client_wait_seconds=0.0,
+                    input_wait_seconds=0.0,
+                    idle_seconds_known=observed,
+                    unknown_seconds=float(as_of - 10) - observed,
+                    coverage_notes=("Between-cycle gaps are not observed work",),
+                ),
+                "project_created_at": instant(10),
+                "as_of": instant(as_of),
+                "project_age_seconds": float(as_of - 10),
+                "project_elapsed_end_at": instant(endpoint),
+                "project_elapsed_seconds": float(expected),
+                "cycles": cycles,
+                "cycle_elapsed_seconds": observed,
+                "raw_wait_intervals": (),
+            }
+        )
+        assert report.project_elapsed_seconds == expected
+        assert report.cycles[0].elapsed_seconds == 8
+        assert report.cycles[0].cycle_id == first_id
+        if as_of > endpoint:
+            with pytest.raises(ValidationError, match="endpoint"):
+                DurationReport.model_validate(
+                    report.model_dump()
+                    | {
+                        "project_elapsed_end_at": instant(as_of),
+                        "project_elapsed_seconds": report.project_age_seconds,
+                    }
+                )
 
 
 def test_report_rejects_reversed_unclipped_or_foreign_intervals() -> None:
