@@ -25,6 +25,12 @@ class Scope(TypedDict):
     changed: list[Change]
 
 
+DOCUMENTATION_ONLY = {
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/ISSUE_TEMPLATE/help_question.yml",
+}
+
 KNOWN_TESTS = {
     "tests/test_cli.py",
     "tests/test_cli_operations.py",
@@ -90,7 +96,7 @@ def select(changes: list[Change], root: Path) -> Scope:
             build = True
         elif path == "docs/external-agent-proof.md":
             selected.add("tests/test_external_install.py")
-        elif path.startswith("docs/") and path.endswith(".md"):
+        elif path in DOCUMENTATION_ONLY:
             continue
         elif path in KNOWN_TESTS:
             selected.add(path)

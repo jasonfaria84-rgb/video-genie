@@ -37,6 +37,9 @@ def root(tmp_path: Path) -> Path:
         ".github/workflows/ci.yml",
         "tests/conftest.py",
         "tests/new_test.py",
+        "docs/usage.md",
+        "docs/provider-examples.md",
+        ".github/ISSUE_TEMPLATE/config.yml",
         "unknown.txt",
         "scripts/new.py",
     ],
@@ -68,7 +71,9 @@ def test_added_deleted_renamed_never_skip(root: Path, status: str) -> None:
 
 def test_metadata_and_distribution_docs(root: Path) -> None:
     module = selector()
-    scope = module.select([{"status": "M", "old": None, "new": "docs/usage.md"}], root)
+    scope = module.select(
+        [{"status": "M", "old": None, "new": ".github/ISSUE_TEMPLATE/bug_report.yml"}], root
+    )
     assert scope["mode"] == "metadata" and scope["tests"] == []
     assert not scope["build"] and not scope["runtime"]
     scope = module.select([{"status": "M", "old": None, "new": "README.md"}], root)
