@@ -15,18 +15,6 @@ from videogenie.contracts.models import Identifier, Project, ResultEnvelope, Vid
 from videogenie.core.jobs import Job, JobService
 from videogenie.core.service import VideoGenieService
 
-OPERATIONS = (
-    "capabilities",
-    "project.create",
-    "project.list",
-    "project.get",
-    "project.rename",
-    "project.archive",
-    "project.restore",
-    "media.probe",
-    "job.get",
-    "job.resume",
-)
 EXIT_CODES = {
     "INVALID_ARGUMENT": 2,
     "UNSUPPORTED_SCHEMA": 2,
@@ -83,6 +71,44 @@ class _Probe(_ProjectID):
 
 class _JobID(_ProjectID):
     job_id: Identifier
+
+
+INPUT_MODELS: dict[str, type[_Input]] = {
+    "capabilities": _Input,
+    "project.create": _Create,
+    "project.list": _List,
+    "project.get": _ProjectID,
+    "project.rename": _Rename,
+    "project.archive": _Revision,
+    "project.restore": _Revision,
+    "media.probe": _Probe,
+    "job.get": _JobID,
+    "job.resume": _JobID,
+}
+OPERATIONS = tuple(INPUT_MODELS)
+
+
+def _operation_help(operation: str, as_json: bool) -> None:
+    schema = TypeAdapter(dict[str, JsonValue]).validate_python(
+        INPUT_MODELS[operation].model_json_schema()
+    )
+    command = operation.replace(".", " ")
+    help_text = (
+        f"usage: videogenie [--data-dir PATH] {command} [--json] [--input-json -]\n\n"
+        "Send one JSON object on stdin with --input-json -. "
+        "The schema lists required fields, types, and defaults.\n"
+        "Help does not read stdin or open project storage.\n\n"
+        f"Input schema for {operation}:\n{json.dumps(schema, indent=2)}\n"
+    )
+    if as_json:
+        print(
+            ResultEnvelope[dict[str, JsonValue]](
+                success=True,
+                data={"operation": operation, "input_schema": schema, "help": help_text},
+            ).model_dump_json()
+        )
+    else:
+        print(help_text, end="")
 
 
 def _pairs(items: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -206,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"videogenie {installed}")
             return 0
-        if arguments.help or arguments.command is None:
+        if arguments.command is None:
             if arguments.json:
                 print(
                     ResultEnvelope[dict[str, str]](
@@ -221,6 +247,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise VideoGenieError(
                 "INVALID_ARGUMENT", "unrecognized arguments: unsupported operation"
             )
+        if arguments.help:
+            _operation_help(operation, arguments.json)
+            return 0
         payload = _input(arguments.input_json)
         service = VideoGenieService(arguments.data_dir)
         result = _dispatch(service, operation, payload)

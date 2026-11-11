@@ -470,3 +470,79 @@ def test_not_found_and_storage_failures(executable: Path, tmp_path: Path) -> Non
     unsupported = invoke(executable, tmp_path, future, ["project", "list"], expected=2)
     assert isinstance(unsupported["error"], dict)
     assert unsupported["error"]["code"] == "UNSUPPORTED_SCHEMA"
+
+
+@pytest.mark.parametrize(
+    ("operation", "required"),
+    [
+        ("capabilities", set()),
+        ("project.create", {"name", "idempotency_key"}),
+        ("project.list", set()),
+        ("project.get", {"project_id"}),
+        ("project.rename", {"project_id", "name", "expected_revision"}),
+        ("project.archive", {"project_id", "expected_revision"}),
+        ("project.restore", {"project_id", "expected_revision"}),
+        ("media.probe", {"project_id", "storyline_id", "path", "idempotency_key"}),
+        ("job.get", {"project_id", "job_id"}),
+        ("job.resume", {"project_id", "job_id"}),
+    ],
+)
+def test_operation_schema_without_state(
+    executable: Path, tmp_path: Path, operation: str, required: set[str]
+) -> None:
+    state = tmp_path / "never-created"
+    result = data(
+        invoke(executable, tmp_path, state, [*operation.split("."), "--help"], raw="invalid JSON")
+    )
+    assert result["operation"] == operation
+    schema = result["input_schema"]
+    assert isinstance(schema, dict)
+    assert schema["type"] == "object" and schema["additionalProperties"] is False
+    fields = schema["properties"]
+    assert isinstance(fields, dict)
+    required_fields = schema.get("required", [])
+    assert isinstance(required_fields, list)
+    assert all(isinstance(field, str) for field in required_fields)
+    assert set(required_fields) == required
+    assert required <= fields.keys()
+    if operation == "project.list":
+        assert fields["include_archived"] == {
+            "default": False,
+            "title": "Include Archived",
+            "type": "boolean",
+        }
+    if "expected_revision" in fields:
+        revision = fields["expected_revision"]
+        assert isinstance(revision, dict) and revision["minimum"] == 1
+    assert not state.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_human_operation_help_without_state(executable: Path, tmp_path: Path) -> None:
+    state = tmp_path / "never-created"
+    result = subprocess.run(
+        [str(executable), "--data-dir", str(state), "media", "probe", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert result.stderr == ""
+    assert "usage: videogenie [--data-dir PATH] media probe" in result.stdout
+    assert "--input-json -" in result.stdout
+    assert all(name in result.stdout for name in ("project_id", "storyline_id", "idempotency_key"))
+    schema = json.loads(result.stdout.split("Input schema for media.probe:\n", 1)[1])
+    assert "path" in schema["required"]
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("command", [["unknown"], ["project", "unknown"], ["media", "render"]])
+def test_unknown_operation_help_is_structured(
+    executable: Path, tmp_path: Path, command: list[str]
+) -> None:
+    state = tmp_path / "never-created"
+    response = invoke(executable, tmp_path, state, [*command, "--help"], expected=2)
+    error = response["error"]
+    assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
+    assert not state.exists()
