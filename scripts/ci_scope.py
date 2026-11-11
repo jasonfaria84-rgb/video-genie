@@ -41,12 +41,17 @@ KNOWN_TESTS = {
     "tests/test_projects.py",
     "tests/test_external_install.py",
     "tests/test_ci_scope.py",
+    "tests/test_studio_contracts.py",
+    "tests/test_studio.py",
+    "tests/test_activity.py",
+    "tests/test_local_studio_install.py",
 }
 TRANSPORT_TESTS = {
     "tests/test_cli.py",
     "tests/test_cli_operations.py",
     "tests/test_mcp.py",
     "tests/test_external_install.py",
+    "tests/test_local_studio_install.py",
 }
 
 
@@ -98,6 +103,8 @@ def select(changes: list[Change], root: Path) -> Scope:
             build = True
         elif path == "docs/external-agent-proof.md":
             selected.add("tests/test_external_install.py")
+        elif path in {"scripts/dogfood_local_studio.py", "docs/local-studio-proof.md"}:
+            selected.add("tests/test_local_studio_install.py")
         elif path in DOCUMENTATION_ONLY:
             continue
         elif path in KNOWN_TESTS:

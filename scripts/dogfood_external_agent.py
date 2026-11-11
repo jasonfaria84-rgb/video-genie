@@ -20,6 +20,24 @@ from uuid import UUID
 from mcp import ClientSession, StdioServerParameters, stdio_client
 from pydantic import JsonValue
 
+LEGACY_TOOLS = {
+    "videogenie_capabilities",
+    "videogenie_project_create",
+    "videogenie_project_list",
+    "videogenie_project_get",
+    "videogenie_project_rename",
+    "videogenie_project_archive",
+    "videogenie_project_restore",
+    "videogenie_media_probe",
+    "videogenie_job_get",
+    "videogenie_job_resume",
+}
+
+
+def require_legacy_tools(names: set[str]) -> None:
+    """Require the independent original tool contract while allowing supported additions."""
+    assert LEGACY_TOOLS <= names, f"Missing legacy tools: {sorted(LEGACY_TOOLS - names)}"
+
 
 def object_value(value: JsonValue) -> dict[str, JsonValue]:
     """Require an object at a public JSON boundary."""
@@ -209,7 +227,7 @@ class Consumer:
                     tools=tools.model_dump(mode="json"),
                 )
                 names = {tool.name for tool in tools.tools}
-                assert len(names) == 10 and "videogenie_media_probe" in names
+                require_legacy_tools(names)
                 yield client
         self.log.record("mcp-closed", folder=folder)
 
