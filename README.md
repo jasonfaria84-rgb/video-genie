@@ -10,12 +10,12 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 67 shared agent operations: projects and clients, cycles and
+This source exposes 68 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests, output selection, dead-space removal, a
 DaVinci Resolve status check, word-level transcripts made in Resolve, and
-timeline assembly in Resolve. Seven additive discovery reads preserve the earlier
+timeline assembly and rendering in Resolve. Seven additive discovery reads preserve the earlier
 54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
@@ -251,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 67 agent operations. Replace spaces in each CLI command
+The server exposes the same 68 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -471,6 +471,20 @@ adds audio fades at each join. `timeline_name` must be new; existing timelines a
 never edited. The result reports the timeline's ID, length in frames and seconds,
 and `cut_points_seconds`, the output times of every join, which `render.check`-style
 reviews can use.
+
+## Render a timeline from DaVinci Resolve
+
+`resolve render` renders one timeline of the project's own Resolve project to a
+new `.mp4` or `.mov` file with H.264, using a Resolve render preset (default
+`H.264 Master`). Resolve renders into a private folder under the data directory;
+VideoGenie checks that the file's duration matches the timeline, then publishes it
+to `output_path`, which must not exist. If the render fails or passes
+`timeout_seconds`, it is stopped and nothing is published.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","output_path":"/absolute/final.mp4"}' \
+  | videogenie resolve render --json --input-json -
+```
 
 ## Recover a probe job
 

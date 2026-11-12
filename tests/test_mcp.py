@@ -90,6 +90,7 @@ EXPECTED_OPERATIONS = [
     "transcript.create",
     "transcript.get",
     "resolve.timeline.assemble",
+    "resolve.render",
 ]
 
 

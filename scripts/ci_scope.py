@@ -75,6 +75,7 @@ KNOWN_TESTS = {
     "tests/test_recipe_render_install.py",
     "tests/test_recipes.py",
     "tests/test_resolve.py",
+    "tests/test_resolve_render.py",
     "tests/test_silence.py",
     "tests/test_render_contracts.py",
     "tests/test_render_jobs.py",
@@ -99,6 +100,7 @@ TRANSPORT_TESTS = {
     "tests/test_silence.py",
     "tests/test_transcription.py",
     "tests/test_assembly.py",
+    "tests/test_resolve_render.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -124,6 +126,7 @@ RENDER_TESTS = (
 # Explicit shared test fixtures, including indirect consumers. The inventory test
 # checks real Python imports so a new helper edge cannot silently narrow selection.
 TEST_IMPORTERS = {
+    "test_assembly": {"test_resolve_render"},
     "test_costs": {"test_authority"},
     "test_authority": {
         "test_cli_discovery",
@@ -207,12 +210,14 @@ PATH_TESTS = {
         "tests/test_resolve.py",
         "tests/test_transcription.py",
         "tests/test_assembly.py",
+        "tests/test_resolve_render.py",
     },
     "src/videogenie/core/transcription.py": {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
     },
     "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
+    "src/videogenie/core/resolve_render.py": {"tests/test_resolve_render.py"},
     "src/videogenie/core/transcripts.py": {
         "tests/test_transcripts.py",
         "tests/test_transcription.py",
