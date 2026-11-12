@@ -1,0 +1,55 @@
+{
+  "schema_version": "1",
+  "source": {
+    "repository_url": "https://github.com/rsms/inter",
+    "release_url": "https://github.com/rsms/inter/releases/tag/v4.1",
+    "release_tag": "v4.1",
+    "release_commit": "e3a3d4c57d5ecc01453a575621882a384c1995a3",
+    "release_id": 185731254,
+    "release_immutable": false,
+    "observed_at": "2026-11-12T01:28:45.757519+00:00",
+    "archive": {
+      "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+      "asset_id": 206862670,
+      "byte_size": 33707794,
+      "sha256": "9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e",
+      "upstream_digest": null
+    },
+    "verification": "Hashes are observed from the official release. The release URL and tag are mutable; verify exact bytes before reuse. No upstream signed digest or reproducible-build attestation is claimed."
+  },
+  "font": {
+    "file": "Inter-Bold.ttf",
+    "archive_member": "extras/ttf/Inter-Bold.ttf",
+    "byte_size": 420428,
+    "sha256": "288316099b1e0a47a4716d159098005eef7c0066921f34e3200393dbdb01947f",
+    "media_type": "font/ttf",
+    "family": "Inter",
+    "style": "Bold",
+    "full_name": "Inter Bold",
+    "postscript_name": "Inter-Bold",
+    "version": "Version 4.001;git-9221beed3",
+    "embedded_git_commit": "9221beed3e5b521ce94050ca542f568755c17c22",
+    "weight_class": 700,
+    "variable": false,
+    "modified": false,
+    "version_note": "The official v4.1 release ships this unchanged face with internal version 4.001; the embedded commit precedes the release tag by one commit."
+  },
+  "license": {
+    "file": "OFL.txt",
+    "archive_member": "LICENSE.txt",
+    "license_id": "OFL-1.1",
+    "source_url": "https://github.com/rsms/inter/blob/e3a3d4c57d5ecc01453a575621882a384c1995a3/LICENSE.txt",
+    "text_sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a",
+    "git_blob_sha": "9b2ca37b3ffc77391d8b2ebef4a974ef32bf46ea",
+    "byte_size": 4380,
+    "asserted_at": "2026-11-12T01:28:45.757519+00:00",
+    "copyright": "Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)",
+    "notice": "OFL.txt is the complete unchanged upstream license and copyright notice. The font remains OFL-1.1, not the application MIT license; retain this notice with redistributed font copies."
+  },
+  "fixture": {
+    "name": "JOSÉ NÚÑEZ-ØSTBY",
+    "role": "COMMUNITY GARDEN VOLUNTEER",
+    "coverage": "Every codepoint in the fictional name and role is present in this exact font cmap. Shaping, layout, overflow and rendered output require separate renderer verification.",
+    "distribution": "Test/source-distribution fixture only. Installed proofs must explicitly supply and import this font with its license; the runtime wheel does not bundle it. No system-font fallback."
+  }
+}
