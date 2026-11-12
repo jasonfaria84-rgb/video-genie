@@ -51,6 +51,7 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
             except ValueError as exc:
                 raise VideoGenieError("INVALID_ARGUMENT", "Input must contain finite JSON") from exc
             model.model_validate_json(encoded, strict=True)
+            # Dotted names reach into nested objects; an omitted optional object is skipped.
             path_fields = {
                 "media.probe": ("path",),
                 "asset.register": ("source_path",),
@@ -58,9 +59,14 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "media.silence.remove": ("source_path", "output_path"),
                 "transcript.create": ("source_path",),
                 "resolve.render": ("output_path",),
+                "captions.create": ("output_path", "burn_in.video_path", "burn_in.output_path"),
             }.get(operation, ())
             for path_field in path_fields:
-                path = raw.get(path_field)
+                parent_name, _, name = path_field.rpartition(".")
+                holder = raw.get(parent_name) if parent_name else raw
+                if parent_name and holder is None:
+                    continue
+                path = holder.get(name) if isinstance(holder, dict) else None
                 if not isinstance(path, str) or not Path(path).is_absolute():
                     raise VideoGenieError("INVALID_ARGUMENT", "MCP file paths must be absolute")
             value = _dispatch(service, operation, raw)

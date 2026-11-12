@@ -94,6 +94,7 @@ EXPECTED_OPERATIONS = [
     "resolve.color.apply",
     "edit.cuts.plan",
     "edit.cuts.get",
+    "captions.create",
 ]
 
 

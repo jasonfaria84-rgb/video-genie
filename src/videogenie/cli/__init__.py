@@ -26,6 +26,7 @@ from videogenie.contracts.authority import (
     ReviewInput,
     SelectOutputInput,
 )
+from videogenie.contracts.captions import CreateCaptionsInput
 from videogenie.contracts.color import ApplyColorInput
 from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.discovery import (
@@ -107,6 +108,7 @@ from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
+from videogenie.workers.captions import create_captions
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -243,6 +245,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "resolve.color.apply": ApplyColorInput,
     "edit.cuts.plan": PlanCutsInput,
     "edit.cuts.get": GetCutPlanInput,
+    "captions.create": CreateCaptionsInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -307,13 +310,22 @@ def _context_id(value: JsonValue | None) -> str | None:
     return None
 
 
-def _strict_json(payload: dict[str, JsonValue]) -> str:
-    """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
+def _anchor(payload: dict[str, JsonValue], fields: tuple[str, ...]) -> dict[str, JsonValue]:
+    """Resolve relative CLI file paths against the current folder; other values pass."""
     anchored = dict(payload)
-    for field in ("source_path", "output_path"):
+    for field in fields:
         value = anchored.get(field)
         if isinstance(value, str) and value and "://" not in value:
             anchored[field] = value if Path(value).is_absolute() else str(Path.cwd() / value)
+    return anchored
+
+
+def _strict_json(payload: dict[str, JsonValue]) -> str:
+    """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
+    anchored = _anchor(payload, ("source_path", "output_path"))
+    burn_in = anchored.get("burn_in")
+    if isinstance(burn_in, dict):
+        anchored["burn_in"] = _anchor(burn_in, ("video_path", "output_path"))
     return json.dumps(anchored, allow_nan=False)
 
 
@@ -479,6 +491,7 @@ def _dispatch(
                 "resolve.color.apply",
                 "edit.cuts.plan",
                 "edit.cuts.get",
+                "captions.create",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -538,6 +551,9 @@ def _dispatch(
     if operation == "resolve.status":
         checked = ResolveStatusInput.model_validate_json(_strict_json(payload))
         return resolve_status(checked.timeout_seconds)
+    if operation == "captions.create":
+        captions = CreateCaptionsInput.model_validate_json(_strict_json(payload))
+        return create_captions(service, captions)
     if operation in {"media.silence.detect", "media.silence.remove"}:
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
@@ -635,7 +651,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "command",
         nargs="?",
         help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
-        "artifact, cost, approval, grant, output, resolve, edit, or explicit owner launch",
+        "artifact, cost, approval, grant, output, resolve, edit, captions, overlay, "
+        "or explicit owner launch",
     )
     parser.add_argument(
         "action",
