@@ -26,6 +26,16 @@ from videogenie.contracts.authority import (
     SelectOutputInput,
 )
 from videogenie.contracts.costs import CostReportInput
+from videogenie.contracts.discovery import (
+    ApprovalOutcome,
+    ApprovalOutcomeInput,
+    ListApprovalsInput,
+    ListBrandVersionsInput,
+    ListGrantsInput,
+    ListOutputReviewsInput,
+    ListRecipeVersionsInput,
+    ProjectRecipeContextInput,
+)
 from videogenie.contracts.models import (
     ContractModel,
     Identifier,
@@ -70,6 +80,7 @@ from videogenie.core.activity import ActivityService
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.costs import CostService
+from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
@@ -194,6 +205,13 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "output.review.get": ReviewInput,
     "output.select": SelectOutputInput,
     "output.selection.get": ProjectAuthorityScope,
+    "recipe.version.list": ListRecipeVersionsInput,
+    "brand.version.list": ListBrandVersionsInput,
+    "project.recipe.context": ProjectRecipeContextInput,
+    "grant.list": ListGrantsInput,
+    "approval.outcome.get": ApprovalOutcomeInput,
+    "output.review.list": ListOutputReviewsInput,
+    "approval.list": ListApprovalsInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -273,6 +291,21 @@ def _recipe_dispatch(
         }
     # JSON mode preserves strict numbers/bools while accepting JSON arrays for tuple fields.
     request = INPUT_MODELS[operation].model_validate_json(json.dumps(payload, allow_nan=False))
+    # Read-only discovery precedes initializing services and broader legacy input types.
+    if isinstance(request, ListRecipeVersionsInput):
+        return DiscoveryService(service).list_recipe_versions(request)
+    if isinstance(request, ListBrandVersionsInput):
+        return DiscoveryService(service).list_brand_versions(request)
+    if isinstance(request, ProjectRecipeContextInput):
+        return DiscoveryService(service).project_recipe_context(request)
+    if isinstance(request, ListGrantsInput):
+        return DiscoveryService(service).list_grants(request)
+    if isinstance(request, ApprovalOutcomeInput):
+        return DiscoveryService(service).approval_outcome(request)
+    if isinstance(request, ListOutputReviewsInput):
+        return DiscoveryService(service).list_output_reviews(request)
+    if isinstance(request, ListApprovalsInput):
+        return DiscoveryService(service).list_approvals(request)
     if isinstance(request, RegisterAssetInput):
         return AssetService(service).register_asset(request)
     if isinstance(request, AssetLookupInput):
@@ -365,7 +398,7 @@ def _result_context(
     if isinstance(result, RenderResult):
         request = result.manifest.request
         return request.project_id, request.storyline_id
-    if isinstance(result, OwnerChallenge):
+    if isinstance(result, (OwnerChallenge, ApprovalOutcome)):
         action = result.action
         scoped = getattr(action, "target", getattr(action, "terms", action))
         return (
