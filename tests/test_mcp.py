@@ -45,6 +45,38 @@ EXPECTED_OPERATIONS = [
     "project.cycle.close",
     "project.wait.set",
     "project.duration",
+    "asset.register",
+    "asset.get",
+    "asset.verify",
+    "recipe.draft.create",
+    "recipe.draft.update",
+    "recipe.draft.get",
+    "recipe.draft.list",
+    "recipe.version.get",
+    "brand.draft.create",
+    "brand.draft.update",
+    "brand.draft.get",
+    "brand.draft.list",
+    "brand.version.get",
+    "recipe.preview",
+    "recipe.compare",
+    "brand.compare",
+    "project.recipe.bind",
+    "project.recipe.get",
+    "graphics.render_lower_third",
+    "render.job.get",
+    "render.job.resume",
+    "render.job.list",
+    "artifact.get",
+    "artifact.list",
+    "cost.report",
+    "approval.request",
+    "approval.get",
+    "grant.get",
+    "output.review.prepare",
+    "output.review.get",
+    "output.select",
+    "output.selection.get",
 ]
 
 
@@ -58,7 +90,7 @@ def write_media(path: Path) -> None:
 
 
 @asynccontextmanager
-async def connect(root: Path, cwd: Path) -> AsyncIterator[ClientSession]:
+async def connect(root: Path, cwd: Path, *, timeout: float = 20) -> AsyncIterator[ClientSession]:
     """Launch a fresh installed entry point from an unrelated directory."""
     cwd.mkdir(exist_ok=True)
     params = StdioServerParameters(
@@ -68,7 +100,7 @@ async def connect(root: Path, cwd: Path) -> AsyncIterator[ClientSession]:
         env={"PATH": os.environ["PATH"]},
     )
     async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write, read_timeout_seconds=20) as client:
+        async with ClientSession(read, write, read_timeout_seconds=timeout) as client:
             discovery = await client.discover()
             assert client.protocol_version == "2026-07-28"
             assert "2026-07-28" in discovery.supported_versions
