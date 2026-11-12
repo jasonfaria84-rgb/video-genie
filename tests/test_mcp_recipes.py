@@ -180,6 +180,7 @@ def test_asset_paths_and_nested_provenance_remain_strict(tmp_path: Path) -> None
         async with connect(root, tmp_path / "mcp") as client:
             invalid_changes: tuple[dict[str, JsonValue], ...] = (
                 {"source_path": "relative.ttf"},
+                {"source_path": str(source.parent / ".." / "fonts" / source.name)},
                 {"max_bytes": "500000"},
                 {"origin": '{"kind":"referenced"}'},
             )
@@ -191,6 +192,21 @@ def test_asset_paths_and_nested_provenance_remain_strict(tmp_path: Path) -> None
             lookup = {key: registered[key] for key in ("asset_id", "version_id")}
             assert data(cli(root, tmp_path / "cli", "asset.get", lookup)) == registered
             assert data(await call(client, "asset_verify", lookup)) == registered
+            alias = tmp_path / "font-alias.ttf"
+            alias.symlink_to(source.resolve())
+            via_alias = data(
+                await call(
+                    client,
+                    "asset_register",
+                    payload
+                    | {
+                        "source_path": str(alias),
+                        "idempotency_key": "alias",
+                    },
+                )
+            )
+            assert via_alias["sha256"] == registered["sha256"]
+            assert via_alias["byte_size"] == registered["byte_size"]
 
     asyncio.run(scenario())
 
@@ -266,9 +282,12 @@ def test_real_render_artifacts_costs_review_and_restart(plan: Planning, tmp_path
                 mode="json"
             )
             artifact_input = scope | {"artifact_id": job.result_ref.artifact_id}
-            artifact = RenderResult.model_validate_json(
-                json.dumps(data(cli(root, tmp_path / "cli", "artifact.get", artifact_input)))
+            artifact_response = cli(root, tmp_path / "cli", "artifact.get", artifact_input)
+            assert (artifact_response.project_id, artifact_response.storyline_id) == (
+                value.project_id,
+                value.storyline_id,
             )
+            artifact = RenderResult.model_validate_json(json.dumps(data(artifact_response)))
             assert len(artifact.manifest.decoded_frame_sha256) == 150
             assert (
                 hashlib.sha256((root / artifact.artifact.locator).read_bytes()).hexdigest()
@@ -333,9 +352,12 @@ def test_real_render_artifacts_costs_review_and_restart(plan: Planning, tmp_path
             assert data(await call(client, "render_job_resume", selected)) == job.model_dump(
                 mode="json"
             )
-            assert data(await call(client, "artifact_get", artifact_input)) == artifact.model_dump(
-                mode="json"
+            artifact_response = await call(client, "artifact_get", artifact_input)
+            assert (artifact_response.project_id, artifact_response.storyline_id) == (
+                value.project_id,
+                value.storyline_id,
             )
+            assert data(artifact_response) == artifact.model_dump(mode="json")
             assert data(await call(client, "cost_report", frozen)) == report.model_dump(mode="json")
             assert data(await call(client, "output_selection_get", scope))["selection"] == selection
             wrong_scope = await call(
