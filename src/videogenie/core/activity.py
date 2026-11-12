@@ -357,7 +357,8 @@ class ActivityService:
     def duration_report(self, project_id: str, as_of: str | None = None) -> DurationReport:
         """Report creation age, frozen completion spans and disjoint observed cycle time."""
         args = _validate(DurationReportInput, project_id=project_id, as_of=as_of)
-        instant = datetime.fromisoformat(args.as_of) if args.as_of else _now()
+        now = _now()
+        instant = datetime.fromisoformat(args.as_of) if args.as_of else now
         end = instant.timestamp()
         with self.service.connection() as connection:
             project = self.service.require_project(connection, args.project_id)
@@ -367,6 +368,12 @@ class ActivityService:
                     "INVALID_ARGUMENT",
                     "as_of precedes project creation",
                     details={"reason": "clock_reversal"},
+                )
+            if instant > now:
+                raise VideoGenieError(
+                    "INVALID_ARGUMENT",
+                    "as_of is later than the service clock; request present or past activity",
+                    details={"reason": "future_as_of"},
                 )
             activity = self._activity(connection, args.project_id)
             visible = tuple(cycle for cycle in activity.cycles if _stamp(cycle.opened_at) <= end)

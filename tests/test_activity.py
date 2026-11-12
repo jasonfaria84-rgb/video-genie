@@ -48,6 +48,47 @@ def counts(activity: ActivityService) -> tuple[int, ...]:
         )
 
 
+def test_duration_rejects_future_without_mutation_and_captures_clock_once(
+    scene: tuple[ActivityService, Project, list[float]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    activity, project, clock = scene
+    opened = activity.open_cycle(project.project_id, 0)
+    clock[0] = 14
+    calls = [0]
+
+    def service_clock() -> datetime:
+        calls[0] += 1
+        return BASE + timedelta(seconds=clock[0])
+
+    monkeypatch.setattr(module, "_now", service_clock)
+    before_counts = counts(activity)
+    before_bytes = activity.service.db_path.read_bytes()
+    for future in (stamp(14.000001), "2026-01-01T01:00:15+01:00"):
+        calls[0] = 0
+        with pytest.raises(VideoGenieError) as rejected:
+            activity.duration_report(project.project_id, future)
+        assert rejected.value.code == "INVALID_ARGUMENT"
+        assert rejected.value.details == {"reason": "future_as_of"}
+        assert calls[0] == 1
+    assert activity.get_activity(project.project_id) == opened
+    assert counts(activity) == before_counts
+    assert activity.service.db_path.read_bytes() == before_bytes
+    calls[0] = 0
+    present = activity.duration_report(project.project_id)
+    assert calls[0] == 1 and present.as_of == stamp(14)
+    calls[0] = 0
+    assert activity.duration_report(project.project_id, stamp(14)) == present
+    assert calls[0] == 1
+    past = activity.duration_report(project.project_id, stamp(13))
+    clock[0] = 20
+    assert activity.duration_report(project.project_id, stamp(13)) == past
+    with pytest.raises(VideoGenieError) as before_creation:
+        activity.duration_report(project.project_id, stamp(9))
+    assert before_creation.value.details == {"reason": "clock_reversal"}
+    assert counts(activity) == before_counts
+    assert activity.service.db_path.read_bytes() == before_bytes
+
+
 def add_attempt(
     activity: ActivityService,
     project: Project,
@@ -101,6 +142,7 @@ def test_completion_reopen_historical_snapshot_and_archive(
     closed = activity.close_cycle(pid, first, 1)
     assert closed.revision == 2 and closed.current_cycle is None
     for at in (30, 35):
+        clock[0] = at
         report = activity.duration_report(pid, stamp(at))
         assert report.project_age_seconds == at - 10
         assert report.project_elapsed_seconds == 10
@@ -112,10 +154,12 @@ def test_completion_reopen_historical_snapshot_and_archive(
     assert reopened.current_cycle is not None
     second = reopened.current_cycle.cycle_id
     assert first != second
+    clock[0] = 45
     report = activity.duration_report(pid, stamp(45))
     assert report.project_elapsed_seconds == 35 and report.cycle_elapsed_seconds == 13
     clock[0] = 50
     activity.close_cycle(pid, second, 3, "cancelled")
+    clock[0] = 60
     report = activity.duration_report(pid, stamp(60))
     assert report.project_elapsed_seconds == 40 and report.cycle_elapsed_seconds == 18
     assert report.unknown_seconds == 32
@@ -155,6 +199,7 @@ def test_union_sum_wait_priority_and_unknown_are_separate(
     add_attempt(activity, project, 42, 48, "interrupted")
     clock[0] = 50
     activity.close_cycle(pid, cid, 5)
+    clock[0] = 60
     report = activity.duration_report(pid, stamp(60))
     assert report.processing_active_seconds_known == 13
     assert report.processing_attempt_seconds_known == 18
@@ -192,6 +237,7 @@ def test_later_completion_does_not_backfill_historical_processing(
     activity, project, clock = scene
     activity.open_cycle(project.project_id, 0)
     attempt_id = add_attempt(activity, project, 14, None, "running")
+    clock[0] = 20
     before = activity.duration_report(project.project_id, stamp(20))
     assert before.processing_active_seconds_known == 0
     assert before.cycles[0].unknown_seconds == 6
@@ -200,6 +246,7 @@ def test_later_completion_does_not_backfill_historical_processing(
             "UPDATE job_attempts SET status='succeeded',ended_at=? WHERE attempt_id=?",
             (BASE.timestamp() + 25, attempt_id),
         )
+    clock[0] = 30
     assert activity.duration_report(project.project_id, stamp(20)) == before
     after = activity.duration_report(project.project_id, stamp(30))
     assert after.processing_active_seconds_known == 11
@@ -211,14 +258,16 @@ def test_legacy_no_cycle_and_clock_uncertainty(
 ) -> None:
     activity, project, clock = scene
     add_attempt(activity, project, 11, 12)
+    clock[0] = 20
     report = activity.duration_report(project.project_id, stamp(20))
     assert report.project_age_seconds == report.unknown_seconds == 10
     assert report.project_elapsed_seconds is None and report.project_elapsed_end_at is None
     assert report.processing_active_seconds_known is None and report.idle_seconds_known is None
     assert counts(activity) == (0, 0, 0, 0)
     activity.open_cycle(project.project_id, 0)
-    add_attempt(activity, project, 15, 14, "failed")
-    report = activity.duration_report(project.project_id, stamp(20))
+    add_attempt(activity, project, 23, 22, "failed")
+    clock[0] = 28
+    report = activity.duration_report(project.project_id, stamp(28))
     assert report.cycles[0].unknown_seconds == 5
     assert any("clock" in note for note in report.coverage_notes)
     before = counts(activity)
@@ -246,6 +295,7 @@ def test_fractional_wait_clear_duplicate_and_queue_history(
     activity.set_wait(project.project_id, cid, 3, "owner")
     clock[0] = 13.25
     closed = activity.close_cycle(project.project_id, cid, 4)
+    clock[0] = 14
     report = activity.duration_report(project.project_id, stamp(14))
     assert closed.revision == 5 and closed.active_wait is None
     assert report.owner_wait_seconds == 0.75
@@ -266,6 +316,7 @@ def test_fractional_wait_clear_duplicate_and_queue_history(
             "SELECT * FROM job_attempts WHERE attempt_id=?", (attempt,)
         ).fetchone()
         connection.execute("DELETE FROM job_attempts WHERE attempt_id=?", (attempt,))
+    clock[0] = 20
     historical = activity.duration_report(project.project_id, stamp(20))
     assert historical.cycles[-1].unknown_seconds == 4
     assert historical.cycles[-1].processing_active_seconds_known == 0
@@ -274,6 +325,7 @@ def test_fractional_wait_clear_duplicate_and_queue_history(
         connection.execute("INSERT INTO job_attempts VALUES (?,?,?,?,?,?,?,?)", tuple(saved))
         connection.execute("UPDATE jobs SET status='succeeded' WHERE job_id=?", (saved["job_id"],))
     add_attempt(activity, project, 40, 45)
+    clock[0] = 45
     assert activity.duration_report(project.project_id, stamp(20)) == historical
 
 
