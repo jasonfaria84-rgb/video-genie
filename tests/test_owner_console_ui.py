@@ -2,14 +2,20 @@
 
 import base64
 import hashlib
+import http.client
 import json
 import re
+import threading
 from uuid import uuid4
 
 import pytest
+from test_authority import studio as studio_fixture
 from test_job_storage import registry as registry_fixture
 from test_owner_console import action, artifact, enrollment, login, request
 from test_owner_console import console as console_fixture
+from test_render_jobs import prepared
+from test_render_plan import Planning
+from test_render_plan import plan as plan_fixture
 
 from videogenie.adapters.owner_console import OwnerConsole
 from videogenie.contracts.authority import OwnerChallengeInput, PublishRecipeAction
@@ -20,6 +26,8 @@ from videogenie.core.service import VideoGenieService
 
 console = console_fixture
 storage_registry = registry_fixture
+studio = studio_fixture
+plan = plan_fixture
 
 
 def test_page_exact_csp_and_secret_free_resources(console: OwnerConsole) -> None:
@@ -46,6 +54,10 @@ def test_page_exact_csp_and_secret_free_resources(console: OwnerConsole) -> None
     assert "userVerification:'required'" in page
     assert "Final approval — not available" in page
     assert "https://" not in page
+    assert "<video" not in page and "output-candidate" in page
+    assert 'id="project-id"' not in page
+    assert "sample.frame_index/24" in page and "sample frame" in page
+    assert "pairValues" in page and "output context changed" in page
 
 
 def test_review_uses_stored_draft_and_rejects_stale_snapshot(console: OwnerConsole) -> None:
@@ -63,15 +75,24 @@ def test_review_uses_stored_draft_and_rejects_stale_snapshot(console: OwnerConso
     assert payload["draft"]["content_sha256"] == prepared.action.content_sha256
     assert payload["draft"]["draft_revision"] == 1
     assert json.loads(payload["action_json"]) == prepared.action.model_dump(mode="json")
-    assert payload["baseline_version_id"] is None and "first publication" in payload["content_diff"]
+    assert payload["baseline_version_id"] is None
+    assert payload["baseline_kind"] == "no_history" and payload["content_diff"] == ""
     assert payload["preview_available"] is False
     with console.authority.service.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM authority_results").fetchone()[0] == 0
     assert request(console, "/action/select", browser=browser, body=identity)[0] == 200
+    # Reviewing another challenge and reselecting this one cannot remove its requirement.
+    other = console.authority.request_action(action(console))
+    other_identity = OwnerChallengeInput(
+        application_instance_id=other.application_instance_id, challenge_id=other.challenge_id
+    ).model_dump_json()
+    assert request(console, "/action/review", browser=browser, body=other_identity)[0] == 200
+    assert request(console, "/action/select", browser=browser, body=identity)[0] == 200
     proof = signer.assert_action(prepared, change={"origin": console.origin}).model_dump_json()
     first = request(console, "/action/apply", browser=browser, body=proof)
     replay = request(console, "/action/apply", browser=browser, body=proof)
-    assert first[0] == replay[0] == 200 and first[2] == replay[2]
+    assert first[0] == replay[0] == 409 and first[2] == replay[2]
+    assert json.loads(first[2])["error"]["reason"] == "publication_preview_required"
     # Changing the current draft cannot silently change the signed review's content.
     draft = console.authority.recipes.get_recipe_draft(
         RecipeDraftInput(recipe_id=payload["draft"]["recipe_id"])
@@ -186,3 +207,180 @@ def test_review_preserves_int64_caps_without_browser_number_rounding(
     assert f'"minor_units": {maximum}' in result["action_json"]
     assert f'"max_runs": {maximum}' in result["action_json"]
     assert result["draft"] is None
+    summaries = {item["label"]: item["value"] for item in result["summary"]}
+    assert summaries["Maximum runs"] == str(maximum)
+    assert (
+        summaries["Budget cap · USD"]
+        == "92233720368547758.07 (9223372036854775807 minor units; exponent 2)"
+    )
+
+
+def preview_post(console: OwnerConsole, browser: object, body: str) -> tuple[int, bytes]:
+    """Real bounded HTTP render request; allow the worker's declared local deadline."""
+    from test_owner_console import Browser
+
+    assert isinstance(browser, Browser)
+    connection = http.client.HTTPConnection("127.0.0.1", console.server.server_port, timeout=130)
+    try:
+        connection.request(
+            "POST",
+            "/preview/create",
+            body=body.encode(),
+            headers={
+                "Host": console.host,
+                "Origin": console.origin,
+                "Cookie": browser.cookie,
+                "X-CSRF-Token": browser.csrf,
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def test_real_preview_binding_stale_bytes_and_exact_recovery(console: OwnerConsole) -> None:
+    import io
+
+    from PIL import Image
+    from test_recipes import brand as brand_content
+
+    from videogenie.contracts.previews import (
+        BrandDraftPin,
+        CreatePreviewInput,
+        FictionalFixture,
+        RecipeDraftPin,
+    )
+    from videogenie.contracts.recipes import CreateBrandDraftInput
+
+    browser, signer, _ = enrollment(console)
+    challenge = console.authority.request_action(action(console))
+    identity = OwnerChallengeInput(
+        application_instance_id=challenge.application_instance_id,
+        challenge_id=challenge.challenge_id,
+    ).model_dump_json()
+    assert request(console, "/action/review", browser=browser, body=identity)[0] == 200
+    assert request(console, "/action/select", browser=browser, body=identity)[0] == 200
+    assert isinstance(challenge.action, PublishRecipeAction)
+    recipes = console.authority.recipes
+    client = recipes.studio.create_client("Fictional Preview Client", "preview-client")
+    brand = recipes.create_brand_draft(
+        CreateBrandDraftInput(
+            client_id=client.client_id,
+            content=brand_content(recipes),
+            idempotency_key="preview-brand",
+        )
+    )
+    value = CreatePreviewInput(
+        recipe=RecipeDraftPin(
+            recipe_id=challenge.action.recipe_id,
+            draft_revision=challenge.action.expected_draft_revision,
+            content_sha256=challenge.action.content_sha256,
+        ),
+        brand=BrandDraftPin(
+            client_id=client.client_id,
+            brand_id=brand.brand_id,
+            draft_revision=brand.draft_revision,
+            content_sha256=brand.content_sha256,
+        ),
+        fixture=FictionalFixture(),
+        idempotency_key="ui-preview",
+    )
+    bad = value.model_dump(mode="json")
+    bad["recipe"]["recipe_id"] = str(uuid4())
+    assert preview_post(console, browser, json.dumps(bad))[0] == 409
+    status, raw = preview_post(console, browser, value.model_dump_json())
+    assert status == 200, raw
+    result = json.loads(raw)
+    manifest = result["data"]["manifest"]
+    assert manifest["provenance"]["request"] == value.model_dump(mode="json")
+    base = f"/previews/{client.client_id}/{manifest['preview_id']}"
+    for sample in manifest["keyframes"]:
+        code, headers, png = request(
+            console, base + "/keyframe/" + str(sample["frame_index"]), browser=browser, method="GET"
+        )
+        assert code == 200 and headers["Content-Type"] == "image/png"
+        assert hashlib.sha256(png).hexdigest() == sample["png_sha256"]
+        with Image.open(io.BytesIO(png)) as image:
+            assert (
+                hashlib.sha256(image.tobytes()).hexdigest()
+                == manifest["decoded_frame_sha256"][sample["frame_index"]]
+            )
+    code, _, mov = request(console, base + "/video", browser=browser, method="GET")
+    assert code == 200 and hashlib.sha256(mov).hexdigest() == manifest["video_sha256"]
+    assert (
+        request(
+            console,
+            base.replace(client.client_id, str(uuid4())) + "/poster",
+            browser=browser,
+            method="GET",
+        )[0]
+        == 404
+    )
+    proof = signer.assert_action(challenge, change={"origin": console.origin}).model_dump_json()
+    # Reselecting never clears the previously established preview requirement.
+    assert request(console, "/action/select", browser=browser, body=identity)[0] == 200
+    first = request(console, "/action/apply", browser=browser, body=proof)
+    assert first[0] == 200, first[2]
+    draft = recipes.get_recipe_draft(RecipeDraftInput(recipe_id=value.recipe.recipe_id))
+    recipes.update_recipe_draft(
+        UpdateRecipeDraftInput(
+            recipe_id=draft.recipe_id,
+            expected_draft_revision=draft.draft_revision,
+            content=draft.content,
+            idempotency_key="advance",
+        )
+    )
+    assert request(console, base + "/poster", browser=browser, method="GET")[0] == 409
+    replay = request(console, "/action/apply", browser=browser, body=proof)
+    assert replay == first
+    changed = json.loads(proof)
+    changed["assertion"]["signature"] = "AQ"
+    assert request(console, "/action/apply", browser=browser, body=json.dumps(changed))[0] != 200
+    with console.authority.service.connection() as connection:
+        assert connection.execute("SELECT count(*) FROM content_versions").fetchone()[0] == 1
+
+
+def test_actual_durable_output_inventory_and_verified_download(plan: Planning) -> None:
+    value, _ = prepared(plan)
+    job = plan.renderer.submit_lower_third(value)
+    assert job.status == "succeeded" and job.result_ref is not None, job.failure
+    artifact = job.result_ref
+    assert artifact.locator.startswith("render-execution/artifacts/")
+    console = OwnerConsole(plan.studio.authority)
+    thread = threading.Thread(target=console.serve_forever, daemon=True)
+    thread.start()
+    try:
+        browser = login(console)
+        scope = dict(
+            project_id=value.project_id, storyline_id=value.storyline_id, client_id=value.client_id
+        )
+        status, _, raw = request(console, "/outputs", browser=browser, body=json.dumps(scope))
+        assert status == 200 and json.loads(raw)["data"] == [artifact.model_dump(mode="json")]
+        selection = dict(
+            project_id=value.project_id,
+            storyline_id=value.storyline_id,
+            job_id=job.job_id,
+            artifact_id=artifact.artifact_id,
+        )
+        status, _, raw = request(
+            console, "/artifact/review", browser=browser, body=json.dumps(selection)
+        )
+        assert status == 200
+        review = json.loads(raw)
+        code, _, media = request(console, review["artifact_url"], browser=browser, method="GET")
+        assert code == 200 and hashlib.sha256(media).hexdigest() == artifact.sha256
+        assert review["manifest_sha256"] == artifact.manifest_sha256
+        scope["client_id"] = str(uuid4())
+        status, _, outside = request(console, "/outputs", browser=browser, body=json.dumps(scope))
+        assert status == 200 and json.loads(outside)["data"] == []
+        path = plan.renderer.service.data_dir / artifact.locator
+        payload = path.read_bytes()
+        path.write_bytes(b"x" * len(payload))
+        assert request(console, review["artifact_url"], browser=browser, method="GET")[0] == 409
+    finally:
+        console.server.shutdown()
+        thread.join(timeout=10)
+        console.close()
+        assert not thread.is_alive()

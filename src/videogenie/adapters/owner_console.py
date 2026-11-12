@@ -5,7 +5,6 @@ outside this boundary; a browser session never replaces per-action WebAuthn proo
 """
 
 import base64
-import difflib
 import hashlib
 import hmac
 import json
@@ -27,7 +26,9 @@ from webauthn.helpers import bytes_to_base64url
 from videogenie.adapters.owner_auth import EnrollmentTicket
 from videogenie.contracts.authority import (
     IssueGrantAction,
+    OwnerAction,
     OwnerActionRequest,
+    OwnerChallenge,
     OwnerChallengeInput,
     PublishBrandAction,
     PublishRecipeAction,
@@ -35,19 +36,27 @@ from videogenie.contracts.authority import (
     VerifyOwnerActionInput,
 )
 from videogenie.contracts.models import VideoGenieError
+from videogenie.contracts.previews import (
+    BrandDraftPin,
+    CompareBrandInput,
+    CompareRecipeInput,
+    CreatePreviewInput,
+    PreviewReadInput,
+    RecipeDraftPin,
+)
 from videogenie.contracts.recipes import (
     BrandDraft,
     BrandDraftInput,
-    BrandVersionInput,
-    PublishedBrand,
-    PublishedRecipe,
+    BrandScopeInput,
     RecipeDraft,
     RecipeDraftInput,
-    RecipeVersionInput,
     content_sha256,
 )
+from videogenie.contracts.rendering import ListArtifactsInput
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.job_storage import JobStorage
+from videogenie.core.recipe_previews import RecipePreviewService
+from videogenie.core.rendering import RenderService
 from videogenie.core.service import validate_identifier
 
 _COOKIE = "videogenie_owner"
@@ -77,6 +86,9 @@ class _Session:
     selected_challenge: str | None = None
     selected_digest: str | None = None
     enrollment_completed: bool = False
+    reviewed_publications: set[str] = field(default_factory=set)
+    preview: tuple[str, str] | None = None
+    applied_responses: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass
@@ -110,6 +122,7 @@ class OwnerConsole:
 
     def __init__(self, authority: OwnerAuthorityService) -> None:
         self.authority = authority
+        self.previews = RecipePreviewService(authority.recipes)
         self.origin = authority.auth.origin
         parsed = urlsplit(self.origin)
         if parsed.scheme != "http" or parsed.hostname != "localhost" or parsed.port is None:
@@ -358,6 +371,23 @@ class OwnerConsole:
                     )
                     return
                 token, session = self._session(handler)
+                if handler.command == "GET" and handler.path.startswith("/previews/"):
+                    parts = handler.path.split("/")
+                    if len(parts) not in (5, 6):
+                        raise _HttpError(404, "preview_not_found")
+                    read = PreviewReadInput.model_validate(
+                        {
+                            "client_id": parts[2],
+                            "preview_id": parts[3],
+                            "kind": parts[4],
+                            "frame_index": int(parts[5]) if len(parts) == 6 else None,
+                        }
+                    )
+                    with self.previews.read_preview(read) as media:
+                        self._headers(handler, 200, media.media_type, media.byte_size)
+                        while block := media.stream.read(65536):
+                            handler.wfile.write(block)
+                    return
                 if handler.command == "GET" and handler.path.startswith("/artifacts/"):
                     self._artifact(handler)
                     return
@@ -440,46 +470,85 @@ class OwnerConsole:
                             or draft.content_sha256 != action.content_sha256
                         ):
                             raise _HttpError(409, "review_draft_changed")
-                    baseline: PublishedRecipe | PublishedBrand | None = None
-                    if draft is not None:
-                        identity = (
-                            draft.recipe_id if isinstance(draft, RecipeDraft) else draft.brand_id
+                    comparison = None
+                    if isinstance(draft, RecipeDraft):
+                        comparison = self.previews.compare_recipe(
+                            CompareRecipeInput(
+                                draft=RecipeDraftPin(
+                                    recipe_id=draft.recipe_id,
+                                    draft_revision=draft.draft_revision,
+                                    content_sha256=draft.content_sha256,
+                                ),
+                                prior_version_id=None,
+                            )
                         )
-                        with self.authority.service.connection() as connection:
-                            row = connection.execute(
-                                "SELECT version_id FROM content_versions WHERE identity_id=? "
-                                "ORDER BY ordinal DESC LIMIT 1",
-                                (identity,),
-                            ).fetchone()
-                        if row is not None:
-                            if isinstance(draft, RecipeDraft):
-                                baseline = self.authority.recipes.get_recipe_version(
-                                    RecipeVersionInput(recipe_id=identity, version_id=row[0])
-                                )
-                            else:
-                                baseline = self.authority.recipes.get_brand_version(
-                                    BrandVersionInput(
-                                        brand_id=identity,
-                                        client_id=draft.client_id,
-                                        version_id=row[0],
-                                    )
-                                )
+                    elif isinstance(draft, BrandDraft):
+                        comparison = self.previews.compare_brand(
+                            CompareBrandInput(
+                                draft=BrandDraftPin(
+                                    brand_id=draft.brand_id,
+                                    client_id=draft.client_id,
+                                    draft_revision=draft.draft_revision,
+                                    content_sha256=draft.content_sha256,
+                                ),
+                                prior_version_id=None,
+                            )
+                        )
+                    if draft is not None:
+                        if (
+                            len(session.reviewed_publications) >= 128
+                            and challenge.challenge_id not in session.reviewed_publications
+                        ):
+                            raise _HttpError(409, "review_capacity")
+                        session.reviewed_publications.add(challenge.challenge_id)
+                        session.preview = None
                     summary = []
                     if isinstance(action, IssueGrantAction):
                         terms = action.terms
                         summary = [
                             {"label": label, "value": str(value)}
                             for label, value in (
-                                ("Project", terms.project_id),
-                                ("Storyline", terms.storyline_id),
-                                ("Client", terms.client_id),
+                                ("Project", self._project_label(terms.project_id)),
+                                (
+                                    "Storyline",
+                                    self._storyline_label(terms.project_id, terms.storyline_id),
+                                ),
+                                ("Client", self._client_label(terms.client_id)),
                                 ("Maximum runs", terms.max_runs),
                                 ("Attempts per run", terms.max_attempts_per_run),
                                 ("Concurrent runs", terms.max_concurrent),
+                                (
+                                    "Attempt timeout (seconds)",
+                                    terms.resource_bounds.timeout_seconds,
+                                ),
+                                (
+                                    "Maximum artifact bytes",
+                                    terms.resource_bounds.max_artifact_bytes,
+                                ),
+                                (
+                                    "Name / role character limits",
+                                    str(terms.parameter_bounds.name_max_length)
+                                    + " / "
+                                    + str(terms.parameter_bounds.role_max_length),
+                                ),
+                                ("Permitted inputs", ", ".join(terms.permitted_input_classes)),
                                 ("Valid from", terms.valid_from),
                                 ("Expires", terms.expires_at),
-                                ("Recipe version", terms.recipe.version_id),
-                                ("Brand version", terms.brand.version_id),
+                                (
+                                    "Recipe",
+                                    "Lower third · "
+                                    + terms.recipe.recipe_id[:8]
+                                    + " / version "
+                                    + terms.recipe.version_id[:8],
+                                ),
+                                (
+                                    "Brand kit",
+                                    self._client_label(terms.client_id)
+                                    + " · "
+                                    + terms.brand.brand_id[:8]
+                                    + " / version "
+                                    + terms.brand.version_id[:8],
+                                ),
                                 ("Provider", ", ".join(terms.allowed_providers)),
                                 ("Capabilities", ", ".join(terms.allowed_capabilities)),
                             )
@@ -499,7 +568,6 @@ class OwnerConsole:
                                     + ")",
                                 }
                             )
-                    before = baseline.content.model_dump_json(indent=2) if baseline else ""
                     after = draft.content.model_dump_json(indent=2) if draft else ""
                     self._json(
                         handler,
@@ -511,19 +579,113 @@ class OwnerConsole:
                             "summary": summary,
                             "draft": draft.model_dump(mode="json") if draft is not None else None,
                             "draft_content_json": after,
-                            "baseline_version_id": baseline.version_id if baseline else None,
-                            "content_diff": "\n".join(
-                                difflib.unified_diff(
-                                    before.splitlines(),
-                                    after.splitlines(),
-                                    fromfile="published version " + baseline.version_id
-                                    if baseline
-                                    else "first publication",
-                                    tofile="prepared draft",
-                                    lineterm="",
-                                )
-                            ),
+                            "draft_revision_text": str(draft.draft_revision) if draft else None,
+                            "baseline_version_id": None,
+                            "baseline_kind": comparison.baseline_kind if comparison else None,
+                            "content_diff": comparison.diff
+                            if comparison and comparison.has_published_history
+                            else "",
                             "preview_available": False,
+                        },
+                    )
+                    return
+                if handler.path == "/catalog":
+                    if json.loads(body) != {}:
+                        raise _HttpError(400, "unexpected_fields")
+                    recipes = self.authority.recipes
+                    clients = recipes.studio.list_clients(include_archived=True)
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "clients": [item.model_dump(mode="json") for item in clients],
+                            "projects": [
+                                item.model_dump(mode="json")
+                                for item in self.authority.service.list_projects(
+                                    include_archived=True
+                                )
+                            ],
+                            "recipes": [
+                                item.model_dump(mode="json")
+                                | {
+                                    "draft_revision_text": str(item.draft_revision),
+                                    "pin_json": RecipeDraftPin(
+                                        recipe_id=item.recipe_id,
+                                        draft_revision=item.draft_revision,
+                                        content_sha256=item.content_sha256,
+                                    ).model_dump_json(),
+                                }
+                                for item in recipes.list_recipe_drafts()
+                            ],
+                            "brands": [
+                                item.model_dump(mode="json")
+                                | {
+                                    "draft_revision_text": str(item.draft_revision),
+                                    "pin_json": BrandDraftPin(
+                                        client_id=item.client_id,
+                                        brand_id=item.brand_id,
+                                        draft_revision=item.draft_revision,
+                                        content_sha256=item.content_sha256,
+                                    ).model_dump_json(),
+                                }
+                                for client in clients
+                                for item in recipes.list_brand_drafts(
+                                    BrandScopeInput(client_id=client.client_id)
+                                )
+                            ],
+                        },
+                    )
+                    return
+                if handler.path == "/outputs":
+                    scope = ListArtifactsInput.model_validate_json(body)
+                    artifacts = RenderService(self.authority).list_artifacts(scope)
+                    self._json(
+                        handler,
+                        200,
+                        {"ok": True, "data": [item.model_dump(mode="json") for item in artifacts]},
+                    )
+                    return
+                if handler.path in ("/comparison/recipe", "/comparison/brand"):
+                    comparison = (
+                        self.previews.compare_recipe(CompareRecipeInput.model_validate_json(body))
+                        if handler.path.endswith("recipe")
+                        else self.previews.compare_brand(
+                            CompareBrandInput.model_validate_json(body)
+                        )
+                    )
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "baseline_kind": comparison.baseline_kind,
+                            "diff": comparison.diff
+                            if comparison.baseline_kind != "no_history"
+                            else "",
+                            "current_json": comparison.current.content.model_dump_json(indent=2),
+                            "prior_json": comparison.prior.content.model_dump_json(indent=2)
+                            if comparison.prior
+                            else None,
+                        },
+                    )
+                    return
+                if handler.path == "/preview/create":
+                    preview_request = CreatePreviewInput.model_validate_json(body)
+                    challenge = self._selected_publication(session)
+                    self._match_preview(challenge.action, preview_request)
+                    preview_result = self.previews.create_preview(preview_request)
+                    session.preview = (
+                        preview_result.manifest.client_id,
+                        preview_result.manifest.preview_id,
+                    )
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "data": preview_result.model_dump(mode="json"),
+                            "manifest_json": preview_result.manifest.model_dump_json(indent=2),
                         },
                     )
                     return
@@ -585,7 +747,41 @@ class OwnerConsole:
                     )
                     if challenge.action_sha256 != session.selected_digest:
                         raise _HttpError(403, "action_changed")
+                    proof_hash = hashlib.sha256(proof.model_dump_json().encode()).hexdigest()
+                    if proof_hash in session.applied_responses:
+                        self._json(handler, 200, session.applied_responses[proof_hash])
+                        return
+                    if proof.challenge_id in session.reviewed_publications:
+                        if session.preview is None:
+                            raise _HttpError(409, "publication_preview_required")
+                        client, preview_id = session.preview
+                        result_preview = self.previews.get_preview(client, preview_id)
+                        self._match_preview(
+                            challenge.action, result_preview.manifest.provenance.request
+                        )
+                        # Revalidate all supplied media, not only the metadata row.
+                        for read in (
+                            PreviewReadInput(client_id=client, preview_id=preview_id, kind="video"),
+                            *(
+                                PreviewReadInput(
+                                    client_id=client,
+                                    preview_id=preview_id,
+                                    kind="keyframe",
+                                    frame_index=index,
+                                )
+                                for index in (0, 16, 75, 129, 149)
+                            ),
+                        ):
+                            with self.previews.read_preview(read):
+                                pass
+                    if len(session.applied_responses) >= 128:
+                        raise _HttpError(409, "review_capacity")
                     result = self.authority.apply_action(proof)
+                    session.applied_responses[proof_hash] = {
+                        "ok": True,
+                        "data": result.model_dump(mode="json"),
+                        "result_json": result.model_dump_json(indent=2),
+                    }
                     self._json(
                         handler,
                         200,
@@ -627,6 +823,69 @@ class OwnerConsole:
             # Never include request data, paths, credentials or OS error text in a response/log.
             self._json(handler, 400, {"ok": False, "error": {"reason": "request_failed"}})
 
+    def _selected_publication(self, session: _Session) -> OwnerChallenge:
+        if (
+            session.selected_challenge is None
+            or session.selected_challenge not in session.reviewed_publications
+        ):
+            raise _HttpError(409, "publication_review_required")
+        return self.authority.get_challenge(
+            OwnerChallengeInput(
+                application_instance_id=self.authority.auth.application_instance_id,
+                challenge_id=session.selected_challenge,
+            )
+        )
+
+    @staticmethod
+    def _match_preview(action: OwnerAction, request: CreatePreviewInput) -> None:
+        if isinstance(action, PublishRecipeAction):
+            pin = request.recipe
+            matches = (pin.recipe_id, pin.draft_revision, pin.content_sha256) == (
+                action.recipe_id,
+                action.expected_draft_revision,
+                action.content_sha256,
+            )
+        elif isinstance(action, PublishBrandAction):
+            pin_brand = request.brand
+            matches = (
+                pin_brand.client_id,
+                pin_brand.brand_id,
+                pin_brand.draft_revision,
+                pin_brand.content_sha256,
+            ) == (
+                action.client_id,
+                action.brand_id,
+                action.expected_draft_revision,
+                action.content_sha256,
+            )
+        else:
+            matches = False
+        if not matches:
+            raise _HttpError(409, "preview_action_mismatch")
+
+    def _project_label(self, identity: str) -> str:
+        try:
+            return self.authority.service.get_project(identity).name + " · " + identity[:8]
+        except VideoGenieError:
+            return "Unavailable project · " + identity[:8]
+
+    def _storyline_label(self, project: str, identity: str) -> str:
+        try:
+            value = next(
+                item
+                for item in self.authority.service.get_project(project).storylines
+                if item.storyline_id == identity
+            )
+            return value.name + " · " + identity[:8]
+        except (VideoGenieError, StopIteration):
+            return "Unavailable storyline · " + identity[:8]
+
+    def _client_label(self, identity: str) -> str:
+        try:
+            return self.authority.recipes.studio.get_client(identity).name + " · " + identity[:8]
+        except VideoGenieError:
+            return "Unavailable client · " + identity[:8]
+
     def _artifact(self, handler: BaseHTTPRequestHandler) -> None:
         parts = handler.path.split("/")
         if len(parts) != 6:
@@ -649,7 +908,10 @@ class OwnerConsole:
             if manifest.request.storyline_id != storyline:
                 raise _HttpError(404, "artifact_not_found")
         components = manifest.locator.split("/")
-        if components[0] != "artifacts" or len(components) < 2:
+        if not (
+            (components[0] == "artifacts" and len(components) >= 2)
+            or (components[:2] == ["render-execution", "artifacts"] and len(components) == 3)
+        ):
             raise _HttpError(403, "artifact_location")
         # Walk relative to owned descriptors, rejecting every symlink component.
         descriptor = os.open(service.data_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
