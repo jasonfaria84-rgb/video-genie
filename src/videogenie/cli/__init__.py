@@ -11,6 +11,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
+from videogenie.cli.owner import HELP as OWNER_HELP
+from videogenie.cli.owner import MODES as OWNER_MODES
+from videogenie.cli.owner import run_owner
 from videogenie.contracts.models import (
     ContractModel,
     Identifier,
@@ -57,7 +60,11 @@ MAX_INPUT_CHARACTERS = 65536
 
 
 class _Parser(argparse.ArgumentParser):
+    redact_errors = False
+
     def error(self, message: str) -> NoReturn:
+        if self.redact_errors:
+            raise VideoGenieError("INVALID_ARGUMENT", "Invalid owner launch arguments")
         safe = message.encode("utf-8", errors="backslashreplace").decode("utf-8")
         raise VideoGenieError("INVALID_ARGUMENT", f"Invalid command arguments: {safe}")
 
@@ -309,7 +316,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
-    parser.add_argument("command", nargs="?", help="capabilities, project, media, job, or client")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        help="capabilities, project, media, job, client, or explicit owner launch",
+    )
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume"
     )
@@ -319,9 +330,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")
     parser.add_argument("--help", "-h", action="store_true", help="Show command help")
     parser.add_argument("--version", action="store_true", help="Show installed package version")
+    parser.add_argument("--port", type=int, help="Owner console fixed localhost port")
+    parser.add_argument("--handoff-file", help="New private owner launch file (not stdout)")
+    parser.add_argument("--challenge-id", help="Prepared owner review challenge UUID")
     payload: dict[str, JsonValue] = {}
     operation = ""
     try:
+        parser.redact_errors = "owner" in (sys.argv[1:] if argv is None else argv)
         arguments = parser.parse_args(argv)
         if arguments.version:
             installed = version("video-genie")
@@ -349,6 +364,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             for segment in (arguments.command, arguments.action, arguments.detail)
             if segment is not None
         )
+        if arguments.command == "owner":
+            if arguments.help or arguments.action is None:
+                if arguments.json:
+                    print(
+                        ResultEnvelope[dict[str, str]](
+                            success=True, data={"help": OWNER_HELP}
+                        ).model_dump_json()
+                    )
+                else:
+                    print(OWNER_HELP, end="")
+                return 0
+            if arguments.action not in OWNER_MODES or arguments.detail or arguments.input_json:
+                raise VideoGenieError(
+                    "INVALID_ARGUMENT",
+                    "Use explicit owner launch options; JSON action or actor flags cannot approve",
+                )
+            if arguments.handoff_file is None:
+                raise VideoGenieError("INVALID_ARGUMENT", "Owner launch requires --handoff-file")
+            return run_owner(
+                arguments.action,
+                data_dir=arguments.data_dir,
+                port=arguments.port if arguments.port is not None else 8456,
+                handoff_file=arguments.handoff_file,
+                challenge_id=arguments.challenge_id,
+            )
+        if any(
+            value is not None
+            for value in (arguments.port, arguments.handoff_file, arguments.challenge_id)
+        ):
+            raise VideoGenieError(
+                "INVALID_ARGUMENT", "Owner launch options are not ordinary agent operations"
+            )
         if operation not in OPERATIONS:
             raise VideoGenieError(
                 "INVALID_ARGUMENT", "unrecognized arguments: unsupported operation"
