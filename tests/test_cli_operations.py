@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -733,11 +733,9 @@ def test_installed_studio_lifecycle_and_duration(executable: Path, tmp_path: Pat
     cycles = closed["cycles"]
     assert isinstance(cycles, list) and isinstance(cycles[0], dict)
     closed_at = string(cycles[0], "closed_at")
-    as_of = datetime.fromisoformat(closed_at) + timedelta(days=1)
+    as_of = datetime.now(UTC)
     report = data(call("project.duration", {**args, "as_of": as_of.isoformat()}))
-    later = data(
-        call("project.duration", {**args, "as_of": (as_of + timedelta(days=1)).isoformat()})
-    )
+    later = data(call("project.duration", {**args, "as_of": datetime.now(UTC).isoformat()}))
     assert report["project_elapsed_end_at"] == later["project_elapsed_end_at"] == closed_at
     assert report["project_elapsed_seconds"] == later["project_elapsed_seconds"]
     later_age, report_age = later["project_age_seconds"], report["project_age_seconds"]
