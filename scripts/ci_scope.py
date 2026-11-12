@@ -80,6 +80,7 @@ KNOWN_TESTS = {
     "tests/test_render_plan.py",
     "tests/test_studio.py",
     "tests/test_studio_contracts.py",
+    "tests/test_transcripts.py",
 }
 TRANSPORT_TESTS = {
     "tests/test_cli.py",
