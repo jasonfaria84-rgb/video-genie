@@ -84,6 +84,8 @@ EXPECTED_OPERATIONS = [
     "approval.outcome.get",
     "output.review.list",
     "approval.list",
+    "media.silence.detect",
+    "media.silence.remove",
 ]
 
 
