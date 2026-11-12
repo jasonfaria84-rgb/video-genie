@@ -416,6 +416,8 @@ def test_worker_authority_changes_reach_transitive_public_consumers(root: Path, 
 @pytest.mark.parametrize(
     "path",
     [
+        "src/videogenie/core/discovery.py",
+        "src/videogenie/contracts/discovery.py",
         "src/videogenie/core/assets.py",
         "src/videogenie/core/rendering.py",
         "src/videogenie/core/authority.py",
@@ -662,3 +664,67 @@ def test_harness_inventory_and_import_edges_cannot_drift() -> None:
             [{"status": "M", "old": None, "new": f"scripts/{helper}.py"}], repository
         )
         assert {consumers[name] for name in importers} <= set(scope["tests"])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/videogenie/cli/__init__.py",
+        "src/videogenie/adapters/mcp_server.py",
+    ],
+)
+def test_discovery_transports_reach_paired_and_installed_consumers(root: Path, path: str) -> None:
+    module = selector()
+    scope = module.select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted"
+    assert {
+        "tests/test_cli_discovery.py",
+        "tests/test_mcp_discovery.py",
+        "tests/test_cli_recipes.py",
+        "tests/test_mcp_recipes.py",
+        "tests/test_external_install.py",
+        "tests/test_local_studio_install.py",
+        "tests/test_recipe_render_install.py",
+    } <= set(scope["tests"])
+    assert scope["build"] and scope["runtime"]
+    assert module.validate_scope(scope) == scope
+    (root / "tests/test_mcp_discovery.py").unlink()
+    assert module.select([{"status": "M", "old": None, "new": path}], root)["mode"] == "full"
+
+
+@pytest.mark.parametrize(
+    "helper,expected",
+    [
+        ("test_authority", {"test_discovery", "test_cli_discovery", "test_mcp_discovery"}),
+        ("test_costs", {"test_discovery", "test_cli_discovery", "test_mcp_discovery"}),
+        ("test_render_plan", {"test_discovery", "test_cli_discovery", "test_mcp_discovery"}),
+        ("test_output_review", {"test_discovery", "test_cli_discovery", "test_mcp_discovery"}),
+        ("test_render_contracts", {"test_discovery_contracts"}),
+        ("test_cli_operations", {"test_cli_discovery"}),
+        ("test_cli_recipes", {"test_cli_discovery"}),
+        ("test_owner_cli", {"test_cli_discovery"}),
+        ("test_mcp", {"test_mcp_discovery"}),
+        ("test_mcp_recipes", {"test_mcp_discovery"}),
+    ],
+)
+def test_discovery_fixture_changes_follow_actual_importers(
+    root: Path, helper: str, expected: set[str]
+) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": f"tests/{helper}.py"}], root)
+    assert scope["mode"] == "targeted"
+    assert {f"tests/{name}.py" for name in expected} <= set(scope["tests"])
+    assert "tests/test_ci_scope.py" in scope["tests"]
+    assert "tests/test_projects.py" not in scope["tests"]
+
+
+@pytest.mark.parametrize(
+    "suite",
+    ["test_discovery", "test_discovery_contracts", "test_cli_discovery", "test_mcp_discovery"],
+)
+def test_discovery_suite_edits_admit_inventory_without_unrelated_product_tests(
+    root: Path, suite: str
+) -> None:
+    path = f"tests/{suite}.py"
+    scope = selector().select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted"
+    assert set(scope["tests"]) == {path, "tests/test_ci_scope.py"}
