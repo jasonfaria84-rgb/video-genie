@@ -1,19 +1,23 @@
 """Bounded, read-only ffprobe execution and validated media metadata."""
 
+import errno
 import hashlib
 import json
 import math
 import os
+import select
 import selectors
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
+from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from videogenie.contracts.models import ContractModel, VideoGenieError
 
@@ -157,6 +161,86 @@ def require_unchanged(path: Path, expected: Fingerprint) -> None:
         raise VideoGenieError("INPUT_CHANGED", "Media changed before publication")
 
 
+def _wait_for_exit(process: subprocess.Popen[bytes], deadline: float) -> None:
+    """On POSIX retain the leader PID until its process group has been signalled."""
+    if os.name != "posix":
+        process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        return
+    if sys.platform == "darwin":
+        # Python 3.12 has no waitid on macOS. kqueue observes exit without
+        # consuming the child's wait status or releasing its PID for reuse.
+        with closing(select.kqueue()) as queue:
+            event = select.kevent(
+                process.pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            events = queue.control([event], 1, max(0.0, deadline - time.monotonic()))
+        if not events:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        if events[0].flags & select.KQ_EV_ERROR and events[0].data != errno.ESRCH:
+            raise OSError(events[0].data, "Cannot observe probe exit")
+        # ESRCH means this still-unreaped owned child exited before registration.
+        return
+    while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        time.sleep(min(remaining, 0.01))
+
+
+def _cleanup_process(process: subprocess.Popen[bytes]) -> VideoGenieError | None:
+    """Signal before reaping; bound direct-child cleanup and expose unresolved errors."""
+    problems: dict[str, JsonValue] = {}
+    group_denied = False
+    try:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                group_denied = True
+                problems["group_signal_errno"] = error.errno
+        if os.name != "posix" or group_denied:
+            try:
+                # Popen checks its owned child, including an already-exited leader.
+                process.kill()
+            except OSError as error:
+                problems["child_signal_errno"] = error.errno
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            problems["child_reap"] = "deadline_exceeded"
+        except OSError as error:
+            problems["child_wait_errno"] = error.errno
+        if group_denied and process.returncode is not None:
+            # Darwin can deny killpg for a zombie-only group. After reaping, only
+            # inspect group existence: never signal a possibly reused group ID.
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                if problems.get("group_signal_errno") == errno.EPERM:
+                    del problems["group_signal_errno"]
+            except OSError:
+                problems["group_cleanup"] = "unconfirmed"
+            else:
+                problems["group_cleanup"] = "unconfirmed"
+    finally:
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError as error:
+                    problems["pipe_close_errno"] = error.errno
+    if problems:
+        return VideoGenieError(
+            "MEDIA_UNAVAILABLE", "ffprobe cleanup could not be confirmed", details=problems
+        )
+    return None
+
+
 def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
     """Capture at most 1 MiB across both pipes and kill the child group on timeout."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -195,25 +279,21 @@ def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
                         )
                     if key.data:
                         output.extend(chunk)
-            process.wait(timeout=max(0.001, deadline - time.monotonic()))
-        if process.returncode != 0:
-            raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe could not read valid media")
-        return bytes(output)
+            _wait_for_exit(process, deadline)
     except subprocess.TimeoutExpired as exc:
         raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe exceeded its deadline") from exc
     finally:
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
-        process.wait()
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+        primary = sys.exception()
+        cleanup = _cleanup_process(process)
+        if cleanup is not None:
+            if primary is None:
+                raise cleanup
+            primary.add_note(cleanup.message)
+            if isinstance(primary, VideoGenieError):
+                primary.details["cleanup"] = cleanup.details
+    if process.returncode != 0:
+        raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe could not read valid media")
+    return bytes(output)
 
 
 def probe_tool(ffprobe_path: str | None = None) -> tuple[str, str]:
