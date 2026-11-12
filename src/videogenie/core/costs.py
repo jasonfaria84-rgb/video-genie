@@ -180,6 +180,17 @@ class CostService:
         ).fetchone()
         return str(row[0]) if row else None
 
+    def _run_client(
+        self, connection: sqlite3.Connection, project_id: str, run_id: str
+    ) -> str | None:
+        # A late measurement belongs to the incurred run, including an explicitly
+        # unattributed run; current association is not a historical backfill.
+        row = connection.execute(
+            "SELECT client_id FROM cost_entries WHERE run_id=? ORDER BY sequence LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return row[0] if row is not None else self._client(connection, project_id)
+
     def _append(
         self, connection: sqlite3.Connection, values: dict[str, object], key: str, request_json: str
     ) -> CostEntry:
@@ -265,7 +276,9 @@ class CostService:
                 return replay
             self.service.require_storyline(transaction, request.project_id, request.storyline_id)
             values = request.model_dump(exclude={"idempotency_key"})
-            values["client_id_at_event"] = self._client(transaction, request.project_id)
+            values["client_id_at_event"] = self._run_client(
+                transaction, request.project_id, request.run_id
+            )
             return self._append(transaction, values, request.idempotency_key, fingerprint)
 
     def reserve(
@@ -355,7 +368,8 @@ class CostService:
                 if (
                     estimate.kind != "estimate"
                     or estimate.run_id != request.run_id
-                    or estimate.client_id_at_event != self._client(transaction, request.project_id)
+                    or estimate.client_id_at_event
+                    != self._run_client(transaction, request.project_id, request.run_id)
                     or estimate.amount is None
                     or estimate.amount.currency != ceiling.currency
                 ):
@@ -370,7 +384,9 @@ class CostService:
             values = request.model_dump(exclude={"idempotency_key"}) | {
                 "kind": "reservation",
                 "reservation_id": str(uuid4()),
-                "client_id_at_event": self._client(transaction, request.project_id),
+                "client_id_at_event": self._run_client(
+                    transaction, request.project_id, request.run_id
+                ),
             }
             return self._append(transaction, values, request.idempotency_key, fingerprint)
 

@@ -666,3 +666,52 @@ def test_settlement_after_archive_retains_original_fact(
     with pytest.raises(VideoGenieError) as rejected:
         service.reserve(reservation(project), cap(100))
     assert rejected.value.code == "PROJECT_ARCHIVED"
+
+
+@pytest.mark.parametrize("initial_client", [False, True])
+def test_late_run_measurements_keep_original_attribution_and_live_metadata(
+    ledger: tuple[CostService, Project],
+    initial_client: bool,
+) -> None:
+    service, project = ledger
+    studio = StudioService(service.service)
+    alice = studio.create_client("Fictional original client", "original")
+    bob = studio.create_client("Fictional successor client", "successor")
+    if initial_client:
+        studio.assign_project_client(project.project_id, alice.client_id, project.revision)
+    request = reservation(project)
+    original = service.reserve(request, cap(100))
+    frozen = report(service, project)
+    expected = alice.client_id if initial_client else None
+    latest = service.service.get_project(project.project_id)
+    studio.assign_project_client(project.project_id, bob.client_id, latest.revision)
+    after_reassignment = service.report(
+        CostReportInput(
+            project_id=project.project_id, **frozen.snapshot.model_dump(exclude={"schema_version"})
+        )
+    )
+    assert after_reassignment.model_dump(exclude={"attribution"}) == frozen.model_dump(
+        exclude={"attribution"}
+    )
+    assert frozen.attribution[0].current_client_id == expected
+    assert after_reassignment.attribution[0].current_client_id == bob.client_id
+    assert (
+        after_reassignment.attribution[0].historical_client_ids
+        == frozen.attribution[0].historical_client_ids
+    )
+    late = RecordCostInput.model_validate(
+        estimate(project, request.run_id, request.grant_id).model_dump()
+        | {"kind": "unpriced", "amount": None, "occurred_at": original.occurred_at}
+    )
+    measured = service.record(late)
+    assert measured.client_id_at_event == expected
+    service.transition(change(original, "release"))
+    retry = reservation(project, run=request.run_id, grant=request.grant_id)
+    assert service.reserve(retry, cap(100)).client_id_at_event == expected
+    assert service.report(CostReportInput(client_id=bob.client_id)).currencies == ()
+    if initial_client:
+        assert service.report(CostReportInput(client_id=alice.client_id)).unpriced_quantities == (
+            QUANTITY,
+        )
+    else:
+        assert report(service, project).attribution[0].unattributed_entries == 4
