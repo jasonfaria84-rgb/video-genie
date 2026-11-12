@@ -11,6 +11,7 @@ dependencies = [
     "mcp==2.3.0",
     "pillow==13.0.0",
     "pydantic==2.14.3",
+    "webauthn==3.0.1",
 ]
 
 [project.scripts]
