@@ -209,3 +209,70 @@ class RecipePin(ContractModel):
     recipe_id: Identifier
     version_id: Identifier
     content_sha256: Sha256
+
+
+class _KeyedDraftInput(ContractModel):
+    idempotency_key: Annotated[LiteralText, Field(min_length=1, max_length=200)]
+
+    @model_validator(mode="after")
+    def visible_key(self) -> Self:
+        if not self.idempotency_key.strip():
+            raise ValueError("Idempotency key must contain visible text")
+        return self
+
+
+class CreateRecipeDraftInput(_KeyedDraftInput):
+    """Prepare declarative content; this input cannot request publication."""
+
+    content: RecipeContent
+
+
+class UpdateRecipeDraftInput(CreateRecipeDraftInput):
+    """Replace draft content at exactly the observed draft revision."""
+
+    recipe_id: Identifier
+    expected_draft_revision: int = Field(ge=1)
+
+
+class RecipeDraftInput(ContractModel):
+    """Select one explicit recipe draft in the configured data root."""
+
+    recipe_id: Identifier
+
+
+class BrandScopeInput(ContractModel):
+    """Select an explicit client; no active-project or inferred ownership state."""
+
+    client_id: Identifier
+
+
+class CreateBrandDraftInput(_KeyedDraftInput):
+    """Prepare a client-scoped brand with exact currently verified asset pins."""
+
+    client_id: Identifier
+    content: BrandContent
+
+
+class UpdateBrandDraftInput(CreateBrandDraftInput):
+    """Replace an existing client's brand draft with optimistic concurrency control."""
+
+    brand_id: Identifier
+    expected_draft_revision: int = Field(ge=1)
+
+
+class BrandDraftInput(BrandScopeInput):
+    """Select an explicit brand within its client scope."""
+
+    brand_id: Identifier
+
+
+class RecipeVersionInput(RecipeDraftInput):
+    """Read one immutable published version; there is no latest-version fallback."""
+
+    version_id: Identifier
+
+
+class BrandVersionInput(BrandDraftInput):
+    """Read one immutable brand version within its original client scope."""
+
+    version_id: Identifier
