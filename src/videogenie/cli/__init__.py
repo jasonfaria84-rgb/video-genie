@@ -11,7 +11,13 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
-from videogenie.contracts.models import Identifier, Project, ResultEnvelope, VideoGenieError
+from videogenie.contracts.models import (
+    ContractModel,
+    Identifier,
+    Project,
+    ResultEnvelope,
+    VideoGenieError,
+)
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
     ClientInput,
@@ -314,6 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--help", "-h", action="store_true", help="Show command help")
     parser.add_argument("--version", action="store_true", help="Show installed package version")
     payload: dict[str, JsonValue] = {}
+    operation = ""
     try:
         arguments = parser.parse_args(argv)
         if arguments.version:
@@ -381,10 +388,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         error = VideoGenieError(
             "INTERNAL_ERROR", "Operation failed; preserve the request ID for review"
         )
+    context = payload
+    input_model = INPUT_MODELS.get(operation)
+    if input_model is not None and issubclass(input_model, ContractModel):
+        # Rejected extra IDs cannot claim context outside a studio operation's schema.
+        context = {key: value for key, value in payload.items() if key in input_model.model_fields}
     print(
         error.to_envelope(
-            project_id=_context_id(payload.get("project_id")),
-            storyline_id=_context_id(payload.get("storyline_id")),
+            project_id=_context_id(context.get("project_id")),
+            storyline_id=_context_id(context.get("storyline_id")),
         ).model_dump_json()
     )
     print(f"{error.code}: {error.message}", file=sys.stderr)

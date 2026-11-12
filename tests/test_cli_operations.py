@@ -803,3 +803,38 @@ def test_studio_invalid_inputs_are_structured(
     assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
     if payload.get("project_id") == "invalid":
         assert response["project_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "project_context", "storyline_context"),
+    [
+        ("client.get", False, False),
+        ("project.duration", True, False),
+        ("project.wait.set", True, False),
+        ("job.get", True, True),
+    ],
+)
+def test_rejected_extra_ids_cannot_claim_studio_context(
+    executable: Path,
+    tmp_path: Path,
+    operation: str,
+    project_context: bool,
+    storyline_context: bool,
+) -> None:
+    project_id, storyline_id = str(uuid4()), str(uuid4())
+    response = invoke(
+        executable,
+        tmp_path,
+        tmp_path / "state",
+        operation.split("."),
+        {
+            "client_id": str(uuid4()),
+            "project_id": project_id.upper(),
+            "storyline_id": storyline_id.upper(),
+        },
+        expected=2,
+    )
+    error = response["error"]
+    assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
+    assert response["project_id"] == (project_id if project_context else None)
+    assert response["storyline_id"] == (storyline_id if storyline_context else None)
