@@ -19,7 +19,8 @@ import tempfile
 import time
 import unicodedata
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import BinaryIO, Protocol, cast
@@ -30,8 +31,29 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from videogenie.contracts.assets import AssetPin
 from videogenie.contracts.models import VideoGenieError
-from videogenie.contracts.recipes import BrandContent, RecipeContent
-from videogenie.contracts.rendering import RenderConfig, RenderProvenance, RenderToolVersions
+from videogenie.contracts.previews import (
+    CreatePreviewInput,
+    PreviewKeyframe,
+    PreviewManifest,
+    PreviewProvenance,
+    PreviewReadInput,
+)
+from videogenie.contracts.recipes import (
+    BrandContent,
+    BrandDraft,
+    LowerThirdParameters,
+    RecipeContent,
+    RecipeDraft,
+    content_sha256,
+)
+from videogenie.contracts.rendering import (
+    RenderColorMetadata,
+    RenderConfig,
+    RenderExecutionEvidence,
+    RenderFitMetrics,
+    RenderProvenance,
+    RenderToolVersions,
+)
 from videogenie.workers.probe import (
     MAX_OUTPUT_BYTES,
     Fingerprint,
@@ -188,11 +210,33 @@ class WorkerResult:
 
 @dataclass(frozen=True)
 class _Prepared:
-    provenance: RenderProvenance
+    provenance: RenderProvenance | PreviewProvenance
+    recipe: RecipeContent
+    brand: BrandContent
+    parameters: LowerThirdParameters
     name_font: ImageFont.FreeTypeFont
     role_font: ImageFont.FreeTypeFont
     fit: FitMetrics
     sources: tuple[tuple[Path, Fingerprint], ...]
+
+
+@dataclass(frozen=True)
+class PreviewWorkerResult:
+    """Real preview stage and manifest; neither publication nor approval."""
+
+    path: Path
+    manifest: PreviewManifest
+
+
+@dataclass(frozen=True)
+class _Rendered:
+    path: Path
+    fingerprint: Fingerprint
+    execution: ExecutionEvidence
+    decoded_frame_sha256: tuple[str, ...]
+    ffprobe_version: str
+    stream: _EncodedStream
+    keyframes: tuple[PreviewKeyframe, ...]
 
 
 def _invalid(reason: str, message: str) -> VideoGenieError:
@@ -336,15 +380,26 @@ def _prepare(
         raise _invalid(
             "invalid_config", "Render content must match the exact valid config"
         ) from exc
+    return _prepare_content(provenance, recipe, brand, config.parameters, asset_paths, deadline)
+
+
+def _prepare_content(
+    provenance: RenderProvenance | PreviewProvenance,
+    recipe: RecipeContent,
+    brand: BrandContent,
+    parameters: LowerThirdParameters,
+    asset_paths: Mapping[AssetPin, Path],
+    deadline: float,
+) -> _Prepared:
     if brand.logo is not None:
         raise _invalid(
             "unsupported_format", "Logo rendering is not supported by this recipe worker"
         )
-    if set(asset_paths) != set(config.input_asset_pins):
+    if set(asset_paths) != {brand.name_font, brand.role_font}:
         raise _invalid("asset_pins", "Asset paths must match exactly the pinned config assets")
     snapshots = {pin: _font_bytes(path, pin, deadline) for pin, path in asset_paths.items()}
-    name = config.parameters.name
-    role = config.parameters.role
+    name = parameters.name
+    role = parameters.role
     _glyphs(snapshots[brand.name_font][0], name)
     _glyphs(snapshots[brand.role_font][0], role)
     layout = recipe.layout
@@ -378,6 +433,9 @@ def _prepare(
     )
     return _Prepared(
         provenance,
+        recipe,
+        brand,
+        parameters,
         name_font,
         role_font,
         FitMetrics(
@@ -402,11 +460,7 @@ def _rgba(color: str, opacity: float) -> tuple[int, int, int, int]:
 
 
 def _frames(prepared: _Prepared, deadline: float) -> Iterator[bytes]:
-    brand, config, layout = (
-        prepared.provenance.brand,
-        prepared.provenance.config,
-        prepared.provenance.recipe.layout,
-    )
+    brand, parameters, layout = prepared.brand, prepared.parameters, prepared.recipe.layout
     left, top, right, bottom = prepared.fit.panel_bbox
     for index in range(150):
         _remaining(deadline)
@@ -422,8 +476,8 @@ def _frames(prepared: _Prepared, deadline: float) -> Iterator[bytes]:
         text_layer = Image.new("RGBA", SIZE)
         draw = ImageDraw.Draw(text_layer)
         for text, font, y, color in (
-            (config.parameters.name, prepared.name_font, layout.name_y, brand.name_color),
-            (config.parameters.role, prepared.role_font, layout.role_y, brand.role_color),
+            (parameters.name, prepared.name_font, layout.name_y, brand.name_color),
+            (parameters.role, prepared.role_font, layout.role_y, brand.role_color),
         ):
             draw.text(
                 (round(layout.text_x * 1920) + shift, round(y * 1080)),
@@ -555,6 +609,135 @@ def render_lower_third(
     executable, version = _tool("ffmpeg", deadline)
     probe, probe_version = _tool("ffprobe", deadline)
     prepared = _prepare(config, recipe, brand, asset_paths, version, deadline)
+    rendered = _render_prepared(
+        prepared, output_directory, deadline, executable, probe, probe_version, samples=False
+    )
+    assert isinstance(prepared.provenance, RenderProvenance)
+    return WorkerResult(
+        rendered.path,
+        rendered.fingerprint.sha256,
+        rendered.fingerprint.size,
+        prepared.provenance,
+        rendered.execution,
+        prepared.fit,
+        rendered.decoded_frame_sha256,
+        rendered.ffprobe_version,
+        rendered.stream.color_range,
+        rendered.stream.color_space,
+        rendered.stream.color_transfer,
+        rendered.stream.color_primaries,
+    )
+
+
+def render_draft_preview(
+    preview_id: str,
+    request: CreatePreviewInput,
+    recipe: RecipeDraft,
+    brand: BrandDraft,
+    asset_paths: Mapping[AssetPin, Path],
+    output_directory: Path,
+) -> PreviewWorkerResult:
+    """Render actual fictional draft content without fabricated production identities."""
+    if not output_directory.is_absolute() or not output_directory.is_dir():
+        raise _invalid("output_directory", "An existing absolute staging parent is required")
+    try:
+        request = CreatePreviewInput.model_validate(request.model_dump())
+        PreviewReadInput(client_id=request.brand.client_id, preview_id=preview_id, kind="poster")
+        recipe = RecipeDraft.model_validate(recipe.model_dump())
+        brand = BrandDraft.model_validate(brand.model_dump())
+        deadline = time.monotonic() + recipe.content.resources.timeout_seconds
+        executable, version = _tool("ffmpeg", deadline)
+        probe, probe_version = _tool("ffprobe", deadline)
+        provenance = PreviewProvenance(
+            request=request,
+            recipe=recipe,
+            brand=brand,
+            input_asset_pins=tuple(
+                sorted(asset_paths, key=lambda pin: (pin.asset_id, pin.version_id))
+            ),
+            tools=RenderToolVersions(
+                python=platform.python_version(),
+                pillow=pillow_version,
+                fonttools=package_version("fonttools"),
+                freetype=features.version_module("freetype2") or "unknown",
+                ffmpeg=version,
+            ),
+        )
+    except ValidationError as exc:
+        raise _invalid("invalid_preview", "Preview content differs from its exact pins") from exc
+    prepared = _prepare_content(
+        provenance,
+        recipe.content,
+        brand.content,
+        LowerThirdParameters(name=request.fixture.name, role=request.fixture.role),
+        asset_paths,
+        deadline,
+    )
+    rendered = _render_prepared(
+        prepared, output_directory, deadline, executable, probe, probe_version, samples=True
+    )
+    try:
+        poster = rendered.keyframes[2]
+        manifest = PreviewManifest(
+            preview_version="1",
+            purpose="fictional_draft_preview",
+            preview_id=preview_id,
+            client_id=brand.client_id,
+            request_sha256=content_sha256(request),
+            provenance=provenance,
+            execution=RenderExecutionEvidence(**asdict(rendered.execution)),
+            fit=RenderFitMetrics(**asdict(prepared.fit)),
+            color_metadata=RenderColorMetadata.model_validate(
+                {
+                    field: getattr(rendered.stream, field)
+                    for field in ("color_range", "color_space", "color_transfer", "color_primaries")
+                }
+            ),
+            ffprobe_version=rendered.ffprobe_version,
+            decoded_frame_sha256=rendered.decoded_frame_sha256,
+            keyframes=rendered.keyframes,
+            video_sha256=rendered.fingerprint.sha256,
+            video_byte_size=rendered.fingerprint.size,
+            poster_sha256=poster.png_sha256,
+            poster_byte_size=poster.png_byte_size,
+            poster_frame_index=75,
+            poster_rgba_sha256=poster.rgba_sha256,
+            output=recipe.content.output,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        return PreviewWorkerResult(rendered.path, manifest)
+    except ValidationError as exc:
+        error = _invalid("invalid_preview", "Observed preview evidence is inconsistent")
+        try:
+            shutil.rmtree(rendered.path.parent)
+        except OSError as cleanup:
+            error.details["stage_cleanup_errno"] = cleanup.errno
+        raise error from exc
+
+
+def _sample_frames(
+    prepared: _Prepared, directory: Path, deadline: float, samples: bool
+) -> Iterator[bytes]:
+    for index, raw in enumerate(_frames(prepared, deadline)):
+        if samples and index in KEYFRAMES:
+            with (directory / f"frame-{index}.png").open("xb") as stream:
+                Image.frombytes("RGBA", SIZE, raw).save(stream, format="PNG")
+                stream.flush()
+                os.fsync(stream.fileno())
+        yield raw
+
+
+def _render_prepared(
+    prepared: _Prepared,
+    output_directory: Path,
+    deadline: float,
+    executable: str,
+    probe: str,
+    probe_version: str,
+    *,
+    samples: bool,
+) -> _Rendered:
+    recipe = prepared.recipe
     source_path = Path(__file__).resolve()
     source_identity = fingerprint(source_path, _remaining(deadline))
     execution = ExecutionEvidence(
@@ -620,7 +803,7 @@ def render_lower_third(
                 "mov",
                 str(path),
             ],
-            _frames(prepared, deadline),
+            _sample_frames(prepared, directory, deadline, samples),
             path,
             deadline,
             recipe.resources.max_artifact_bytes,
@@ -679,20 +862,37 @@ def render_lower_third(
         with path.open("rb") as output:
             os.fsync(output.fileno())
         _remaining(deadline)
-        return WorkerResult(
-            path,
-            result.sha256,
-            result.size,
-            prepared.provenance,
-            execution,
-            prepared.fit,
-            hashes,
-            probe_version,
-            stream.color_range,
-            stream.color_space,
-            stream.color_transfer,
-            stream.color_primaries,
-        )
+        keyframes = []
+        if samples:
+            for index in KEYFRAMES:
+                sample = directory / f"frame-{index}.png"
+                observed = fingerprint(sample, _remaining(deadline))
+                if not 0 < observed.size <= 16777216:
+                    raise _invalid("preview_sample", "PNG exceeds preview sample bound")
+                with Image.open(sample) as image:
+                    if image.format != "PNG" or image.mode != "RGBA" or image.size != SIZE:
+                        raise _invalid("preview_sample", "Unexpected preview PNG format")
+                    pixels = hashlib.sha256(image.tobytes()).hexdigest()
+                require_unchanged(sample, observed)
+                if pixels != hashes[index]:
+                    raise _invalid("preview_sample", "PNG pixels differ from decoded master")
+                keyframes.append(
+                    PreviewKeyframe.model_validate(
+                        {
+                            "frame_index": index,
+                            "png_sha256": observed.sha256,
+                            "png_byte_size": observed.size,
+                            "rgba_sha256": pixels,
+                        }
+                    )
+                )
+            _remaining(deadline)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return _Rendered(path, result, execution, hashes, probe_version, stream, tuple(keyframes))
     except BaseException as primary:
         # Only this invocation's unique stage is removed; source assets are untouched.
         try:
