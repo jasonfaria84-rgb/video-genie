@@ -62,6 +62,7 @@ KNOWN_TESTS = {
     "tests/test_mcp_recipes.py",
     "tests/test_media_probe.py",
     "tests/test_output_review.py",
+    "tests/test_overlays.py",
     "tests/test_owner_auth.py",
     "tests/test_owner_auth_dependency.py",
     "tests/test_owner_cli.py",
@@ -101,6 +102,7 @@ TRANSPORT_TESTS = {
     "tests/test_transcription.py",
     "tests/test_assembly.py",
     "tests/test_resolve_render.py",
+    "tests/test_overlays.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -126,7 +128,7 @@ RENDER_TESTS = (
 # Explicit shared test fixtures, including indirect consumers. The inventory test
 # checks real Python imports so a new helper edge cannot silently narrow selection.
 TEST_IMPORTERS = {
-    "test_assembly": {"test_resolve_render"},
+    "test_assembly": {"test_resolve_render", "test_overlays"},
     "test_costs": {"test_authority"},
     "test_authority": {
         "test_cli_discovery",
@@ -211,13 +213,21 @@ PATH_TESTS = {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
         "tests/test_resolve_render.py",
+        "tests/test_overlays.py",
     },
     "src/videogenie/core/transcription.py": {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
+        "tests/test_overlays.py",
     },
-    "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
-    "src/videogenie/core/resolve_render.py": {"tests/test_resolve_render.py"},
+    "src/videogenie/core/assembly.py": {"tests/test_assembly.py", "tests/test_overlays.py"},
+    "src/videogenie/core/resolve_render.py": {
+        "tests/test_resolve_render.py",
+        "tests/test_overlays.py",
+    },
+    "src/videogenie/core/overlays.py": {"tests/test_overlays.py"},
+    "src/videogenie/contracts/overlays.py": {"tests/test_overlays.py"} | TRANSPORT_TESTS,
+    "src/videogenie/workers/overlay_renderers.py": {"tests/test_overlays.py"},
     "src/videogenie/core/transcripts.py": {
         "tests/test_transcripts.py",
         "tests/test_transcription.py",

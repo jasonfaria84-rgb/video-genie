@@ -91,6 +91,8 @@ EXPECTED_OPERATIONS = [
     "transcript.get",
     "resolve.timeline.assemble",
     "resolve.render",
+    "overlay.renderers",
+    "overlay.place",
 ]
 
 

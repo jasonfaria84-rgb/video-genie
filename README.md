@@ -10,12 +10,13 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 68 shared agent operations: projects and clients, cycles and
+This source exposes 70 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests, output selection, dead-space removal, a
 DaVinci Resolve status check, word-level transcripts made in Resolve, and
-timeline assembly and rendering in Resolve. Seven additive discovery reads preserve the earlier
+timeline assembly and rendering in Resolve, motion-graphics renderer detection, and
+overlay placement on Resolve timelines. Seven additive discovery reads preserve the earlier
 54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
@@ -251,7 +252,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 68 agent operations. Replace spaces in each CLI command
+The server exposes the same 70 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -485,6 +486,44 @@ to `output_path`, which must not exist. If the render fails or passes
 printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","output_path":"/absolute/final.mp4"}' \
   | videogenie resolve render --json --input-json -
 ```
+
+## Place motion graphics overlays
+
+`overlay renderers` reports which motion-graphics renderers this machine can use:
+`pil` (Pillow and FFmpeg, used by `graphics render_lower_third`), `fusion` and
+`lottie` (DaVinci Resolve Studio), and `remotion`, `hyperframes` and `manim`
+(found on `PATH`). Each entry has `available`, `version`, `missing`, a `fix` hint
+and a `note`. Detection installs and downloads nothing, and every version check
+has a time limit. Remotion, HyperFrames and Manim are detected only; VideoGenie
+doesn't render with them yet. Remotion's license is free only for individuals
+and companies of 1–3 people, so it stays off until the owner decides.
+
+```bash
+printf '{}' | videogenie overlay renderers --json --input-json -
+```
+
+`overlay place` puts an existing overlay file on a named timeline in the
+project's own Resolve project: a `.mov` with alpha (such as the lower third's
+QuickTime Animation file) or a `.png` still. The file is imported into the media
+pool once and reused after that. Fusion `.comp` files aren't supported yet and
+return `DEPENDENCY_UNAVAILABLE`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","source_path":"/absolute/lower-third.mov","start_seconds":2,"duration_seconds":5}' \
+  | videogenie overlay place --json --input-json -
+```
+
+`start_seconds` counts from the start of the timeline. With `track` set to
+`"auto"` (the default), the overlay goes on the lowest video track above
+everything in that time range, and a track is added when needed. An explicit
+`track` must be 2 or higher and free over the range. Existing items are never
+moved, trimmed or overwritten; a clash is an error. `position_x` and
+`position_y` (pixels from the frame centre), `scale` (0.05–4) and `opacity`
+(0–1) set Resolve's Pan, Tilt, Zoom and Opacity. A movie must have the timeline's
+frame rate and be at least `duration_seconds` long. The result gives the new
+item's `timeline_item_id`, `track_index`, record frames (end exclusive) and the
+properties read back from Resolve. If any check fails after placing, the item
+(and any track it added) is removed.
 
 ## Recover a probe job
 

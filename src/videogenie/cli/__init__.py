@@ -43,6 +43,7 @@ from videogenie.contracts.models import (
     ResultEnvelope,
     VideoGenieError,
 )
+from videogenie.contracts.overlays import OverlayRenderersInput, PlaceOverlayInput
 from videogenie.contracts.previews import CompareBrandInput, CompareRecipeInput, CreatePreviewInput
 from videogenie.contracts.recipes import (
     BrandDraftInput,
@@ -94,6 +95,7 @@ from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.costs import CostService
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
+from videogenie.core.overlays import place_overlay
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
@@ -101,6 +103,7 @@ from videogenie.core.resolve_render import render_timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
+from videogenie.workers.overlay_renderers import detect_renderers
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -234,6 +237,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "transcript.get": TranscriptInput,
     "resolve.timeline.assemble": AssembleTimelineInput,
     "resolve.render": RenderTimelineInput,
+    "overlay.renderers": OverlayRenderersInput,
+    "overlay.place": PlaceOverlayInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -467,6 +472,8 @@ def _dispatch(
                 "transcript.get",
                 "resolve.timeline.assemble",
                 "resolve.render",
+                "overlay.renderers",
+                "overlay.place",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -506,6 +513,11 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "overlay.renderers":
+        wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
+        return detect_renderers(wanted_renderers.timeout_seconds)
+    if operation == "overlay.place":
+        return place_overlay(service, PlaceOverlayInput.model_validate_json(_strict_json(payload)))
     if operation == "resolve.render":
         return render_timeline(
             service, RenderTimelineInput.model_validate_json(_strict_json(payload))
@@ -616,7 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "command",
         nargs="?",
         help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
-        "artifact, cost, approval, grant, output, resolve, or explicit owner launch",
+        "artifact, cost, approval, grant, output, resolve, overlay, or explicit owner launch",
     )
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"

@@ -362,7 +362,7 @@ class RecipeConsumer(Consumer):
         """Prepare exact content and prove real rendering/replay through separate public clients."""
         capabilities = data(self.cli("capabilities", {}))
         operations = capabilities["operations"]
-        assert isinstance(operations, list) and len(operations) == 68
+        assert isinstance(operations, list) and len(operations) == 70
         assert capabilities["owner_mutations"] == "console_only"
         fixture = self.root / "fixture"
         lock = object_value(json.loads((fixture / "fonts.lock.json").read_text()))
@@ -1156,7 +1156,7 @@ async def scope_continue(admission: dict[str, JsonValue], stage: str) -> dict[st
     async with consumer.connect("mcp-b") as sdk:
         capabilities = data(await consumer.mcp(sdk, "capabilities", {}))
         operations = capabilities["operations"]
-        assert isinstance(operations, list) and len(operations) == 68
+        assert isinstance(operations, list) and len(operations) == 70
         assert without_observation(
             data(await consumer.mcp(sdk, "project.recipe.context", scope))
         ) == without_observation(context)

@@ -58,6 +58,7 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "media.silence.remove": ("source_path", "output_path"),
                 "transcript.create": ("source_path",),
                 "resolve.render": ("output_path",),
+                "overlay.place": ("source_path",),
             }.get(operation, ())
             for path_field in path_fields:
                 path = raw.get(path_field)
