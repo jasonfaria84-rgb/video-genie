@@ -6,15 +6,19 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 69 shared agent operations, including local recipe/brand drafts, immutable
+expose 73 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
-seven additive discovery reads, and two dead-space operations (`media.silence.detect`
-reads only; `media.silence.remove` writes a new file and never overwrites), and
-`resolve.status`, plus `transcript.create`/`transcript.get` (Resolve transcription with
-FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches), and `resolve.timeline.assemble` (new timeline from cut
-plans; never edits an existing timeline) and `resolve.render` (private render, verified,
-then published without overwriting), and `resolve.color.apply` (looks and bounded
-adjustments as CDL in a separate color version; LUTs only from Resolve's library). Resolve work happens only in Resolve projects named
+seven additive discovery reads, and the editing toolkit that follows them:
+`media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
+never overwrites), `resolve.status`, `transcript.create`/`get` (Resolve transcription
+with FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches),
+`resolve.timeline.assemble` (new timeline from cut plans; never edits an existing
+one), `resolve.render` (private render, verified, published without overwriting),
+`resolve.color.apply` (looks and bounded adjustments as CDL in a separate color
+version; LUTs only from Resolve's library), `edit.cuts.plan`/`get` (fillers, false
+starts and pauses from a transcript), `captions.create` (SRT, optional FFmpeg
+burn-in that needs libass), and `render.check` (per-cut review and contact sheet).
+Resolve work happens only in Resolve projects named
 `VideoGenie <project ID>`; never switch away from a person's open project unless
 the request explicitly allows it. General editing/templates, paid provider
 integrations/billing, hosted tenancy, and a physical owner's consent remain

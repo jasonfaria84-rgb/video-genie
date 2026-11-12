@@ -66,7 +66,7 @@ def test_installed_recipe_render_owner_channel_and_recovery(
         assert scope_events[-1]["owner_channel_used"] is False
         assert scope_events[-1]["human_consent"] is False
         discovered = next(e for e in scope_events if e["kind"] == "mcp-discovery")
-        assert len(discovered["tools"]["tools"]) == 69
+        assert len(discovered["tools"]["tools"]) == 73
         for name in ("cli-a", "mcp-b", "cli-c", "mcp-d"):
             assert not list((folder / name).iterdir())
     results = {e["stage"]: e["result"] for e in events if e["kind"] == "scope-only-result"}

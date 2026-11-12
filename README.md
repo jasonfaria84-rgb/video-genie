@@ -10,20 +10,23 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 69 shared agent operations: projects and clients, cycles and
+This source exposes 73 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, dead-space removal, a
-DaVinci Resolve status check, and word-level transcripts, timeline assembly,
-color grading and rendering in Resolve. Seven additive discovery reads preserve the earlier
-54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
-owner console handles enrollment, publication, budget grants, and final review.
+artifacts, costs, approval requests and output selection, plus an editing toolkit:
+dead-space removal, word-level transcripts made in DaVinci Resolve, cut plans that
+remove filler words and false starts, timeline assembly, color grading and
+rendering in Resolve, subtitles, and a self-check of every cut in a render. Seven
+additive discovery reads preserve the earlier 54 operation schemas and results; the
+editing operations follow them. A separate supervised owner console handles
+enrollment, publication, budget grants, and final review.
 
-General video editing, reusable project templates, additional storyline creation,
-paid provider integrations/billing, and hosted tenancy remain outside this slice.
-Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
-environment doesn't configure a VideoGenie integration. Physical owner consent
-and hosted deployment aren't established by synthetic test fixtures.
+Motion graphics overlays, reusable project templates, additional storyline
+creation, paid provider integrations/billing, and hosted tenancy remain outside this
+slice. Resolve operations need DaVinci Resolve Studio running on the same machine
+with external scripting set to Local. Higgsfield and ElevenLabs access elsewhere in
+an agent's environment doesn't configure a VideoGenie integration. Physical owner
+consent and hosted deployment aren't established by synthetic test fixtures.
 
 ## Install
 
@@ -251,7 +254,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 69 agent operations. Replace spaces in each CLI command
+The server exposes the same 73 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -444,7 +447,43 @@ inside a kept word; a filler that overlaps other speech is left in. Single words
 people often double on purpose, such as "very very" or "that that", aren't treated
 as false starts. If nothing would be left, the plan cuts nothing. The plan's
 `kept` ranges are what remains to assemble; it names the transcript and source
-SHA-256 it was made from. Rendering a plan to a new file isn't implemented yet.
+SHA-256 it was made from. Use `resolve timeline assemble` to turn one or more
+plans into a Resolve timeline, then `resolve render` to make the file.
+
+## Create subtitles
+
+`captions create` turns a stored word-level transcript into an SRT file of short
+cues: two spoken words per cue in UPPERCASE by default. Give `cut_plan_id` (a plan
+made from the same transcript) to time cues to the edited output instead of the
+source; words inside cuts are dropped and no cue spans a cut. The SRT is plain UTF-8
+and imports into DaVinci Resolve as a subtitle track. Add `burn_in` to also render
+the subtitles into a new copy of a video with local FFmpeg.
+
+```bash
+printf '%s' '{"transcript_id":"<uuid>","output_path":"/absolute/talk.srt"}' \
+  | videogenie captions create --json --input-json -
+printf '%s' '{"transcript_id":"<uuid>","cut_plan_id":"<uuid>","output_path":"/absolute/talk.srt",
+  "burn_in":{"video_path":"/absolute/talk-edit.mp4","output_path":"/absolute/talk-subtitled.mp4"}}' \
+  | videogenie captions create --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `words_per_cue` | 2 | Spoken words per cue (1 to 12). |
+| `uppercase` | true | Uppercase the text. Leading/trailing punctuation is always removed; apostrophes stay. |
+| `max_cue_seconds` | 3.0 | A cue ends early rather than run longer than this. A pause of 0.5 s or more also ends a cue. |
+| `min_cue_seconds` | 0.35 | Shorter cues join the next (else previous) cue when that fits; otherwise they're lengthened into the following gap. |
+| `burn_in.font_size` | 18 | libass font size on a 288-line canvas, so it scales with video height (8 to 96). |
+| `burn_in.timeout_seconds` | 1800 | Deadline for the burn-in render. |
+
+The result reports the cue count, words captioned and dropped, the SRT's SHA-256 and
+size, and the first five cues. Burn-in reports the new file's SHA-256, size, measured
+duration and the style used. With a cut plan, `burn_in.video_path` must be the edited
+output, not the source. Burn-in needs an FFmpeg built with libass (the `subtitles`
+filter); without it the request fails with `DEPENDENCY_UNAVAILABLE` before anything is
+written, and you can drop `burn_in` to get the SRT alone. Inputs are never modified and
+existing files are never overwritten; a failed burn-in removes the SRT it just wrote.
+MCP paths, including those inside `burn_in`, must be absolute.
 
 ## Check a render before delivery
 
