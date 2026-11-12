@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from videogenie.adapters.owner_auth import OwnerAuth
+from videogenie.adapters.resolve import resolve_status
 from videogenie.cli.owner import HELP as OWNER_HELP
 from videogenie.cli.owner import MODES as OWNER_MODES
 from videogenie.cli.owner import run_owner
@@ -25,6 +26,7 @@ from videogenie.contracts.authority import (
     ReviewInput,
     SelectOutputInput,
 )
+from videogenie.contracts.color import ApplyColorInput
 from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.discovery import (
     ApprovalOutcome,
@@ -63,6 +65,8 @@ from videogenie.contracts.rendering import (
     RenderLowerThirdInput,
     RenderResult,
 )
+from videogenie.contracts.resolve import ResolveStatusInput
+from videogenie.contracts.resolve_render import RenderTimelineInput
 from videogenie.contracts.silence import DetectSilenceInput, RemoveSilenceInput
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -77,17 +81,28 @@ from videogenie.contracts.studio import (
     ProjectClientInput,
     SetWaitInput,
 )
+from videogenie.contracts.transcripts import (
+    AssembleTimelineInput,
+    CreateTranscriptInput,
+    Transcript,
+    TranscriptInput,
+)
+from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
+from videogenie.core.assembly import assemble_timeline
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
+from videogenie.core.color import apply_color
 from videogenie.core.costs import CostService
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
+from videogenie.core.resolve_render import render_timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
+from videogenie.core.transcription import create_transcript
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -216,6 +231,12 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "approval.list": ListApprovalsInput,
     "media.silence.detect": DetectSilenceInput,
     "media.silence.remove": RemoveSilenceInput,
+    "resolve.status": ResolveStatusInput,
+    "transcript.create": CreateTranscriptInput,
+    "transcript.get": TranscriptInput,
+    "resolve.timeline.assemble": AssembleTimelineInput,
+    "resolve.render": RenderTimelineInput,
+    "resolve.color.apply": ApplyColorInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -444,6 +465,12 @@ def _dispatch(
                 "graphics.render_lower_third",
                 "media.silence.detect",
                 "media.silence.remove",
+                "resolve.status",
+                "transcript.create",
+                "transcript.get",
+                "resolve.timeline.assemble",
+                "resolve.render",
+                "resolve.color.apply",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -483,6 +510,26 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "resolve.color.apply":
+        return apply_color(service, ApplyColorInput.model_validate_json(_strict_json(payload)))
+    if operation == "resolve.render":
+        return render_timeline(
+            service, RenderTimelineInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "resolve.timeline.assemble":
+        return assemble_timeline(
+            service, AssembleTimelineInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "transcript.create":
+        return create_transcript(
+            service, CreateTranscriptInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "transcript.get":
+        wanted = TranscriptInput.model_validate_json(_strict_json(payload))
+        return transcript_store.load(service, Transcript, wanted.transcript_id)
+    if operation == "resolve.status":
+        checked = ResolveStatusInput.model_validate_json(_strict_json(payload))
+        return resolve_status(checked.timeout_seconds)
     if operation in {"media.silence.detect", "media.silence.remove"}:
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
@@ -574,8 +621,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        help="capabilities, project, client, asset, recipe, brand, graphics, render, artifact, "
-        "cost, approval, grant, output, or explicit owner launch",
+        help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
+        "artifact, cost, approval, grant, output, resolve, or explicit owner launch",
     )
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"

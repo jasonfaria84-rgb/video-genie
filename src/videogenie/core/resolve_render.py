@@ -1,0 +1,135 @@
+"""Render a Resolve timeline privately, verify it, and publish it without overwriting."""
+
+import os
+import shutil
+import time
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from videogenie.adapters import resolve
+from videogenie.contracts.models import VideoGenieError
+from videogenie.contracts.resolve_render import RenderedTimeline, RenderTimelineInput
+from videogenie.core.service import VideoGenieService
+from videogenie.workers.probe import fingerprint
+from videogenie.workers.silence import _media, _tool
+
+CONTAINERS = {".mp4": "mp4", ".mov": "mov"}
+POLL_SECONDS = 0.5
+
+
+def _output(value: str) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute() or any(ord(char) < 32 for char in value):
+        raise VideoGenieError("INVALID_ARGUMENT", "output_path must be an absolute path")
+    try:
+        parent = candidate.parent.resolve(strict=True)
+    except OSError as exc:
+        raise VideoGenieError("INVALID_ARGUMENT", "output_path folder must exist") from exc
+    output = parent / candidate.name
+    if output.suffix.lower() not in CONTAINERS:
+        raise VideoGenieError("INVALID_ARGUMENT", "output_path must end in .mp4 or .mov")
+    if os.path.lexists(output):
+        raise VideoGenieError("INVALID_ARGUMENT", "output_path already exists; choose a new name")
+    return output
+
+
+def _timeline(project: Any, name: str) -> Any:
+    for index in range(1, int(project.GetTimelineCount() or 0) + 1):
+        timeline = project.GetTimelineByIndex(index)
+        if timeline is not None and timeline.GetName() == name:
+            return timeline
+    raise VideoGenieError("NOT_FOUND", "No timeline with that name in the Resolve project")
+
+
+def render_timeline(service: VideoGenieService, request: RenderTimelineInput) -> RenderedTimeline:
+    """Render through Resolve's queue; stop on deadline and publish only a verified file."""
+    started = time.monotonic()
+    deadline = started + request.timeout_seconds
+    service.get_project(request.project_id)
+    output = _output(request.output_path)
+    app = resolve.connect(min(30.0, request.timeout_seconds))
+    project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
+    timeline = _timeline(project, request.timeline_name)
+    if not project.SetCurrentTimeline(timeline):
+        raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not select the timeline")
+    if request.preset not in (project.GetRenderPresetList() or []):
+        raise VideoGenieError("INVALID_ARGUMENT", "Unknown Resolve render preset")
+    fps = float(timeline.GetSetting("timelineFrameRate") or 0)
+    frames = int(timeline.GetEndFrame()) - int(timeline.GetStartFrame())
+    if fps <= 0 or frames <= 0:
+        raise VideoGenieError("INVALID_ARGUMENT", "The timeline is empty or has no frame rate")
+    staging = service.data_dir / "renders" / uuid4().hex
+    staging.mkdir(parents=True, mode=0o700)
+    job: str | None = None
+    try:
+        if not project.LoadRenderPreset(request.preset):
+            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not load the preset")
+        container = CONTAINERS[output.suffix.lower()]
+        if not project.SetCurrentRenderFormatAndCodec(container, "H264"):
+            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve cannot render H.264 here")
+        settings = {"SelectAllFrames": True, "TargetDir": str(staging), "CustomName": "render"}
+        if not project.SetRenderSettings(settings):
+            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve rejected the render settings")
+        job = project.AddRenderJob()
+        if not job or not project.StartRendering([job], isInteractiveMode=False):
+            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not start rendering")
+        while True:
+            status = project.GetRenderJobStatus(job) or {}
+            state = str(status.get("JobStatus", ""))
+            if state == "Complete":
+                break
+            if state in {"Failed", "Cancelled"}:
+                raise VideoGenieError(
+                    "MEDIA_UNAVAILABLE", "Resolve render failed", details={"status": state}
+                )
+            if time.monotonic() > deadline:
+                project.StopRendering()
+                raise VideoGenieError("MEDIA_UNAVAILABLE", "Render exceeded its deadline")
+            time.sleep(POLL_SECONDS)
+        rendered = [path for path in staging.iterdir() if path.is_file()]
+        if len(rendered) != 1:
+            raise VideoGenieError("MEDIA_UNAVAILABLE", "Resolve did not produce one output file")
+        ffprobe, _ = _tool("ffprobe", deadline)
+        measured = _media(ffprobe, rendered[0], deadline)
+        expected = frames / fps
+        if abs(measured.duration - expected) > max(0.1, 2 / fps):
+            raise VideoGenieError(
+                "MEDIA_UNAVAILABLE",
+                "Rendered duration does not match the timeline",
+                details={"expected": round(expected, 3), "measured": round(measured.duration, 3)},
+            )
+        written = fingerprint(rendered[0], max(1.0, deadline - time.monotonic()))
+        try:
+            os.link(rendered[0], output)
+        except FileExistsError as exc:
+            raise VideoGenieError(
+                "INVALID_ARGUMENT", "output_path already exists; choose a new name"
+            ) from exc
+        except OSError:
+            # Hard links fail across volumes; copy without ever replacing a file.
+            try:
+                with rendered[0].open("rb") as source, output.open("xb") as target:
+                    shutil.copyfileobj(source, target)
+            except FileExistsError as exc:
+                raise VideoGenieError(
+                    "INVALID_ARGUMENT", "output_path already exists; choose a new name"
+                ) from exc
+            except OSError as exc:
+                output.unlink(missing_ok=True)
+                raise VideoGenieError("ACCESS_DENIED", "Output file could not be written") from exc
+    finally:
+        if job:
+            project.DeleteRenderJob(job)
+        shutil.rmtree(staging, ignore_errors=True)
+    return RenderedTimeline(
+        project_id=request.project_id,
+        timeline_name=request.timeline_name,
+        preset=request.preset,
+        path=str(output),
+        sha256=written.sha256,
+        size=written.size,
+        duration_seconds=round(measured.duration, 3),
+        expected_duration_seconds=round(expected, 3),
+        render_seconds=round(time.monotonic() - started, 3),
+    )

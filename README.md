@@ -10,16 +10,16 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 63 shared agent operations: projects and clients, cycles and
+This source exposes 69 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, and dead-space removal.
-Seven additive discovery reads preserve the earlier 54 operation schemas and
-results, and two dead-space operations follow them. A separate supervised
+artifacts, costs, approval requests, output selection, dead-space removal, a
+DaVinci Resolve status check, and word-level transcripts, timeline assembly,
+color grading and rendering in Resolve. Seven additive discovery reads preserve the earlier
+54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
-Removing filler words such as "um" needs word-level transcription and isn't
-implemented yet. General video editing, reusable project templates, additional storyline creation,
+General video editing, reusable project templates, additional storyline creation,
 paid provider integrations/billing, and hosted tenancy remain outside this slice.
 Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
 environment doesn't configure a VideoGenie integration. Physical owner consent
@@ -251,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 63 agent operations. Replace spaces in each CLI command
+The server exposes the same 69 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -412,6 +412,106 @@ MCP paths must be absolute; CLI paths may be relative to the current folder.
 
 This uses silence only. Filler words ("um", "uh") and false starts need a
 word-level transcript and aren't detected yet.
+
+## Check DaVinci Resolve
+
+`resolve status` reports whether DaVinci Resolve Studio is open and scriptable,
+without changing anything in Resolve. When it isn't, `reason` and `fix` say why
+(`library_missing`, `library_unloadable`, `not_running_or_scripting_disabled`,
+`timeout` or `free_edition`).
+
+```bash
+printf '{}' | videogenie resolve status --json --input-json -
+```
+
+Resolve must be open with Preferences > System > General > External scripting
+using set to Local. Set `RESOLVE_SCRIPT_LIB` if Resolve is installed somewhere
+other than the default location. VideoGenie edits only Resolve projects named
+`VideoGenie <project ID>`, and it won't switch away from a project you have open
+unless the request explicitly allows it.
+
+## Transcribe with DaVinci Resolve
+
+`transcript create` imports one local file into the project's own Resolve project
+(`VideoGenie <project_id>`), transcribes it word by word with Resolve Studio, and
+stores the result. `transcript get` reads it back by `transcript_id`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
+  | videogenie transcript create --json --input-json -
+```
+
+Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
+`kind`. Resolve leaves filler words such as "um" and "uh" out of its text, so
+VideoGenie checks every gap between words with FFmpeg: quiet stretches become
+`kind: "silence"` and audible ones `kind: "sound"`, which usually means a filler,
+breath or noise. Transcripts are tied to the source file's SHA-256.
+
+The call refuses when you have a different Resolve project open; pass
+`"allow_switch": true` after saving your work to let VideoGenie open its own
+project. `speaker_detection` (default true), `noise_threshold_db` (default -35)
+and `timeout_seconds` (default 900) are optional. The file must be a format Resolve
+imports; Resolve rejects the AIFF files written by macOS `say`, for example.
+
+## Assemble an edit in DaVinci Resolve
+
+`resolve timeline assemble` builds a new timeline in the project's own Resolve
+project from the kept ranges of one or more takes, in the order given. Each take is
+named by a stored cut plan, whose transcript names the source file; a source that
+changed since transcription is refused.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"},{"cut_plan_id":"<uuid>"}]}' \
+  | videogenie resolve timeline assemble --json --input-json -
+```
+
+The timeline uses the first take's frame rate and resolution, and every take must
+share that frame rate. `fade_frames` (default 1, the shortest fade Resolve allows)
+adds audio fades at each join. `timeline_name` must be new; existing timelines are
+never edited. The result reports the timeline's ID, length in frames and seconds,
+and `cut_points_seconds`, the output times of every join, which `render.check`-style
+reviews can use.
+
+## Grade color in DaVinci Resolve
+
+`resolve color apply` grades clips on a timeline in the project's own Resolve
+project. The grade goes into a separate color version on each clip (default
+`VideoGenie`), so the original grade stays available in Resolve.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","look":"warm_cinematic","adjustments":{"temperature":0.2}}' \
+  | videogenie resolve color apply --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `look` | `neutral` | `neutral`, `neutral_punch`, `warm_cinematic`, `cool_clean`, `soft_film` or `mono`. |
+| `adjustments.exposure_stops` | 0 | -2 to 2 stops. |
+| `adjustments.contrast` | 1 | 0.5 to 2. |
+| `adjustments.saturation` | 1 | 0 to 2. |
+| `adjustments.temperature` | 0 | -1 (cooler) to 1 (warmer). |
+| `adjustments.tint` | 0 | -1 to 1. |
+| `lut` | none | A LUT installed in Resolve's LUT library, as a relative path such as `Blackmagic Design/Blackmagic 4.6K Film to Rec709.cube`. |
+| `track_index`, `item_numbers` | 1, all | Which clips to grade, by position on the track. |
+| `version_name` | `VideoGenie` | The color version that holds the grade. |
+
+The look and adjustments become ASC CDL values on node 1. Resolve only applies
+LUTs from its own LUT library, so install new LUTs through Resolve first. Raw
+filter text and arbitrary file paths aren't accepted.
+
+## Render a timeline from DaVinci Resolve
+
+`resolve render` renders one timeline of the project's own Resolve project to a
+new `.mp4` or `.mov` file with H.264, using a Resolve render preset (default
+`H.264 Master`). Resolve renders into a private folder under the data directory;
+VideoGenie checks that the file's duration matches the timeline, then publishes it
+to `output_path`, which must not exist. If the render fails or passes
+`timeout_seconds`, it is stopped and nothing is published.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","output_path":"/absolute/final.mp4"}' \
+  | videogenie resolve render --json --input-json -
+```
 
 ## Recover a probe job
 

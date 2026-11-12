@@ -40,6 +40,7 @@ DOCUMENTATION_ONLY = {
 KNOWN_TESTS = {
     "tests/test_activity.py",
     "tests/test_artifact_preview.py",
+    "tests/test_assembly.py",
     "tests/test_assets.py",
     "tests/test_authority.py",
     "tests/test_authority_cost_contracts.py",
@@ -48,6 +49,7 @@ KNOWN_TESTS = {
     "tests/test_cli_discovery.py",
     "tests/test_cli_operations.py",
     "tests/test_cli_recipes.py",
+    "tests/test_color.py",
     "tests/test_costs.py",
     "tests/test_discovery.py",
     "tests/test_discovery_contracts.py",
@@ -73,12 +75,16 @@ KNOWN_TESTS = {
     "tests/test_recipe_previews.py",
     "tests/test_recipe_render_install.py",
     "tests/test_recipes.py",
+    "tests/test_resolve.py",
+    "tests/test_resolve_render.py",
     "tests/test_silence.py",
     "tests/test_render_contracts.py",
     "tests/test_render_jobs.py",
     "tests/test_render_plan.py",
     "tests/test_studio.py",
     "tests/test_studio_contracts.py",
+    "tests/test_transcription.py",
+    "tests/test_transcripts.py",
 }
 TRANSPORT_TESTS = {
     "tests/test_cli.py",
@@ -93,6 +99,10 @@ TRANSPORT_TESTS = {
     "tests/test_local_studio_install.py",
     "tests/test_recipe_render_install.py",
     "tests/test_silence.py",
+    "tests/test_transcription.py",
+    "tests/test_assembly.py",
+    "tests/test_resolve_render.py",
+    "tests/test_color.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -118,6 +128,8 @@ RENDER_TESTS = (
 # Explicit shared test fixtures, including indirect consumers. The inventory test
 # checks real Python imports so a new helper edge cannot silently narrow selection.
 TEST_IMPORTERS = {
+    "test_assembly": {"test_resolve_render", "test_color"},
+    "test_resolve_render": {"test_color"},
     "test_costs": {"test_authority"},
     "test_authority": {
         "test_cli_discovery",
@@ -197,6 +209,28 @@ PATH_TESTS = {
     "src/videogenie/workers/lower_third.py": RENDER_TESTS,
     "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
     "src/videogenie/workers/silence.py": {"tests/test_silence.py"},
+    "src/videogenie/adapters/resolve.py": {
+        "tests/test_resolve.py",
+        "tests/test_transcription.py",
+        "tests/test_assembly.py",
+        "tests/test_resolve_render.py",
+        "tests/test_color.py",
+    },
+    "src/videogenie/core/transcription.py": {
+        "tests/test_transcription.py",
+        "tests/test_assembly.py",
+    },
+    "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
+    "src/videogenie/core/resolve_render.py": {
+        "tests/test_resolve_render.py",
+        "tests/test_color.py",
+    },
+    "src/videogenie/core/color.py": {"tests/test_color.py"},
+    "src/videogenie/core/transcripts.py": {
+        "tests/test_transcripts.py",
+        "tests/test_transcription.py",
+        "tests/test_assembly.py",
+    },
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",
         "tests/test_external_install.py",
