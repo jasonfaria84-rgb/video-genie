@@ -136,6 +136,57 @@ def test_installed_catalog_and_pure_schemas(installed: Path, tmp_path: Path) -> 
     assert not (state / ".cleo").exists()
 
 
+def test_installed_asset_path_semantics(installed: Path, tmp_path: Path) -> None:
+    caller = tmp_path / "outside"
+    caller.mkdir()
+    source = caller / "source"
+    source.mkdir()
+    (source / "asset.bin").write_bytes(b"fictional asset bytes")
+    (caller / "file-alias").symlink_to(source / "asset.bin")
+    (caller / "directory-alias").symlink_to(source, target_is_directory=True)
+    state = tmp_path / "state"
+    request: dict[str, JsonValue] = {
+        "source_path": "source/asset.bin",
+        "storage_mode": "copy",
+        "media_type": "application/octet-stream",
+        "origin": {"kind": "generated"},
+        "license_provenance": None,
+        "max_bytes": 1024,
+        "idempotency_key": "source",
+    }
+    expected = hashlib.sha256(b"fictional asset bytes").hexdigest()
+    for index, path in enumerate(("source/asset.bin", "file-alias", "directory-alias/asset.bin")):
+        registered = data(
+            invoke(
+                installed,
+                caller,
+                state,
+                "asset.register",
+                request
+                | {
+                    "source_path": path,
+                    "idempotency_key": f"alias-{index}",
+                },
+            )
+        )
+        assert registered["sha256"] == expected
+    for path in ("source/../source/asset.bin", str(caller / "source/../source/asset.bin")):
+        rejected = invoke(
+            installed,
+            caller,
+            state,
+            "asset.register",
+            request
+            | {
+                "source_path": path,
+                "idempotency_key": "traversal",
+            },
+            code=2,
+        )
+        error = rejected["error"]
+        assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
+
+
 def test_installed_assets_drafts_and_real_preview(installed: Path, tmp_path: Path) -> None:
     a, b = tmp_path / "agent-a", tmp_path / "agent-b"
     a.mkdir()
@@ -363,7 +414,10 @@ def test_installed_authorized_render_review_and_restart(
     reference = job["result_ref"]
     assert isinstance(reference, dict)
     artifact_scope = scope | {"artifact_id": reference["artifact_id"]}
-    artifact = data(invoke(installed, b, state, "artifact.get", artifact_scope))
+    artifact_response = invoke(installed, b, state, "artifact.get", artifact_scope)
+    assert artifact_response["project_id"] == scope["project_id"]
+    assert artifact_response["storyline_id"] == scope["storyline_id"]
+    artifact = data(artifact_response)
     assert data(invoke(installed, a, state, "artifact.list", scope))["artifacts"] == [reference]
     path = state / string(reference, "locator")
     assert hashlib.sha256(path.read_bytes()).hexdigest() == reference["sha256"]

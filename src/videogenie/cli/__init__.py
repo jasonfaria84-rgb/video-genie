@@ -51,6 +51,7 @@ from videogenie.contracts.rendering import (
     RenderConfigInput,
     RenderJobInput,
     RenderLowerThirdInput,
+    RenderResult,
 )
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -262,12 +263,14 @@ def _recipe_dispatch(
 ) -> BaseModel | dict[str, JsonValue]:
     """Route public agent operations through strict JSON models and existing domain rules."""
     if operation == "asset.register" and isinstance(payload.get("source_path"), str):
-        # CLI paths resolve once against the caller. MCP rejects relative paths before dispatch.
+        # Anchor relative CLI paths without erasing shared traversal/alias validation.
         source = payload["source_path"]
         assert isinstance(source, str)
         if not source or "://" in source or any(ord(char) < 32 for char in source):
             raise VideoGenieError("INVALID_ARGUMENT", "Asset path must name a local file")
-        payload = payload | {"source_path": str(Path(source).resolve())}
+        payload = payload | {
+            "source_path": source if Path(source).is_absolute() else str(Path.cwd() / source)
+        }
     # JSON mode preserves strict numbers/bools while accepting JSON arrays for tuple fields.
     request = INPUT_MODELS[operation].model_validate_json(json.dumps(payload, allow_nan=False))
     if isinstance(request, RegisterAssetInput):
@@ -359,6 +362,9 @@ def _result_context(
     operation: str, payload: dict[str, JsonValue], result: BaseModel | dict[str, JsonValue]
 ) -> tuple[str | None, str | None]:
     """Use returned domain scope, or declared input scope for collection responses."""
+    if isinstance(result, RenderResult):
+        request = result.manifest.request
+        return request.project_id, request.storyline_id
     if isinstance(result, OwnerChallenge):
         action = result.action
         scoped = getattr(action, "target", getattr(action, "terms", action))
