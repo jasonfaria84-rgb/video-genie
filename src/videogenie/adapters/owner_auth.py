@@ -128,6 +128,10 @@ class OwnerAuth:
 
     def __init__(self, service: VideoGenieService, *, origin: str) -> None:
         self.service = service
+        self._set_policy(origin)
+        self._initialize()
+
+    def _set_policy(self, origin: str) -> None:
         try:
             parsed = urlsplit(origin)
             if (
@@ -149,40 +153,60 @@ class OwnerAuth:
             ) from exc
         self.origin = origin
         self.rp_id = "localhost"
-        self._initialize()
+
+    @staticmethod
+    def _existing_config(connection: sqlite3.Connection) -> sqlite3.Row | None:
+        present = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        } & _TABLES
+        if not present:
+            return None
+        if present != _TABLES:
+            raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete owner authentication schema")
+        for table, columns in _COLUMNS.items():
+            if [
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            ] != columns.split():
+                raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete owner table layout")
+        rows = connection.execute("SELECT * FROM owner_auth_config").fetchall()
+        if len(rows) != 1 or rows[0]["version"] != 1:
+            raise VideoGenieError("UNSUPPORTED_SCHEMA", "Unsupported owner authentication schema")
+        guards = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        if not _GUARDS <= guards:
+            raise VideoGenieError("UNSUPPORTED_SCHEMA", "Missing owner immutability guards")
+        row = rows[0]
+        assert isinstance(row, sqlite3.Row)
+        return row
+
+    @classmethod
+    def open_existing(cls, service: VideoGenieService) -> "OwnerAuth":
+        """Open the exact persisted owner policy without initializing or enrolling anyone."""
+        with service.connection() as connection:
+            row = cls._existing_config(connection)
+            if row is None:
+                raise _deny("owner_auth_uninitialized")
+            instance = cls.__new__(cls)
+            instance.service = service
+            try:
+                instance._set_policy(row["origin"])
+            except VideoGenieError as exc:
+                raise VideoGenieError("UNSUPPORTED_SCHEMA", "Invalid stored owner policy") from exc
+            if row["rp_id"] != instance.rp_id:
+                raise VideoGenieError("UNSUPPORTED_SCHEMA", "Invalid stored relying party")
+            instance.application_instance_id = row["instance_id"]
+            return instance
 
     def _initialize(self) -> None:
         with self.service.connection(write=True) as connection:
-            present = {
-                row[0]
-                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            } & _TABLES
-            if present:
-                if present != _TABLES:
-                    raise VideoGenieError(
-                        "UNSUPPORTED_SCHEMA", "Incomplete owner authentication schema"
-                    )
-                for table, columns in _COLUMNS.items():
-                    if [
-                        row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-                    ] != columns.split():
-                        raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete owner table layout")
-                rows = connection.execute("SELECT * FROM owner_auth_config").fetchall()
-                if len(rows) != 1 or rows[0]["version"] != 1:
-                    raise VideoGenieError(
-                        "UNSUPPORTED_SCHEMA", "Unsupported owner authentication schema"
-                    )
-                if rows[0]["origin"] != self.origin or rows[0]["rp_id"] != self.rp_id:
+            row = self._existing_config(connection)
+            if row is not None:
+                if row["origin"] != self.origin or row["rp_id"] != self.rp_id:
                     raise _deny("rp_policy_changed")
-                guards = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='trigger'"
-                    )
-                }
-                if not _GUARDS <= guards:
-                    raise VideoGenieError("UNSUPPORTED_SCHEMA", "Missing owner immutability guards")
-                self.application_instance_id = rows[0]["instance_id"]
+                self.application_instance_id = row["instance_id"]
                 return
             connection.execute("""CREATE TABLE owner_auth_config (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL,

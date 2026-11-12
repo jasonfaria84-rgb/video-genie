@@ -11,15 +11,45 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
+from videogenie.adapters.owner_auth import OwnerAuth
 from videogenie.cli.owner import HELP as OWNER_HELP
 from videogenie.cli.owner import MODES as OWNER_MODES
 from videogenie.cli.owner import run_owner
+from videogenie.contracts.assets import AssetLookupInput, RegisterAssetInput
+from videogenie.contracts.authority import (
+    GrantInput,
+    OwnerActionRequest,
+    OwnerChallenge,
+    OwnerChallengeInput,
+    ProjectAuthorityScope,
+    ReviewInput,
+    SelectOutputInput,
+)
+from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.models import (
-    ContractModel,
     Identifier,
-    Project,
     ResultEnvelope,
     VideoGenieError,
+)
+from videogenie.contracts.previews import CompareBrandInput, CompareRecipeInput, CreatePreviewInput
+from videogenie.contracts.recipes import (
+    BrandDraftInput,
+    BrandScopeInput,
+    BrandVersionInput,
+    CreateBrandDraftInput,
+    CreateRecipeDraftInput,
+    RecipeDraftInput,
+    RecipeVersionInput,
+    UpdateBrandDraftInput,
+    UpdateRecipeDraftInput,
+)
+from videogenie.contracts.rendering import (
+    ArtifactInput,
+    BindRenderConfigInput,
+    ListArtifactsInput,
+    RenderConfigInput,
+    RenderJobInput,
+    RenderLowerThirdInput,
 )
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -27,18 +57,21 @@ from videogenie.contracts.studio import (
     ClientRevisionInput,
     CloseCycleInput,
     CreateClientInput,
-    DurationReport,
     DurationReportInput,
     ListClientsInput,
     OpenCycleInput,
-    ProjectActivity,
     ProjectActivityInput,
     ProjectClientInput,
-    ProjectClientLink,
     SetWaitInput,
 )
 from videogenie.core.activity import ActivityService
-from videogenie.core.jobs import Job, JobService
+from videogenie.core.assets import AssetService
+from videogenie.core.authority import OwnerAuthorityService
+from videogenie.core.costs import CostService
+from videogenie.core.jobs import JobService
+from videogenie.core.recipe_previews import RecipePreviewService
+from videogenie.core.recipes import RecipeService
+from videogenie.core.rendering import RenderService
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 
@@ -127,6 +160,38 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "project.cycle.close": CloseCycleInput,
     "project.wait.set": SetWaitInput,
     "project.duration": DurationReportInput,
+    "asset.register": RegisterAssetInput,
+    "asset.get": AssetLookupInput,
+    "asset.verify": AssetLookupInput,
+    "recipe.draft.create": CreateRecipeDraftInput,
+    "recipe.draft.update": UpdateRecipeDraftInput,
+    "recipe.draft.get": RecipeDraftInput,
+    "recipe.draft.list": _Input,
+    "recipe.version.get": RecipeVersionInput,
+    "brand.draft.create": CreateBrandDraftInput,
+    "brand.draft.update": UpdateBrandDraftInput,
+    "brand.draft.get": BrandDraftInput,
+    "brand.draft.list": BrandScopeInput,
+    "brand.version.get": BrandVersionInput,
+    "recipe.preview": CreatePreviewInput,
+    "recipe.compare": CompareRecipeInput,
+    "brand.compare": CompareBrandInput,
+    "project.recipe.bind": BindRenderConfigInput,
+    "project.recipe.get": RenderConfigInput,
+    "graphics.render_lower_third": RenderLowerThirdInput,
+    "render.job.get": RenderJobInput,
+    "render.job.resume": RenderJobInput,
+    "render.job.list": ProjectAuthorityScope,
+    "artifact.get": ArtifactInput,
+    "artifact.list": ListArtifactsInput,
+    "cost.report": CostReportInput,
+    "approval.request": OwnerActionRequest,
+    "approval.get": OwnerChallengeInput,
+    "grant.get": GrantInput,
+    "output.review.prepare": ArtifactInput,
+    "output.review.get": ReviewInput,
+    "output.select": SelectOutputInput,
+    "output.selection.get": ProjectAuthorityScope,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -191,6 +256,126 @@ def _context_id(value: JsonValue | None) -> str | None:
     return None
 
 
+def _recipe_dispatch(
+    service: VideoGenieService, operation: str, payload: dict[str, JsonValue]
+) -> BaseModel | dict[str, JsonValue]:
+    """Route public agent operations through strict JSON models and existing domain rules."""
+    if operation == "asset.register" and isinstance(payload.get("source_path"), str):
+        # CLI paths resolve once against the caller. MCP rejects relative paths before dispatch.
+        source = payload["source_path"]
+        assert isinstance(source, str)
+        if not source or "://" in source or any(ord(char) < 32 for char in source):
+            raise VideoGenieError("INVALID_ARGUMENT", "Asset path must name a local file")
+        payload = payload | {"source_path": str(Path(source).resolve())}
+    # JSON mode preserves strict numbers/bools while accepting JSON arrays for tuple fields.
+    request = INPUT_MODELS[operation].model_validate_json(json.dumps(payload, allow_nan=False))
+    if isinstance(request, RegisterAssetInput):
+        return AssetService(service).register_asset(request)
+    if isinstance(request, AssetLookupInput):
+        assets = AssetService(service)
+        if operation == "asset.get":
+            return assets.get_asset(request.asset_id, request.version_id)
+        return assets.verify_asset(request.asset_id, request.version_id)
+    if isinstance(request, CostReportInput):
+        return CostService(service).report(request)
+    recipes = RecipeService(StudioService(service))
+    if isinstance(request, UpdateRecipeDraftInput):
+        return recipes.update_recipe_draft(request)
+    if isinstance(request, CreateRecipeDraftInput):
+        return recipes.create_recipe_draft(request)
+    if isinstance(request, RecipeVersionInput):
+        return recipes.get_recipe_version(request)
+    if isinstance(request, RecipeDraftInput):
+        return recipes.get_recipe_draft(request)
+    if operation == "recipe.draft.list":
+        return {"recipes": [item.model_dump(mode="json") for item in recipes.list_recipe_drafts()]}
+    if isinstance(request, UpdateBrandDraftInput):
+        return recipes.update_brand_draft(request)
+    if isinstance(request, CreateBrandDraftInput):
+        return recipes.create_brand_draft(request)
+    if isinstance(request, BrandVersionInput):
+        return recipes.get_brand_version(request)
+    if isinstance(request, BrandDraftInput):
+        return recipes.get_brand_draft(request)
+    if isinstance(request, BrandScopeInput):
+        return {
+            "brands": [item.model_dump(mode="json") for item in recipes.list_brand_drafts(request)]
+        }
+    if isinstance(request, CreatePreviewInput):
+        return RecipePreviewService(recipes).create_preview(request)
+    if isinstance(request, CompareRecipeInput):
+        return RecipePreviewService(recipes).compare_recipe(request)
+    if isinstance(request, CompareBrandInput):
+        return RecipePreviewService(recipes).compare_brand(request)
+    authority = OwnerAuthorityService(recipes, OwnerAuth.open_existing(service))
+    if isinstance(request, OwnerActionRequest):
+        return authority.request_action(request)
+    if isinstance(request, OwnerChallengeInput):
+        return authority.get_challenge(request)
+    if isinstance(request, GrantInput):
+        return authority.get_grant(request)
+    if isinstance(request, ReviewInput):
+        return authority.get_review(request)
+    renderer = RenderService(authority)
+    if isinstance(request, BindRenderConfigInput):
+        return renderer.bind_config(request)
+    if isinstance(request, RenderLowerThirdInput):
+        return renderer.submit_lower_third(request)
+    if isinstance(request, RenderConfigInput):
+        return renderer.get_config(request)
+    if isinstance(request, RenderJobInput):
+        if operation == "render.job.get":
+            return renderer.get_job(request)
+        return renderer.resume_job(request)
+    if isinstance(request, ListArtifactsInput):
+        return {
+            "artifacts": [item.model_dump(mode="json") for item in renderer.list_artifacts(request)]
+        }
+    if isinstance(request, ArtifactInput):
+        if operation == "artifact.get":
+            return renderer.get_artifact(request)
+        view = renderer.prepare_output_review(request)
+        return {
+            "target": view.target.model_dump(mode="json"),
+            "evidence": view.evidence.model_dump(mode="json"),
+            "costs": view.costs.model_dump(mode="json"),
+        }
+    if isinstance(request, SelectOutputInput):
+        selected = renderer.select_output(request)
+        return {"revision": selected.revision, "review": selected.review.model_dump(mode="json")}
+    assert isinstance(request, ProjectAuthorityScope)
+    if operation == "render.job.list":
+        return {"jobs": [item.model_dump(mode="json") for item in renderer.list_jobs(request)]}
+    selection = renderer.get_selection(request)
+    return {
+        "selection": None
+        if selection is None
+        else {"revision": selection.revision, "review": selection.review.model_dump(mode="json")}
+    }
+
+
+def _result_context(
+    operation: str, payload: dict[str, JsonValue], result: BaseModel | dict[str, JsonValue]
+) -> tuple[str | None, str | None]:
+    """Use returned domain scope, or declared input scope for collection responses."""
+    if isinstance(result, OwnerChallenge):
+        action = result.action
+        scoped = getattr(action, "target", getattr(action, "terms", action))
+        return (
+            _context_id(getattr(scoped, "project_id", None)),
+            _context_id(getattr(scoped, "storyline_id", None)),
+        )
+    data = result.model_dump(mode="json") if isinstance(result, BaseModel) else result
+    for value in (data, data.get("target"), data.get("artifact"), data.get("scope")):
+        if isinstance(value, dict) and "project_id" in value:
+            return _context_id(value.get("project_id")), _context_id(value.get("storyline_id"))
+    fields = INPUT_MODELS[operation].model_fields
+    return (
+        _context_id(payload.get("project_id")) if "project_id" in fields else None,
+        _context_id(payload.get("storyline_id")) if "storyline_id" in fields else None,
+    )
+
+
 def _dispatch(
     service: VideoGenieService, operation: str, payload: dict[str, JsonValue]
 ) -> BaseModel | dict[str, JsonValue]:
@@ -200,6 +385,10 @@ def _dispatch(
             **JobService(service).capabilities(),
             "api_version": "1",
             "operations": list(OPERATIONS),
+            "supported_capabilities": ["media.probe", "graphics.render_lower_third"],
+            "supported_providers": ["local-pillow-ffmpeg"],
+            "paid_providers_supported": False,
+            "owner_mutations": "console_only",
         }
     if operation == "project.create":
         create = _Create.model_validate(payload)
@@ -299,6 +488,8 @@ def _dispatch(
             )
         report = DurationReportInput.model_validate(payload)
         return activity.duration_report(report.project_id, report.as_of)
+    if operation not in {"job.get", "job.resume"}:
+        return _recipe_dispatch(service, operation, payload)
     selected_job = _JobID.model_validate(payload)
     jobs = JobService(service)
     if operation == "job.get":
@@ -312,14 +503,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="videogenie",
         add_help=False,
         description="Video Genie — agentic multicam video production.",
-        epilog="Project lifecycle and media probe commands are available. "
+        epilog="Project/client lifecycle, local recipes, previews and authorized renders "
+        "are available. "
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
     parser.add_argument(
         "command",
         nargs="?",
-        help="capabilities, project, media, job, client, or explicit owner launch",
+        help="capabilities, project, client, asset, recipe, brand, graphics, render, artifact, "
+        "cost, approval, grant, output, or explicit owner launch",
     )
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume"
@@ -406,18 +599,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = _input(arguments.input_json)
         service = VideoGenieService(arguments.data_dir)
         result = _dispatch(service, operation, payload)
+        project_id, storyline_id = _result_context(operation, payload, result)
         print(
             ResultEnvelope[JsonValue](
                 success=True,
                 data=result.model_dump(mode="json") if isinstance(result, BaseModel) else result,
-                project_id=(
-                    result.project_id
-                    if isinstance(
-                        result, (Project, Job, ProjectClientLink, ProjectActivity, DurationReport)
-                    )
-                    else None
-                ),
-                storyline_id=result.storyline_id if isinstance(result, (Project, Job)) else None,
+                project_id=project_id,
+                storyline_id=storyline_id,
             ).model_dump_json()
         )
         return 0
@@ -437,8 +625,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     context = payload
     input_model = INPUT_MODELS.get(operation)
-    if input_model is not None and issubclass(input_model, ContractModel):
-        # Rejected extra IDs cannot claim context outside a studio operation's schema.
+    if input_model is not None:
+        # Rejected extra IDs cannot claim context outside the operation's declared schema.
         context = {key: value for key, value in payload.items() if key in input_model.model_fields}
     print(
         error.to_envelope(
