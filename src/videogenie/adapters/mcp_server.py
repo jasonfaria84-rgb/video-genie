@@ -11,12 +11,36 @@ from mcp.server.mcpserver.tools import Tool
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field, JsonValue, ValidationError
 
-from videogenie.contracts.models import Project, ResultEnvelope, VideoGenieError, canonical_uuid
+from videogenie.contracts.models import (
+    ContractModel,
+    Project,
+    ResultEnvelope,
+    VideoGenieError,
+    canonical_uuid,
+)
+from videogenie.contracts.studio import (
+    AssignProjectClientInput,
+    ClientInput,
+    ClientRevisionInput,
+    CloseCycleInput,
+    CreateClientInput,
+    CycleOutcome,
+    DurationReportInput,
+    ListClientsInput,
+    OpenCycleInput,
+    ProjectActivityInput,
+    ProjectClientInput,
+    SetWaitInput,
+    WaitReason,
+)
+from videogenie.core.activity import ActivityService
 from videogenie.core.jobs import Job, JobService
 from videogenie.core.service import VideoGenieService
+from videogenie.core.studio import StudioService
 
 Text = Annotated[str, Field(min_length=1, max_length=200)]
 Revision = Annotated[int, Field(ge=1)]
+ActivityRevision = Annotated[int, Field(ge=0)]
 OPERATIONS = [
     "capabilities",
     "project.create",
@@ -28,7 +52,34 @@ OPERATIONS = [
     "media.probe",
     "job.get",
     "job.resume",
+    "client.create",
+    "client.list",
+    "client.get",
+    "client.archive",
+    "client.restore",
+    "project.client.get",
+    "project.client.assign",
+    "project.activity.get",
+    "project.cycle.open",
+    "project.cycle.close",
+    "project.wait.set",
+    "project.duration",
 ]
+
+STUDIO_INPUTS: dict[str, type[ContractModel]] = {
+    "client_create": CreateClientInput,
+    "client_list": ListClientsInput,
+    "client_get": ClientInput,
+    "client_archive": ClientRevisionInput,
+    "client_restore": ClientRevisionInput,
+    "project_client_get": ProjectClientInput,
+    "project_client_assign": AssignProjectClientInput,
+    "project_activity_get": ProjectActivityInput,
+    "project_cycle_open": OpenCycleInput,
+    "project_cycle_close": CloseCycleInput,
+    "project_wait_set": SetWaitInput,
+    "project_duration": DurationReportInput,
+}
 
 
 def _safe_id(value: object) -> str | None:
@@ -48,7 +99,7 @@ def _result(envelope: ResultEnvelope[JsonValue]) -> CallToolResult:
 
 
 def _invoke(
-    operation: Callable[[], Project | Job | dict[str, JsonValue]],
+    operation: Callable[[], ContractModel | dict[str, JsonValue]],
     project_id: str | None = None,
     storyline_id: str | None = None,
 ) -> CallToolResult:
@@ -56,6 +107,7 @@ def _invoke(
         result = operation()
         if isinstance(result, Project | Job):
             project_id, storyline_id = result.project_id, result.storyline_id
+        if isinstance(result, ContractModel):
             data = result.model_dump(mode="json")
         else:
             data = result
@@ -73,6 +125,8 @@ def _invoke(
 def build_server(service: VideoGenieService) -> MCPServer[object]:
     """Build typed stdio tools; installed SDK 2.3 / protocol 2026-07-28 is tested."""
     jobs = JobService(service)
+    studio = StudioService(service)
+    activity = ActivityService(studio)
 
     def capabilities() -> CallToolResult:
         """Report implemented operations and real ffprobe dependency health; no media work."""
@@ -131,6 +185,86 @@ def build_server(service: VideoGenieService) -> MCPServer[object]:
         """Resume recoverable work; reject live leases and reuse completed artifacts."""
         return _invoke(lambda: jobs.resume_job(project_id, job_id), project_id)
 
+    def client_create(name: Text, idempotency_key: Text) -> CallToolResult:
+        """Create a client identity, or replay its creation key without duplicating it."""
+        return _invoke(lambda: studio.create_client(name, idempotency_key))
+
+    def client_list(include_archived: bool = False) -> CallToolResult:
+        """List active clients, optionally including retained archived identities."""
+        return _invoke(
+            lambda: {
+                "clients": [
+                    client.model_dump(mode="json")
+                    for client in studio.list_clients(include_archived)
+                ]
+            }
+        )
+
+    def client_get(client_id: str) -> CallToolResult:
+        """Read an explicit client ID, including archived records."""
+        return _invoke(lambda: studio.get_client(client_id))
+
+    def client_archive(client_id: str, expected_revision: Revision) -> CallToolResult:
+        """Archive at the current client revision, preserving project links and history."""
+        return _invoke(lambda: studio.archive_client(client_id, expected_revision))
+
+    def client_restore(client_id: str, expected_revision: Revision) -> CallToolResult:
+        """Restore the same client identity with optimistic revision checking."""
+        return _invoke(lambda: studio.restore_client(client_id, expected_revision))
+
+    def project_client_get(project_id: str) -> CallToolResult:
+        """Read a project's nullable client link and current project revision."""
+        return _invoke(lambda: studio.get_project_client(project_id), project_id)
+
+    def project_client_assign(
+        project_id: str, client_id: str | None, expected_project_revision: Revision
+    ) -> CallToolResult:
+        """Assign or explicitly clear a client link at the current project revision."""
+        return _invoke(
+            lambda: studio.assign_project_client(project_id, client_id, expected_project_revision),
+            project_id,
+        )
+
+    def project_activity_get(project_id: str) -> CallToolResult:
+        """Read retained work cycles, current wait and the independent activity revision."""
+        return _invoke(lambda: activity.get_activity(project_id), project_id)
+
+    def project_cycle_open(
+        project_id: str, expected_activity_revision: ActivityRevision
+    ) -> CallToolResult:
+        """Open or reopen work with a fresh cycle ID; this does not change archive state."""
+        return _invoke(
+            lambda: activity.open_cycle(project_id, expected_activity_revision), project_id
+        )
+
+    def project_cycle_close(
+        project_id: str,
+        cycle_id: str,
+        expected_activity_revision: ActivityRevision,
+        outcome: CycleOutcome = "completed",
+    ) -> CallToolResult:
+        """Close a project-owned work cycle; completion is not approval or delivery."""
+        return _invoke(
+            lambda: activity.close_cycle(project_id, cycle_id, expected_activity_revision, outcome),
+            project_id,
+        )
+
+    def project_wait_set(
+        project_id: str,
+        cycle_id: str,
+        expected_activity_revision: ActivityRevision,
+        reason: WaitReason | None,
+    ) -> CallToolResult:
+        """Set an explicit owner/client/input wait, or clear it with null."""
+        return _invoke(
+            lambda: activity.set_wait(project_id, cycle_id, expected_activity_revision, reason),
+            project_id,
+        )
+
+    def project_duration(project_id: str, as_of: str | None = None) -> CallToolResult:
+        """Report age, frozen completion and observed processing; unobserved time stays unknown."""
+        return _invoke(lambda: activity.duration_report(project_id, as_of), project_id)
+
     tools = [
         Tool.from_function(function, name="videogenie_" + function.__name__)
         for function in (
@@ -144,10 +278,25 @@ def build_server(service: VideoGenieService) -> MCPServer[object]:
             media_probe,
             job_get,
             job_resume,
+            client_create,
+            client_list,
+            client_get,
+            client_archive,
+            client_restore,
+            project_client_get,
+            project_client_assign,
+            project_activity_get,
+            project_cycle_open,
+            project_cycle_close,
+            project_wait_set,
+            project_duration,
         )
     ]
     by_name = {tool.name: tool for tool in tools}
+    studio_models = {"videogenie_" + name: model for name, model in STUDIO_INPUTS.items()}
     for tool in tools:
+        if tool.name in studio_models:
+            tool.parameters = studio_models[tool.name].model_json_schema()
         tool.parameters["additionalProperties"] = False
         tool.fn_metadata.output_model = ResultEnvelope[JsonValue]
         tool.fn_metadata.output_schema = ResultEnvelope[JsonValue].model_json_schema()
@@ -161,17 +310,26 @@ def build_server(service: VideoGenieService) -> MCPServer[object]:
             if isinstance(name, str) and name in by_name:
                 arguments = ctx.params.get("arguments", {})
                 try:
-                    by_name[name].fn_metadata.arg_model.model_validate(
-                        arguments, strict=True, extra="forbid"
-                    )
+                    model = studio_models.get(name, by_name[name].fn_metadata.arg_model)
+                    validated = model.model_validate(arguments, strict=True, extra="forbid")
+                    if name in studio_models:
+                        # Schema metadata is validated, but is not a domain method argument.
+                        ctx.params = dict(
+                            ctx.params,
+                            arguments=validated.model_dump(exclude={"schema_version"}),
+                        )
                 except ValidationError:
                     context = arguments if isinstance(arguments, dict) else {}
                     return _result(
                         VideoGenieError(
                             "INVALID_ARGUMENT", "Arguments must match the advertised tool schema"
                         ).to_envelope(
-                            project_id=_safe_id(context.get("project_id")),
-                            storyline_id=_safe_id(context.get("storyline_id")),
+                            project_id=_safe_id(context.get("project_id"))
+                            if name not in studio_models or name.startswith("videogenie_project_")
+                            else None,
+                            storyline_id=_safe_id(context.get("storyline_id"))
+                            if name not in studio_models
+                            else None,
                         )
                     )
         return await call_next(ctx)
