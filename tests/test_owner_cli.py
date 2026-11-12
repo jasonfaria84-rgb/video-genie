@@ -519,3 +519,23 @@ sys.exit(main())
     assert "launch=" not in out + err and not handoff.exists()
     with socket.socket() as available:
         available.bind(("127.0.0.1", number))
+
+
+def test_cleanup_failure_is_visible_without_second_json_or_secret(
+    installed: Path, tmp_path: Path
+) -> None:
+    injected = """import os,sys
+def fail(*args,**kwargs): raise PermissionError('injected handoff cleanup failure')
+os.unlink=fail
+from videogenie.cli import main
+sys.exit(main())
+"""
+    child, handoff, _ = launch(installed, tmp_path, "serve", port(), inject=injected)
+    ready(child)
+    private = handoff.read_text()
+    child.send_signal(signal.SIGTERM)
+    out, err = child.communicate(timeout=10)
+    assert child.returncode == 1 and out == ""
+    assert err == "ACCESS_DENIED: Private owner handoff cleanup unconfirmed\n"
+    assert private not in err and "launch=" not in err and str(handoff) not in err
+    assert handoff.exists()

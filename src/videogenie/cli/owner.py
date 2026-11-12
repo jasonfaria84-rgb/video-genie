@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import stat
+import sys
 import threading
 import warnings
 from collections.abc import Callable
@@ -106,6 +107,7 @@ def run_owner(
     thread: threading.Thread | None = None
     published = False
     serving = False
+    cleanup_failed = False
     stopped = threading.Event()
     previous: dict[int, Callable[[int, FrameType | None], object] | int | None] = {}
     try:
@@ -184,7 +186,6 @@ def run_owner(
         )
         published = True
         stopped.wait()
-        return 0
     finally:
         if serving and thread is not None and console is not None:
             console.server.shutdown()
@@ -207,4 +208,7 @@ def run_owner(
                 # Once ready was emitted, never print a second JSON result or secret path.
                 if not published:
                     raise
+                cleanup_failed = True
+                print("ACCESS_DENIED: Private owner handoff cleanup unconfirmed", file=sys.stderr)
         os.close(directory)
+    return 1 if cleanup_failed else 0
