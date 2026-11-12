@@ -48,10 +48,43 @@ def test_installed_recipe_render_owner_channel_and_recovery(
     kinds = [event["kind"] for event in events]
     assert kinds[-1] == "recipe-proof-passed"
     assert kinds.count("mcp-discovery") == kinds.count("mcp-closed") == 2
-    assert kinds.count("artifact-independent-verification") == 2
+    assert kinds.count("artifact-independent-verification") == 3
     assert "synthetic-final-review-and-selection-passed" in kinds
     assert "forged-proof-rejected" in kinds
     assert "real-interruption-recovery-passed" in kinds
+    admissions = [e for e in events if e["kind"] == "scope-only-admission"]
+    assert [e["stage"] for e in admissions] == ["pending", "render", "reviews", "rebound"]
+    for event in admissions:
+        assert set(event["admission"]) == {"state", "scope", "actor"}
+        assert set(event["admission"]["scope"]) == {"project_id", "storyline_id", "client_id"}
+        assert "--owner-port" not in event["argv"]
+        folder = output / ("scope-" + event["stage"])
+        scope_events = json.loads((folder / "transcript.json").read_text())
+        assert scope_events[0]["admission"] == event["admission"]
+        assert scope_events[0]["python_isolated_mode"]
+        assert scope_events[-1]["kind"] == "scope-only-complete"
+        assert scope_events[-1]["owner_channel_used"] is False
+        assert scope_events[-1]["human_consent"] is False
+        discovered = next(e for e in scope_events if e["kind"] == "mcp-discovery")
+        assert len(discovered["tools"]["tools"]) == 61
+        for name in ("cli-a", "mcp-b", "cli-c", "mcp-d"):
+            assert not list((folder / name).iterdir())
+    results = {e["stage"]: e["result"] for e in events if e["kind"] == "scope-only-result"}
+    assert set(results["pending"]["pending_challenge_ids"]) <= set(
+        results["render"]["completed_challenge_ids"]
+    )
+    assert results["rebound"]["current_policy"] > results["render"]["current_policy"]
+    assert (
+        results["rebound"]["render_request"]["grant_id"]
+        != results["render"]["render_request"]["grant_id"]
+    )
+    handoff = json.loads((output / "native-handoff.json").read_text())
+    assert set(handoff) == {"state", "scope", "actor"}
+    auditor = json.loads((output / "auditor-expectations.json").read_text())
+    assert auditor["not_for_consumer"] is True
+    assert auditor["unused_grant"]["grant_id"] not in {
+        results[stage]["render_request"]["grant_id"] for stage in ("render", "rebound")
+    }
     identity = events[0]
     assert identity["noneditable"] and identity["python_isolated_mode"]
     assert identity["record_entries_verified"] >= len(identity["package_files"]) > 30
