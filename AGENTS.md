@@ -6,12 +6,13 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 66 shared agent operations, including local recipe/brand drafts, immutable
+expose 67 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and two dead-space operations (`media.silence.detect`
 reads only; `media.silence.remove` writes a new file and never overwrites), and
 `resolve.status`, plus `transcript.create`/`transcript.get` (Resolve transcription with
-FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches). Resolve work happens only in Resolve projects named
+FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches), and `resolve.timeline.assemble` (new timeline from cut
+plans; never edits an existing timeline). Resolve work happens only in Resolve projects named
 `VideoGenie <project ID>`; never switch away from a person's open project unless
 the request explicitly allows it. General editing/templates, paid provider
 integrations/billing, hosted tenancy, and a physical owner's consent remain

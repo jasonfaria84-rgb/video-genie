@@ -40,6 +40,7 @@ DOCUMENTATION_ONLY = {
 KNOWN_TESTS = {
     "tests/test_activity.py",
     "tests/test_artifact_preview.py",
+    "tests/test_assembly.py",
     "tests/test_assets.py",
     "tests/test_authority.py",
     "tests/test_authority_cost_contracts.py",
@@ -97,6 +98,7 @@ TRANSPORT_TESTS = {
     "tests/test_recipe_render_install.py",
     "tests/test_silence.py",
     "tests/test_transcription.py",
+    "tests/test_assembly.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -201,11 +203,20 @@ PATH_TESTS = {
     "src/videogenie/workers/lower_third.py": RENDER_TESTS,
     "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
     "src/videogenie/workers/silence.py": {"tests/test_silence.py"},
-    "src/videogenie/adapters/resolve.py": {"tests/test_resolve.py", "tests/test_transcription.py"},
-    "src/videogenie/core/transcription.py": {"tests/test_transcription.py"},
+    "src/videogenie/adapters/resolve.py": {
+        "tests/test_resolve.py",
+        "tests/test_transcription.py",
+        "tests/test_assembly.py",
+    },
+    "src/videogenie/core/transcription.py": {
+        "tests/test_transcription.py",
+        "tests/test_assembly.py",
+    },
+    "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
     "src/videogenie/core/transcripts.py": {
         "tests/test_transcripts.py",
         "tests/test_transcription.py",
+        "tests/test_assembly.py",
     },
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",

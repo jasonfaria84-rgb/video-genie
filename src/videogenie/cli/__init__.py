@@ -79,9 +79,15 @@ from videogenie.contracts.studio import (
     ProjectClientInput,
     SetWaitInput,
 )
-from videogenie.contracts.transcripts import CreateTranscriptInput, Transcript, TranscriptInput
+from videogenie.contracts.transcripts import (
+    AssembleTimelineInput,
+    CreateTranscriptInput,
+    Transcript,
+    TranscriptInput,
+)
 from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
+from videogenie.core.assembly import assemble_timeline
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.costs import CostService
@@ -224,6 +230,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "resolve.status": ResolveStatusInput,
     "transcript.create": CreateTranscriptInput,
     "transcript.get": TranscriptInput,
+    "resolve.timeline.assemble": AssembleTimelineInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -455,6 +462,7 @@ def _dispatch(
                 "resolve.status",
                 "transcript.create",
                 "transcript.get",
+                "resolve.timeline.assemble",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -493,6 +501,10 @@ def _dispatch(
             raise VideoGenieError("INVALID_ARGUMENT", "Media path could not be resolved") from exc
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
+        )
+    if operation == "resolve.timeline.assemble":
+        return assemble_timeline(
+            service, AssembleTimelineInput.model_validate_json(_strict_json(payload))
         )
     if operation == "transcript.create":
         return create_transcript(

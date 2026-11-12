@@ -136,6 +136,45 @@ class CutPlan(ContractModel):
         return self
 
 
+class AssembleTake(ContractModel):
+    """One take to include, by its stored cut plan."""
+
+    cut_plan_id: Identifier
+
+
+class AssembleTimelineInput(ContractModel):
+    """Build a new DaVinci Resolve timeline from kept ranges of one or more takes, in order.
+
+    Each take's cut plan names its transcript and source file; the source must still match
+    the plan's SHA-256. The timeline is created in the project's own Resolve project, at the
+    first take's frame rate and resolution, and an existing timeline is never edited.
+    fade_frames adds audio fades at every join so cuts don't click.
+    """
+
+    project_id: Identifier
+    takes: tuple[AssembleTake, ...] = Field(min_length=1, max_length=200)
+    timeline_name: str | None = Field(default=None, min_length=1, max_length=200)
+    fade_frames: int = Field(default=1, ge=0, le=10)
+    allow_switch: bool = False
+    timeout_seconds: float = Field(default=600, gt=0, le=7200, allow_inf_nan=False)
+
+
+class AssembledTimeline(ContractModel):
+    """The created timeline and where its cuts land, for rendering and checking."""
+
+    project_id: Identifier
+    resolve_project: str
+    timeline_name: str
+    timeline_id: str
+    frame_rate: float
+    start_timecode: str
+    duration_frames: int = Field(ge=0)
+    duration_seconds: Seconds
+    segment_count: int = Field(ge=0)
+    cut_points_seconds: tuple[Seconds, ...]
+    cut_plan_ids: tuple[Identifier, ...]
+
+
 def output_time(plan: CutPlan, source_seconds: float) -> float | None:
     """Map a source time to edited output time, or None when it falls inside a cut."""
     elapsed = 0.0

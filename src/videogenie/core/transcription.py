@@ -116,7 +116,7 @@ def classify(
     ]
 
 
-def _clip(pool: Any, path: str) -> Any:
+def media_pool_clip(pool: Any, path: str) -> Any:
     """Reuse this file's clip in the project's media pool, or import it once."""
     root = pool.GetRootFolder()
     for clip in root.GetClipList() or []:
@@ -137,7 +137,7 @@ def create_transcript(service: VideoGenieService, request: CreateTranscriptInput
     status = resolve.resolve_status(min(30.0, request.timeout_seconds))
     app = resolve.connect(min(30.0, request.timeout_seconds))
     project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
-    clip = _clip(project.GetMediaPool(), str(path))
+    clip = media_pool_clip(project.GetMediaPool(), str(path))
     fps = float(clip.GetClipProperty("FPS") or 0)
     start_tc = str(clip.GetClipProperty("Start TC") or "00:00:00:00")
     transcription: Any = clip.GetTranscription()

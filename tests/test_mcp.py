@@ -89,6 +89,7 @@ EXPECTED_OPERATIONS = [
     "resolve.status",
     "transcript.create",
     "transcript.get",
+    "resolve.timeline.assemble",
 ]
 
 
