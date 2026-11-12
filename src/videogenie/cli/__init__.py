@@ -12,8 +12,26 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from videogenie.contracts.models import Identifier, Project, ResultEnvelope, VideoGenieError
+from videogenie.contracts.studio import (
+    AssignProjectClientInput,
+    ClientInput,
+    ClientRevisionInput,
+    CloseCycleInput,
+    CreateClientInput,
+    DurationReport,
+    DurationReportInput,
+    ListClientsInput,
+    OpenCycleInput,
+    ProjectActivity,
+    ProjectActivityInput,
+    ProjectClientInput,
+    ProjectClientLink,
+    SetWaitInput,
+)
+from videogenie.core.activity import ActivityService
 from videogenie.core.jobs import Job, JobService
 from videogenie.core.service import VideoGenieService
+from videogenie.core.studio import StudioService
 
 EXIT_CODES = {
     "INVALID_ARGUMENT": 2,
@@ -73,7 +91,7 @@ class _JobID(_ProjectID):
     job_id: Identifier
 
 
-INPUT_MODELS: dict[str, type[_Input]] = {
+INPUT_MODELS: dict[str, type[BaseModel]] = {
     "capabilities": _Input,
     "project.create": _Create,
     "project.list": _List,
@@ -84,6 +102,18 @@ INPUT_MODELS: dict[str, type[_Input]] = {
     "media.probe": _Probe,
     "job.get": _JobID,
     "job.resume": _JobID,
+    "client.create": CreateClientInput,
+    "client.list": ListClientsInput,
+    "client.get": ClientInput,
+    "client.archive": ClientRevisionInput,
+    "client.restore": ClientRevisionInput,
+    "project.client.get": ProjectClientInput,
+    "project.client.assign": AssignProjectClientInput,
+    "project.activity.get": ProjectActivityInput,
+    "project.cycle.open": OpenCycleInput,
+    "project.cycle.close": CloseCycleInput,
+    "project.wait.set": SetWaitInput,
+    "project.duration": DurationReportInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -150,7 +180,7 @@ def _context_id(value: JsonValue | None) -> str | None:
 
 def _dispatch(
     service: VideoGenieService, operation: str, payload: dict[str, JsonValue]
-) -> Project | Job | dict[str, JsonValue]:
+) -> BaseModel | dict[str, JsonValue]:
     if operation == "capabilities":
         _Input.model_validate(payload)
         return {
@@ -192,6 +222,70 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation.startswith("client.") or operation in {
+        "project.client.get",
+        "project.client.assign",
+        "project.activity.get",
+        "project.cycle.open",
+        "project.cycle.close",
+        "project.wait.set",
+        "project.duration",
+    }:
+        studio = StudioService(service)
+        if operation == "client.create":
+            client_create = CreateClientInput.model_validate(payload)
+            return studio.create_client(client_create.name, client_create.idempotency_key)
+        if operation == "client.list":
+            clients = ListClientsInput.model_validate(payload)
+            return {
+                "clients": [
+                    client.model_dump(mode="json")
+                    for client in studio.list_clients(clients.include_archived)
+                ]
+            }
+        if operation == "client.get":
+            client_get = ClientInput.model_validate(payload)
+            return studio.get_client(client_get.client_id)
+        if operation in {"client.archive", "client.restore"}:
+            client_change = ClientRevisionInput.model_validate(payload)
+            if operation == "client.archive":
+                return studio.archive_client(
+                    client_change.client_id, client_change.expected_revision
+                )
+            return studio.restore_client(client_change.client_id, client_change.expected_revision)
+        if operation == "project.client.get":
+            link = ProjectClientInput.model_validate(payload)
+            return studio.get_project_client(link.project_id)
+        if operation == "project.client.assign":
+            assignment = AssignProjectClientInput.model_validate(payload)
+            return studio.assign_project_client(
+                assignment.project_id, assignment.client_id, assignment.expected_project_revision
+            )
+        activity = ActivityService(studio)
+        if operation == "project.activity.get":
+            activity_get = ProjectActivityInput.model_validate(payload)
+            return activity.get_activity(activity_get.project_id)
+        if operation == "project.cycle.open":
+            opening = OpenCycleInput.model_validate(payload)
+            return activity.open_cycle(opening.project_id, opening.expected_activity_revision)
+        if operation == "project.cycle.close":
+            closing = CloseCycleInput.model_validate(payload)
+            return activity.close_cycle(
+                closing.project_id,
+                closing.cycle_id,
+                closing.expected_activity_revision,
+                closing.outcome,
+            )
+        if operation == "project.wait.set":
+            waiting = SetWaitInput.model_validate(payload)
+            return activity.set_wait(
+                waiting.project_id,
+                waiting.cycle_id,
+                waiting.expected_activity_revision,
+                waiting.reason,
+            )
+        report = DurationReportInput.model_validate(payload)
+        return activity.duration_report(report.project_id, report.as_of)
     selected_job = _JobID.model_validate(payload)
     jobs = JobService(service)
     if operation == "job.get":
@@ -209,10 +303,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
-    parser.add_argument("command", nargs="?", help="capabilities, project, media, or job")
+    parser.add_argument("command", nargs="?", help="capabilities, project, media, job, or client")
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume"
     )
+    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set")
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")
@@ -242,7 +337,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 parser.print_help()
             return 0
-        operation = arguments.command + (f".{arguments.action}" if arguments.action else "")
+        operation = ".".join(
+            segment
+            for segment in (arguments.command, arguments.action, arguments.detail)
+            if segment is not None
+        )
         if operation not in OPERATIONS:
             raise VideoGenieError(
                 "INVALID_ARGUMENT", "unrecognized arguments: unsupported operation"
@@ -254,10 +353,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         service = VideoGenieService(arguments.data_dir)
         result = _dispatch(service, operation, payload)
         print(
-            ResultEnvelope[Project | Job | dict[str, JsonValue]](
+            ResultEnvelope[JsonValue](
                 success=True,
-                data=result,
-                project_id=result.project_id if isinstance(result, (Project, Job)) else None,
+                data=result.model_dump(mode="json") if isinstance(result, BaseModel) else result,
+                project_id=(
+                    result.project_id
+                    if isinstance(
+                        result, (Project, Job, ProjectClientLink, ProjectActivity, DurationReport)
+                    )
+                    else None
+                ),
                 storyline_id=result.storyline_id if isinstance(result, (Project, Job)) else None,
             ).model_dump_json()
         )
