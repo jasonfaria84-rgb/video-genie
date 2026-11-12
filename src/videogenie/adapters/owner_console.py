@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from urllib.parse import urlsplit
@@ -26,15 +27,20 @@ from webauthn.helpers import bytes_to_base64url
 from videogenie.adapters.owner_auth import EnrollmentTicket
 from videogenie.contracts.authority import (
     IssueGrantAction,
+    OutputReviewTarget,
     OwnerAction,
     OwnerActionRequest,
     OwnerChallenge,
     OwnerChallengeInput,
+    ProjectAuthorityScope,
     PublishBrandAction,
     PublishRecipeAction,
     RegisterOwnerInput,
+    ReviewOutputAction,
+    SelectOutputInput,
     VerifyOwnerActionInput,
 )
+from videogenie.contracts.costs import CostReport, Currency
 from videogenie.contracts.models import VideoGenieError
 from videogenie.contracts.previews import (
     BrandDraftPin,
@@ -52,7 +58,7 @@ from videogenie.contracts.recipes import (
     RecipeDraftInput,
     content_sha256,
 )
-from videogenie.contracts.rendering import ListArtifactsInput
+from videogenie.contracts.rendering import ArtifactInput, ListArtifactsInput
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.job_storage import JobStorage
 from videogenie.core.recipe_previews import RecipePreviewService
@@ -88,6 +94,7 @@ class _Session:
     enrollment_completed: bool = False
     reviewed_publications: set[str] = field(default_factory=set)
     preview: tuple[str, str] | None = None
+    output_target: OutputReviewTarget | None = None
     applied_responses: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
@@ -388,6 +395,24 @@ class OwnerConsole:
                         while block := media.stream.read(65536):
                             handler.wfile.write(block)
                     return
+                if handler.command == "GET" and handler.path.startswith("/output-media/"):
+                    parts = handler.path.split("/")
+                    if len(parts) != 7:
+                        raise _HttpError(404, "output_media_not_found")
+                    scope = ArtifactInput(
+                        project_id=parts[2],
+                        storyline_id=parts[3],
+                        client_id=parts[4],
+                        artifact_id=parts[5],
+                    )
+                    frame = None if parts[6] == "video" else int(parts[6])
+                    with RenderService(self.authority).read_output_preview(
+                        scope, frame_index=frame
+                    ) as media:
+                        self._headers(handler, 200, media.media_type, media.byte_size)
+                        while block := media.stream.read(65536):
+                            handler.wfile.write(block)
+                    return
                 if handler.command == "GET" and handler.path.startswith("/artifacts/"):
                     self._artifact(handler)
                     return
@@ -637,9 +662,102 @@ class OwnerConsole:
                         },
                     )
                     return
+                if handler.path == "/output/review":
+                    scope = ArtifactInput.model_validate_json(body)
+                    session.output_target = None
+                    renderer = RenderService(self.authority)
+                    view = renderer.prepare_output_review(scope)
+                    selection = renderer.get_selection(
+                        ProjectAuthorityScope(
+                            project_id=scope.project_id,
+                            storyline_id=scope.storyline_id,
+                            client_id=scope.client_id,
+                        )
+                    )
+                    session.output_target = view.target
+                    base = (
+                        f"/output-media/{scope.project_id}/{scope.storyline_id}/"
+                        f"{scope.client_id}/{scope.artifact_id}"
+                    )
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "target": view.target.model_dump(mode="json"),
+                            "target_json": view.target.model_dump_json(),
+                            "evidence": view.evidence.model_dump(mode="json"),
+                            "evidence_json": view.evidence.model_dump_json(indent=2),
+                            "costs_json": view.costs.model_dump_json(indent=2),
+                            "cost_summary": self._cost_summary(view.costs),
+                            "summary": [
+                                {
+                                    "label": "Project",
+                                    "value": self._project_label(scope.project_id),
+                                },
+                                {
+                                    "label": "Storyline",
+                                    "value": self._storyline_label(
+                                        scope.project_id, scope.storyline_id
+                                    ),
+                                },
+                                {"label": "Client", "value": self._client_label(scope.client_id)},
+                                {
+                                    "label": "Project revision",
+                                    "value": str(view.target.project_revision_at_review),
+                                },
+                                {
+                                    "label": "Configuration revision",
+                                    "value": str(view.target.config_revision),
+                                },
+                            ],
+                            "selection_revision_text": str(selection.revision if selection else 0),
+                            "selection_json": selection.review.model_dump_json(indent=2)
+                            if selection
+                            else None,
+                            "media_base": base,
+                        },
+                    )
+                    return
+                if handler.path == "/output/decision":
+                    decision_request = OwnerActionRequest.model_validate_json(body)
+                    if (
+                        not isinstance(decision_request.action, ReviewOutputAction)
+                        or decision_request.action.target != session.output_target
+                    ):
+                        raise _HttpError(409, "output_context_changed")
+                    challenge = self.authority.request_action(decision_request)
+                    session.selected_challenge, session.selected_digest = (
+                        challenge.challenge_id,
+                        challenge.action_sha256,
+                    )
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "data": challenge.model_dump(mode="json"),
+                            "action_json": challenge.action.model_dump_json(indent=2),
+                        },
+                    )
+                    return
+                if handler.path == "/output/select":
+                    selection_request = SelectOutputInput.model_validate_json(body)
+                    selection = RenderService(self.authority).select_output(selection_request)
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "revision_text": str(selection.revision),
+                            "review": selection.review.model_dump(mode="json"),
+                            "review_json": selection.review.model_dump_json(indent=2),
+                        },
+                    )
+                    return
                 if handler.path == "/outputs":
-                    scope = ListArtifactsInput.model_validate_json(body)
-                    artifacts = RenderService(self.authority).list_artifacts(scope)
+                    list_scope = ListArtifactsInput.model_validate_json(body)
+                    artifacts = RenderService(self.authority).list_artifacts(list_scope)
                     self._json(
                         handler,
                         200,
@@ -862,6 +980,66 @@ class OwnerConsole:
             matches = False
         if not matches:
             raise _HttpError(409, "preview_action_mismatch")
+
+    @staticmethod
+    def _cost_summary(report: CostReport) -> list[dict[str, str]]:
+        """Keep exact integer money and explicit unknown/unpriced categories for display."""
+        rows = []
+        for total in report.currencies:
+            currency = total.currency
+
+            def money(value: int, currency: Currency = currency) -> str:
+                digits = str(abs(value)).zfill(currency.exponent + 1)
+                amount = (
+                    digits[: -currency.exponent] + "." + digits[-currency.exponent :]
+                    if currency.exponent
+                    else digits
+                )
+                return ("-" if value < 0 else "") + amount + " " + currency.code
+
+            for label, value in (
+                ("Provider actual", total.actual_provider_minor),
+                ("Adjustments", total.adjustments_minor),
+                ("Net actual", total.net_actual_minor),
+                ("Reserved exposure", total.reserved_exposure_minor),
+                ("Unreserved forecast", total.unreserved_forecast_minor),
+            ):
+                rows.append({"label": label, "value": money(value)})
+            for label, optional in (
+                ("Client charge", total.client_charge),
+                ("Internal cost", total.internal_cost),
+                ("Total economic cost", total.total_economic_cost),
+            ):
+                rows.append(
+                    {
+                        "label": label,
+                        "value": "Not configured / unknown"
+                        if optional is None
+                        else money(optional.minor_units),
+                    }
+                )
+        for label, quantities in (
+            ("Unpriced measured quantity", report.unpriced_quantities),
+            ("Unknown quantity", report.unknown_quantities),
+        ):
+            for q in quantities:
+                if q.unit == "worker_wall_seconds":
+                    seconds = Decimal(q.numerator) / Decimal(q.denominator)
+                    rows.append(
+                        {
+                            "label": "Render time",
+                            "value": f"{seconds:.2f} s (no price set)"
+                            if label.startswith("Unpriced")
+                            else f"{seconds:.2f} s (outcome unknown)",
+                        }
+                    )
+                else:
+                    rows.append(
+                        {"label": label, "value": f"{q.numerator}/{q.denominator} {q.unit}"}
+                    )
+        for note in report.coverage_notes:
+            rows.append({"label": "Coverage", "value": note})
+        return rows
 
     def _project_label(self, identity: str) -> str:
         try:
