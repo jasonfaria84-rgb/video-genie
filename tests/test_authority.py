@@ -463,7 +463,7 @@ def test_bad_registry_and_partial_schema_rejected(studio: Studio, tmp_path: Path
     assert error.value.code == "UNSUPPORTED_SCHEMA"
 
 
-def test_unsupported_output_review_never_consumes_proof(studio: Studio) -> None:
+def test_missing_output_review_never_consumes_proof(studio: Studio) -> None:
     terms = studio.terms()
     target = OutputReviewTarget(
         project_id=terms.project_id,
@@ -483,8 +483,10 @@ def test_unsupported_output_review_never_consumes_proof(studio: Studio) -> None:
         action=ReviewOutputAction(target=target, decision="approved"), idempotency_key="unsupported"
     )
     before = state(studio)
-    with pytest.raises(VideoGenieError):
+    with pytest.raises(VideoGenieError) as missing:
         studio.authority.request_action(request)
+    assert missing.value.code == "NOT_FOUND"
+    assert missing.value.details["reason"] == "review_target_missing"
     assert state(studio) == before
     # Auth can prepare a valid generic challenge; this service must still refuse it.
     challenge = studio.authority.auth.create_challenge(request)
@@ -492,7 +494,8 @@ def test_unsupported_output_review_never_consumes_proof(studio: Studio) -> None:
     before = state(studio)
     with pytest.raises(VideoGenieError) as error:
         studio.authority.apply_action(proof)
-    assert error.value.details["reason"] == "unsupported_action"
+    assert error.value.code == "NOT_FOUND"
+    assert error.value.details["reason"] == "review_target_missing"
     assert state(studio) == before
 
 

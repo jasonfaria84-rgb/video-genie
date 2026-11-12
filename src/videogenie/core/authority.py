@@ -17,7 +17,9 @@ from videogenie.contracts.authority import (
     OwnerChallengeInput,
     PublishBrandAction,
     PublishRecipeAction,
+    ReviewInput,
     ReviewOutputAction,
+    ReviewReceipt,
     RevokeGrantAction,
     VerifyOwnerActionInput,
 )
@@ -33,7 +35,7 @@ from videogenie.contracts.recipes import (
 from videogenie.core.costs import CostService
 from videogenie.core.recipes import RecipeService
 
-Result = PublishedRecipe | PublishedBrand | ExecutionGrant
+Result = PublishedRecipe | PublishedBrand | ExecutionGrant | ReviewReceipt
 _TABLES = {"authority_schema", "authority_results", "authority_grants"}
 _COLUMNS = {
     "authority_schema": ["version"],
@@ -98,7 +100,7 @@ class OwnerAuthorityService:
             if tables & _TABLES:
                 if not _TABLES <= tables or [
                     row[0] for row in connection.execute("SELECT version FROM authority_schema")
-                ] != [1]:
+                ] not in ([1], [2]):
                     raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete authority schema")
                 for table, columns in _COLUMNS.items():
                     if [
@@ -115,12 +117,35 @@ class OwnerAuthorityService:
                 }
                 if not _GUARDS <= guards:
                     raise VideoGenieError("UNSUPPORTED_SCHEMA", "Missing authority history guards")
+                if connection.execute("SELECT version FROM authority_schema").fetchone()[0] == 1:
+                    connection.execute("""CREATE TABLE authority_results_v2(
+                        receipt_id TEXT PRIMARY KEY REFERENCES owner_receipts(receipt_id),
+                        kind TEXT NOT NULL CHECK(kind IN ('publish_recipe','publish_brand',
+                            'issue_grant','revoke_grant','review_output')),
+                        result_json TEXT NOT NULL)""")
+                    connection.execute(
+                        "INSERT INTO authority_results_v2 SELECT * FROM authority_results"
+                    )
+                    connection.execute("DROP TABLE authority_results")
+                    connection.execute(
+                        "ALTER TABLE authority_results_v2 RENAME TO authority_results"
+                    )
+                    for operation in ("UPDATE", "DELETE"):
+                        connection.execute(f"""CREATE TRIGGER
+                            authority_results_no_{operation.lower()}
+                            BEFORE {operation} ON authority_results
+                            BEGIN SELECT RAISE(ABORT,'Authority history is immutable'); END""")
+                    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                        raise VideoGenieError(
+                            "UNSUPPORTED_SCHEMA", "Authority migration broke references"
+                        )
+                    connection.execute("UPDATE authority_schema SET version=2")
                 return
             connection.execute("CREATE TABLE authority_schema(version INTEGER NOT NULL)")
             connection.execute("""CREATE TABLE authority_results(
                 receipt_id TEXT PRIMARY KEY REFERENCES owner_receipts(receipt_id),
                 kind TEXT NOT NULL CHECK(kind IN (
-                    'publish_recipe','publish_brand','issue_grant','revoke_grant')),
+                    'publish_recipe','publish_brand','issue_grant','revoke_grant','review_output')),
 
                 result_json TEXT NOT NULL)""")
             connection.execute("""CREATE TABLE authority_grants(
@@ -133,17 +158,20 @@ class OwnerAuthorityService:
                     connection.execute(f"""CREATE TRIGGER {table}_no_{operation.lower()}
                         BEFORE {operation} ON {table}
                         BEGIN SELECT RAISE(ABORT,'Authority history is immutable'); END""")
-            connection.execute("INSERT INTO authority_schema VALUES(1)")
+            connection.execute("INSERT INTO authority_schema VALUES(2)")
 
     def request_action(self, request: OwnerActionRequest) -> OwnerChallenge:
         """Prepare a reviewable challenge; preparation confers no authority."""
         request = _checked(OwnerActionRequest, request)
         if isinstance(request.action, ReviewOutputAction):
-            raise VideoGenieError(
-                "INVALID_ARGUMENT",
-                "Output review is not implemented",
-                details={"reason": "unsupported_action"},
-            )
+            from videogenie.core.rendering import RenderService
+
+            renderer = RenderService(self)
+            renderer._review_initialize()
+            with self.service.connection(write=True) as connection:
+                renderer._review_target(connection, request.action.target)
+                renderer._require_preview(connection, request.action.target)
+
         return self.auth.create_challenge(request)
 
     def get_challenge(self, request: OwnerChallengeInput) -> OwnerChallenge:
@@ -157,6 +185,8 @@ class OwnerAuthorityService:
                 return PublishedRecipe.model_validate_json(payload)
             if kind == "publish_brand":
                 return PublishedBrand.model_validate_json(payload)
+            if kind == "review_output":
+                return ReviewReceipt.model_validate_json(payload)
             if kind in {"issue_grant", "revoke_grant"}:
                 return ExecutionGrant.model_validate_json(payload)
         except ValidationError as exc:
@@ -174,11 +204,10 @@ class OwnerAuthorityService:
         )
         action = challenge.action
         if isinstance(action, ReviewOutputAction):
-            raise VideoGenieError(
-                "INVALID_ARGUMENT",
-                "Output review is not implemented",
-                details={"reason": "unsupported_action"},
-            )
+            from videogenie.core.rendering import RenderService
+
+            renderer = RenderService(self)
+            renderer._review_initialize()
         with self.service.connection(write=True) as connection:
             verified = self.auth.consume_action(proof, action, connection=connection)
             prior = connection.execute(
@@ -194,13 +223,60 @@ class OwnerAuthorityService:
                 result: Result = self.recipes._publish(connection, action, verified.receipt)
             elif isinstance(action, IssueGrantAction):
                 result = self._issue(connection, action, verified.receipt.receipt_id)
-            else:
+            elif isinstance(action, RevokeGrantAction):
                 result = self._revoke(connection, action, verified.receipt.receipt_id)
+            else:
+                renderer._review_target(connection, action.target)
+                renderer._require_preview(connection, action.target)
+                result = ReviewReceipt(
+                    review_id=str(uuid4()),
+                    target=action.target,
+                    decision=action.decision,
+                    owner_receipt_id=verified.receipt.receipt_id,
+                    reviewed_at=verified.receipt.verified_at,
+                    comments=action.comments,
+                )
+                self.studio.append_event(
+                    connection,
+                    "output.reviewed",
+                    project_id=action.target.project_id,
+                    client_id=action.target.client_id,
+                    correlation_id=verified.receipt.receipt_id,
+                    payload={
+                        "review_id": result.review_id,
+                        "artifact_id": action.target.artifact_id,
+                        "decision": action.decision,
+                    },
+                )
             connection.execute(
                 "INSERT INTO authority_results VALUES(?,?,?)",
                 (verified.receipt.receipt_id, action.kind, result.model_dump_json()),
             )
             return result
+
+    def get_review(self, request: ReviewInput) -> ReviewReceipt:
+        """Read an immutable scoped review, including after policy or ownership changes."""
+        request = _checked(ReviewInput, request)
+        with self.service.connection() as connection:
+            return self._review(connection, request)
+
+    def _review(self, connection: sqlite3.Connection, request: ReviewInput) -> ReviewReceipt:
+        row = connection.execute(
+            "SELECT result_json FROM authority_results WHERE kind='review_output' "
+            "AND json_extract(result_json,'$.review_id')=?",
+            (request.review_id,),
+        ).fetchone()
+        if row is None:
+            raise VideoGenieError("NOT_FOUND", "Output review not found")
+        result = self._decode("review_output", row[0])
+        assert isinstance(result, ReviewReceipt)
+        if (result.target.project_id, result.target.storyline_id, result.target.client_id) != (
+            request.project_id,
+            request.storyline_id,
+            request.client_id,
+        ):
+            raise VideoGenieError("NOT_FOUND", "Output review not found in selected scope")
+        return result
 
     def _scope(
         self, connection: sqlite3.Connection, scope: GrantInput | GrantTerms, *, active: bool
