@@ -565,6 +565,37 @@ def test_render_snapshot_relations_are_append_only_and_probe_artifacts_remain_js
     assert rows(service, "job_artifacts") == []
 
 
+@pytest.mark.parametrize("different_job", [False, True])
+def test_artifact_identity_cannot_transfer_between_attempts_or_jobs(
+    tmp_path: Path, different_job: bool
+) -> None:
+    service = VideoGenieService(tmp_path)
+    project = service.create_project("Immutable artifact ownership", "project")
+    JobService(service)
+    original_job = render_row(service, project)
+    other_job = render_row(service, project) if different_job else original_job
+    first, second, artifact_id = str(uuid4()), str(uuid4()), str(uuid4())
+    with service.connection(write=True) as connection:
+        connection.execute(
+            "INSERT INTO job_attempts VALUES(?,?,1,'failed',0,1,NULL,NULL)", (first, original_job)
+        )
+        connection.execute(
+            "INSERT INTO job_attempts VALUES(?,?,2,'running',2,NULL,NULL,NULL)", (second, other_job)
+        )
+        connection.execute(
+            "INSERT INTO render_manifests VALUES(?,?,?,'staged',?,?)",
+            (artifact_id, original_job, first, "a" * 64, "{}"),
+        )
+    before = rows(service, "render_manifests")
+    with pytest.raises(VideoGenieError):
+        with service.connection(write=True) as connection:
+            connection.execute(
+                "INSERT INTO render_manifests VALUES(?,?,?,'verified',?,?)",
+                (artifact_id, other_job, second, "b" * 64, "{}"),
+            )
+    assert rows(service, "render_manifests") == before
+
+
 def test_v1_queued_work_and_live_lease_survive_without_claim_or_timing_rewrite(
     tmp_path: Path,
 ) -> None:

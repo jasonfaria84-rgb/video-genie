@@ -206,6 +206,8 @@ def _create_job_tables(connection: sqlite3.Connection) -> None:
         WHEN NOT EXISTS(SELECT 1 FROM job_attempts a JOIN jobs j ON j.job_id=a.job_id
             WHERE a.attempt_id=NEW.attempt_id AND a.job_id=NEW.job_id
             AND j.operation='graphics.render_lower_third')
+        OR EXISTS(SELECT 1 FROM render_manifests m WHERE m.artifact_id=NEW.artifact_id
+            AND (m.job_id!=NEW.job_id OR m.attempt_id!=NEW.attempt_id))
         BEGIN SELECT RAISE(ABORT,'Render manifest requires its own render attempt'); END""")
     for table in _RENDER_COLUMNS:
         for operation in ("UPDATE", "DELETE"):
