@@ -176,8 +176,30 @@ def test_installed_wheel_verifier(tmp_path: Path) -> None:
         timeout=30,
     )
     python = runtime / "bin" / "python"
+    requirements = tmp_path / "runtime-requirements.txt"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel)],
+        [
+            uv,
+            "export",
+            "--frozen",
+            "--no-dev",
+            "--no-emit-project",
+            "--output-file",
+            str(requirements),
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    subprocess.run(
+        [uv, "pip", "sync", "--python", str(python), "--require-hashes", str(requirements)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
         check=True,
         capture_output=True,
         timeout=60,
@@ -237,6 +259,8 @@ print(json.dumps({'version': version('webauthn'), 'direct_url': direct,
     )
     receipt = {
         "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "lock_sha256": hashlib.sha256((repository / "uv.lock").read_bytes()).hexdigest(),
+        "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
         "proof": json.loads(proof.stdout),
     }
     (tmp_path / "installed-verifier.json").write_text(json.dumps(receipt, indent=2))
