@@ -56,9 +56,12 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "asset.register": ("source_path",),
                 "media.silence.detect": ("source_path",),
                 "media.silence.remove": ("source_path", "output_path"),
+                "render.check": ("rendered_path", "contact_sheet_path"),
             }.get(operation, ())
             for path_field in path_fields:
                 path = raw.get(path_field)
+                if path is None and path_field == "contact_sheet_path":
+                    continue  # optional output; required paths were validated above
                 if not isinstance(path, str) or not Path(path).is_absolute():
                     raise VideoGenieError("INVALID_ARGUMENT", "MCP file paths must be absolute")
             value = _dispatch(service, operation, raw)

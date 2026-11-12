@@ -10,12 +10,13 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 64 shared agent operations: projects and clients, cycles and
+This source exposes 65 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, dead-space removal, and a
-DaVinci Resolve status check. Seven additive discovery reads preserve the earlier
-54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
+artifacts, costs, approval requests, output selection, dead-space removal, a
+DaVinci Resolve status check, and a per-cut render check. Seven additive discovery reads
+preserve the earlier 54 operation schemas and results; the dead-space, Resolve and render
+check operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
 Removing filler words such as "um" needs word-level transcription and isn't
@@ -251,7 +252,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 64 agent operations. Replace spaces in each CLI command
+The server exposes the same 65 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -412,6 +413,45 @@ MCP paths must be absolute; CLI paths may be relative to the current folder.
 
 This uses silence only. Filler words ("um", "uh") and false starts need a
 word-level transcript and aren't detected yet.
+
+## Check a render before delivery
+
+`render check` inspects every cut of a finished render before anyone calls it final.
+It reads the file only (its SHA-256 is checked before and after) and uses local FFmpeg.
+Give cut positions in output time, either as `cut_points_seconds` or as the
+`cut_plan_id` of a stored cut plan, where cuts fall at the joins of its kept ranges.
+For a `media silence remove` result, the cut points are the running totals of the
+kept segments' durations, without the last one.
+
+```bash
+printf '%s' '{"rendered_path":"/absolute/talk-tight.mp4","cut_points_seconds":[1.733,3.066],"contact_sheet_path":"/absolute/talk-cuts.png"}' \
+  | videogenie render check --json --input-json -
+```
+
+Each cut gets a pass or fail with reasons:
+
+| Reason | Fails when | Default |
+| --- | --- | --- |
+| `audio_jump` | The 10 ms audio level before the cut and after it differ by more than `max_audio_jump_db`. Levels are dBFS, floored at -60 so room tone can't jump. | 20 dB |
+| `audio_click` | The largest sample step within 5 ms of the cut is more than `max_click_db` above the largest step in the surrounding 100 ms (48 kHz mono). | 12 dB |
+| `black_frame` | The frame just before or just after the cut is black: 98% of pixels at or below `black_luma_threshold`. | 0.1 |
+| `frozen_frame` | Three consecutive frames within three frames of the cut differ by less than `freeze_max_difference` (mean luma, 0-255). 0 turns this off. | 0.1 |
+
+The whole file also fails with `av_drift` when its audio and video stream durations
+differ by more than `max_av_drift_seconds` (default 0.05), or with
+`av_drift_unmeasured` when the container doesn't report them. Calibration on generated
+media: clean silence-removal cuts measure a 0 dB jump and a -40 dB click score; an
+abrupt quiet-to-loud join measured a 34 dB jump, and a same-level phase jump a 21 dB click
+score. Frames in a freeze differ by under 0.01; moving test video by 2 or more.
+
+Cut times should be within 5 ms of the real join, and frames are located assuming a
+constant frame rate starting at zero, as FFmpeg renders are. A hard cut into loud
+speech fails `audio_jump` even when it doesn't click; still slides and screen
+recordings can fail `frozen_frame`. Raise the threshold, or set it to 0 for frozen
+frames, when that is intended. `contact_sheet_path` writes a new `.png` or `.jpg` grid,
+one cell per cut: the frame before the cut on the left, after it on the right, failed
+cuts labelled in red. Existing files are never overwritten. Up to 2,000 cuts are checked
+per call.
 
 ## Check DaVinci Resolve
 
