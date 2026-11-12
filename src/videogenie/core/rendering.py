@@ -1,13 +1,39 @@
-"""Immutable render bindings and live preflight; no execution or implied owner approval."""
+"""Pinned render plans and fenced local execution under authenticated standing grants."""
 
+import fcntl
+import hashlib
+import importlib.metadata
+import math
+import os
+import platform
 import sqlite3
-from dataclasses import dataclass
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal, Self
 from uuid import uuid4
 
-from pydantic import ValidationError
+import PIL
+from PIL import features
+from pydantic import Field, ValidationError, model_validator
 
+from videogenie.contracts.assets import AssetPin, Sha256
 from videogenie.contracts.authority import ExecutionGrant, GrantInput, ProjectAuthorityScope
-from videogenie.contracts.models import ContractModel, VideoGenieError
+from videogenie.contracts.costs import (
+    CostEvidence,
+    MonetaryCap,
+    Quantity,
+    RecordCostInput,
+    ReservationChangeInput,
+    ReserveCostInput,
+)
+from videogenie.contracts.models import ContractModel, ErrorDetail, Identifier, VideoGenieError
 from videogenie.contracts.recipes import (
     BrandDraft,
     BrandDraftInput,
@@ -21,13 +47,203 @@ from videogenie.contracts.recipes import (
     content_sha256,
 )
 from videogenie.contracts.rendering import (
+    ArtifactInput,
     BindRenderConfigInput,
+    ListArtifactsInput,
+    MediaArtifact,
+    RenderAttempt,
+    RenderColorMetadata,
     RenderConfig,
     RenderConfigContent,
     RenderConfigInput,
+    RenderExecutionEvidence,
+    RenderFitMetrics,
+    RenderJob,
+    RenderJobInput,
     RenderLowerThirdInput,
+    RenderManifest,
+    RenderProvenance,
+    RenderResult,
+    RenderToolVersions,
 )
+from videogenie.contracts.studio import Timestamp
 from videogenie.core.authority import OwnerAuthorityService
+from videogenie.core.job_storage import JobStorage, stored_render_request
+from videogenie.core.jobs import JobService
+from videogenie.workers.lower_third import _tool, render_lower_third
+
+
+class _WorkerAsset(ContractModel):
+    pin: AssetPin
+    path: str
+
+
+class _WorkerControl(ContractModel):
+    """Private fixed-worker input; neither an agent operation nor an authority token."""
+
+    job_id: Identifier
+    attempt_id: Identifier
+    artifact_id: Identifier
+    fence: int = Field(ge=1)
+    request: RenderLowerThirdInput
+    provenance: RenderProvenance
+    assets: tuple[_WorkerAsset, ...]
+    stage: str
+    locator: str
+
+
+class _WorkerCompletion(ContractModel):
+    """Evidence of return from the bounded worker, never inferred from PID/lease state."""
+
+    control_sha256: Sha256
+    elapsed_ns: int = Field(ge=0, le=2**63 - 1)
+    completed_at: Timestamp
+    manifest: RenderManifest | None
+    candidate: str | None
+    failure: ErrorDetail | None
+
+    @model_validator(mode="after")
+    def coherent(self) -> Self:
+        if (self.manifest is None) != (self.candidate is None):
+            raise ValueError("Candidate and manifest must appear together")
+        if (self.manifest is None) != (self.failure is not None):
+            raise ValueError("Completion must describe one success or failure")
+        return self
+
+
+def _timestamp(value: float | None = None) -> str:
+    return datetime.fromtimestamp(time.time() if value is None else value, UTC).isoformat()
+
+
+def _fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _detail(error: VideoGenieError) -> ErrorDetail:
+    return ErrorDetail(
+        code=error.code, message=str(error), retry_class=error.retry_class, details=error.details
+    )
+
+
+@contextmanager
+def _directory(path: Path) -> Iterator[int]:
+    """Open every absolute directory component without following aliases."""
+    if not path.is_absolute():
+        raise VideoGenieError("INVALID_ARGUMENT", "Managed directory must be absolute")
+    descriptor = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            next_descriptor = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    with _directory(path.parent) as directory:
+        descriptor = os.open(
+            path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(directory)
+
+
+def _read_private(path: Path, limit: int = 131072) -> bytes:
+    with _directory(path.parent) as directory:
+        descriptor = os.open(
+            path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+                raise VideoGenieError("INPUT_CHANGED", "Invalid private evidence file")
+            data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise VideoGenieError("INPUT_CHANGED", "Private evidence exceeds bound")
+            return data
+
+
+def _render_child(control_path: str, lock_descriptor: int) -> None:
+    """Fixed child entry point. The inherited lock stays held through fsynced completion.
+
+    A killed child, unexpected exception or uncertain worker cleanup writes no
+    completion, so neither a free lock nor process exit can release capacity.
+    """
+    os.fstat(lock_descriptor)
+    control = _WorkerControl.model_validate_json(_read_private(Path(control_path)))
+    started = time.monotonic_ns()
+    manifest = None
+    candidate = None
+    failure = None
+    try:
+        result = render_lower_third(
+            control.provenance.config,
+            control.provenance.recipe,
+            control.provenance.brand,
+            {item.pin: Path(item.path) for item in control.assets},
+            Path(control.stage),
+        )
+        if result.provenance != control.provenance:
+            raise VideoGenieError("INPUT_CHANGED", "Runtime provenance changed during execution")
+        candidate = str(result.path.relative_to(Path(control.stage)))
+        manifest = RenderManifest(
+            manifest_version="2",
+            artifact_id=control.artifact_id,
+            job_id=control.job_id,
+            attempt_id=control.attempt_id,
+            fence=control.fence,
+            request=control.request,
+            request_sha256=content_sha256(control.request),
+            provenance=result.provenance,
+            execution=RenderExecutionEvidence(**asdict(result.execution)),
+            fit=RenderFitMetrics(**asdict(result.fit)),
+            color_metadata=RenderColorMetadata.model_validate(
+                {
+                    field: getattr(result, field)
+                    for field in ("color_range", "color_space", "color_transfer", "color_primaries")
+                }
+            ),
+            ffprobe_version=result.ffprobe_version,
+            decoded_frame_sha256=result.decoded_frame_sha256,
+            locator=control.locator,
+            artifact_sha256=result.sha256,
+            byte_size=result.byte_size,
+            output=result.provenance.recipe.output,
+            state="staged",
+            created_at=_timestamp(),
+        )
+    except VideoGenieError as error:
+        if error.details.keys() & {
+            "cleanup",
+            "stage_cleanup_errno",
+            "group_signal_errno",
+            "child_signal_errno",
+            "group_cleanup",
+            "child_reap",
+            "child_wait_errno",
+            "pipe_close_errno",
+        }:
+            raise
+        failure = _detail(error)
+        candidate = None
+        manifest = None
+    completion = _WorkerCompletion(
+        control_sha256=content_sha256(control),
+        elapsed_ns=time.monotonic_ns() - started,
+        completed_at=_timestamp(),
+        manifest=manifest,
+        candidate=candidate,
+        failure=failure,
+    )
+    _write_private(Path(control.stage) / "completion.json", completion.model_dump_json().encode())
+
 
 _COLUMNS = {
     "render_plan_schema": ["version"],
@@ -104,8 +320,20 @@ class DraftPreviewPlan:
     parameters: LowerThirdParameters
 
 
+@dataclass(frozen=True)
+class RenderClaim:
+    """Committed internal claim; live fences and authority still guard publication."""
+
+    job_id: str
+    attempt_id: str
+    fence: int
+    reservation_id: str
+    plan: CompiledRenderPlan
+    provenance: RenderProvenance
+
+
 class RenderService:
-    """Bind exact versions and compile local requests against persisted policy and authority."""
+    """Bind exact versions and execute bounded local work against persisted authority."""
 
     def __init__(self, authority: OwnerAuthorityService) -> None:
         self.authority = authority
@@ -505,3 +733,864 @@ class RenderService:
             self._supported_brand(branding)
             self.recipes._verify_assets(branding.content)
             return DraftPreviewPlan(draft, branding, parameters)
+
+    def _execution_initialize(self) -> None:
+        """Lazy execution storage: planning alone never creates jobs or reservations."""
+        JobService(self.service)
+        columns = {
+            "render_execution_schema": ["version"],
+            "render_run_grants": ["job_id", "grant_id"],
+            "render_reservations": ["attempt_id", "reservation_id"],
+            "render_outcomes": ["attempt_id", "outcome", "receipt_json"],
+            "render_controls": ["attempt_id", "control_json", "control_sha256"],
+            "render_completions": ["attempt_id", "receipt_json", "receipt_sha256"],
+        }
+        with self.service.connection(write=True) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if tables & columns.keys():
+                if not columns.keys() <= tables or [
+                    row[0]
+                    for row in connection.execute("SELECT version FROM render_execution_schema")
+                ] != [1]:
+                    raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete execution storage")
+                for table, names in columns.items():
+                    if [
+                        row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+                    ] != names:
+                        raise VideoGenieError("UNSUPPORTED_SCHEMA", "Invalid execution storage")
+                guards = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger'"
+                    )
+                }
+                required = {
+                    f"{table}_no_{operation}"
+                    for table in columns
+                    if table != "render_execution_schema"
+                    for operation in ("update", "delete")
+                }
+                if not required <= guards:
+                    raise VideoGenieError("UNSUPPORTED_SCHEMA", "Missing execution history guards")
+                return
+            connection.execute("CREATE TABLE render_execution_schema(version INTEGER NOT NULL)")
+            connection.execute("""CREATE TABLE render_run_grants(
+                job_id TEXT PRIMARY KEY REFERENCES jobs(job_id), grant_id TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE render_reservations(
+                attempt_id TEXT PRIMARY KEY REFERENCES job_attempts(attempt_id),
+                reservation_id TEXT NOT NULL UNIQUE)""")
+            connection.execute("""CREATE TABLE render_outcomes(
+                attempt_id TEXT PRIMARY KEY REFERENCES job_attempts(attempt_id),
+                outcome TEXT NOT NULL CHECK(outcome IN ('published','failed','quarantined')),
+                receipt_json TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE render_controls(
+                attempt_id TEXT PRIMARY KEY REFERENCES job_attempts(attempt_id),
+                control_json TEXT NOT NULL, control_sha256 TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE render_completions(
+                attempt_id TEXT PRIMARY KEY REFERENCES job_attempts(attempt_id),
+                receipt_json TEXT NOT NULL, receipt_sha256 TEXT NOT NULL)""")
+            for table in columns.keys() - {"render_execution_schema"}:
+                for operation in ("update", "delete"):
+                    connection.execute(f"""CREATE TRIGGER {table}_no_{operation}
+                        BEFORE {operation.upper()} ON {table}
+                        BEGIN SELECT RAISE(ABORT,'immutable render execution evidence'); END""")
+            connection.execute("INSERT INTO render_execution_schema VALUES(1)")
+
+    def _claim_render(
+        self, request: RenderLowerThirdInput, provenance: RenderProvenance
+    ) -> RenderClaim | None:
+        """Atomically authorize, account for capacity, reserve and claim fixed local work.
+
+        Internal caller must hold the per-job execution lock before dispatching.
+        Missing completion evidence retains capacity regardless of lease expiry.
+        None is an already-published exact replay, not permission to execute again.
+        """
+        request = _checked(RenderLowerThirdInput, request)
+        provenance = _checked(RenderProvenance, provenance)
+        self._execution_initialize()
+        storage = JobStorage(self.service)
+        with self.service.connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE project_id=? AND operation=? AND idempotency_key=?",
+                (request.project_id, request.operation, request.idempotency_key),
+            ).fetchone()
+            if row is not None:
+                if stored_render_request(row) != request:
+                    raise VideoGenieError(
+                        "IDEMPOTENCY_CONFLICT", "Render key binds another request"
+                    )
+                if row["status"] == "succeeded":
+                    return None
+                unresolved = connection.execute(
+                    "SELECT 1 FROM job_attempts a LEFT JOIN render_outcomes o "
+                    "ON o.attempt_id=a.attempt_id WHERE a.job_id=? AND o.attempt_id IS NULL",
+                    (row["job_id"],),
+                ).fetchone()
+                if unresolved is not None:
+                    raise VideoGenieError(
+                        "LEASE_HELD",
+                        "Previous execution needs completion evidence",
+                        details={"reason": "execution_unresolved", "job_id": row["job_id"]},
+                    )
+            plan = self.compile_request(request, connection=connection)
+            if (provenance.config, provenance.recipe, provenance.brand) != (
+                plan.binding.config,
+                plan.recipe.content,
+                plan.brand.content,
+            ):
+                raise VideoGenieError("INVALID_ARGUMENT", "Observed provenance differs from plan")
+            terms = plan.grant.terms
+            runs = connection.execute(
+                "SELECT count(*) FROM render_run_grants WHERE grant_id=?", (request.grant_id,)
+            ).fetchone()[0]
+            if row is None and runs >= terms.max_runs:
+                raise _denied("run_limit")
+            busy = connection.execute(
+                "SELECT count(*) FROM job_attempts a JOIN render_run_grants r USING(job_id) "
+                "LEFT JOIN render_outcomes o USING(attempt_id) "
+                "WHERE r.grant_id=? AND o.attempt_id IS NULL",
+                (request.grant_id,),
+            ).fetchone()[0]
+            if busy >= terms.max_concurrent:
+                raise VideoGenieError(
+                    "LEASE_HELD",
+                    "Grant execution capacity is occupied",
+                    details={"reason": "concurrency_limit"},
+                )
+            job_id = str(uuid4()) if row is None else str(row["job_id"])
+            attempts = connection.execute(
+                "SELECT count(*) FROM job_attempts WHERE job_id=?", (job_id,)
+            ).fetchone()[0]
+            if attempts >= terms.max_attempts_per_run:
+                raise _denied("attempt_limit")
+            if row is None:
+                now = time.time()
+                connection.execute(
+                    "INSERT INTO jobs(job_id,project_id,storyline_id,operation,status,"
+                    "idempotency_key,timeout_seconds,created_at,updated_at,"
+                    "render_request_json,request_sha256) VALUES(?,?,?,?,'queued',?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        request.project_id,
+                        request.storyline_id,
+                        request.operation,
+                        request.idempotency_key,
+                        plan.recipe.content.resources.timeout_seconds,
+                        now,
+                        now,
+                        request.model_dump_json(),
+                        plan.request_sha256,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO render_run_grants VALUES(?,?)", (job_id, request.grant_id)
+                )
+            claim = storage.claim(
+                connection,
+                request.project_id,
+                job_id,
+                expected_operation=request.operation,
+                lease_seconds=plan.recipe.content.resources.timeout_seconds + 60,
+                provenance=provenance,
+            )
+            assert claim is not None
+            # Fixed local execution has no external provider fee. Choose the first
+            # explicitly approved currency; never combine/convert currencies or
+            # pretend that unpriced compute itself is free.
+            ceiling = terms.monetary_caps_by_currency[0]
+            reservation = self.authority.costs.reserve(
+                ReserveCostInput(
+                    project_id=request.project_id,
+                    storyline_id=request.storyline_id,
+                    run_id=job_id,
+                    attempt_id=claim.attempt_id,
+                    grant_id=request.grant_id,
+                    amount=MonetaryCap(currency=ceiling.currency, minor_units=0),
+                    quantity=Quantity(numerator=1, denominator=1, unit="local_render_attempt"),
+                    evidence=(
+                        CostEvidence(
+                            source="local_measurement",
+                            reference="fixed_local_renderer:no_external_provider_dispatch",
+                        ),
+                    ),
+                    idempotency_key=f"render-reserve:{claim.attempt_id}",
+                ),
+                ceiling,
+                connection=connection,
+            )
+            assert reservation.reservation_id is not None
+            connection.execute(
+                "INSERT INTO render_reservations VALUES(?,?)",
+                (claim.attempt_id, reservation.reservation_id),
+            )
+            self.studio.append_event(
+                connection,
+                "render.claimed",
+                project_id=request.project_id,
+                client_id=request.client_id,
+                correlation_id=job_id,
+                payload={"job_id": job_id, "attempt_id": claim.attempt_id, "fence": claim.fence},
+            )
+            return RenderClaim(
+                job_id, claim.attempt_id, claim.fence, reservation.reservation_id, plan, provenance
+            )
+
+    def _managed_directories(self) -> Path:
+        root = self.service.data_dir / "render-execution"
+        for directory in (root, root / "locks", root / "stages", root / "artifacts"):
+            with _directory(directory.parent) as parent:
+                try:
+                    os.mkdir(directory.name, mode=0o700, dir_fd=parent)
+                    os.fsync(parent)
+                except FileExistsError:
+                    pass
+                with _directory(directory):
+                    pass
+        return root
+
+    @contextmanager
+    def _execution_lock(self, request: RenderLowerThirdInput) -> Iterator[int]:
+        # Immutable job identity exists before its UUID. Resume uses the same
+        # lock, and the child inherits the SAME open file description.
+        root = self._managed_directories()
+        identity = "\0".join((request.project_id, request.operation, request.idempotency_key))
+        name = hashlib.sha256(identity.encode()).hexdigest() + ".lock"
+        with _directory(root / "locks") as directory:
+            descriptor = os.open(
+                name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise VideoGenieError("ACCESS_DENIED", "Invalid execution lock file")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise VideoGenieError("LEASE_HELD", "Owned worker is still active") from exc
+                yield descriptor
+            finally:
+                # Do not LOCK_UN: the child must retain the lock after parent exit.
+                os.close(descriptor)
+
+    def _observe_provenance(self, plan: CompiledRenderPlan) -> RenderProvenance:
+        _, version = _tool("ffmpeg", time.monotonic() + 5)
+        return RenderProvenance(
+            config=plan.binding.config,
+            recipe=plan.recipe.content,
+            brand=plan.brand.content,
+            tools=RenderToolVersions(
+                python=platform.python_version(),
+                pillow=PIL.__version__,
+                fonttools=importlib.metadata.version("fonttools"),
+                freetype=features.version_module("freetype2") or "unknown",
+                ffmpeg=version,
+                layout_engine="BASIC",
+            ),
+        )
+
+    def _prepare_control(self, claim: RenderClaim) -> _WorkerControl:
+        root = self._managed_directories()
+        stage = root / "stages" / claim.attempt_id
+        with _directory(stage.parent) as parent:
+            os.mkdir(stage.name, mode=0o700, dir_fd=parent)
+            os.fsync(parent)
+        artifact_id = str(uuid4())
+        control = _WorkerControl(
+            job_id=claim.job_id,
+            attempt_id=claim.attempt_id,
+            artifact_id=artifact_id,
+            fence=claim.fence,
+            request=claim.plan.request,
+            provenance=claim.provenance,
+            assets=tuple(
+                _WorkerAsset(pin=pin, path=str(self.recipes.assets.resolve_asset(pin)))
+                for pin in claim.provenance.config.input_asset_pins
+            ),
+            stage=str(stage),
+            locator=f"render-execution/artifacts/{artifact_id}.mov",
+        )
+        with self.service.connection(write=True) as connection:
+            JobStorage(self.service).check_fence(
+                connection,
+                control.request.project_id,
+                control.job_id,
+                control.fence,
+                expected_operation=control.request.operation,
+            )
+            connection.execute(
+                "INSERT INTO render_controls VALUES(?,?,?)",
+                (control.attempt_id, control.model_dump_json(), content_sha256(control)),
+            )
+        _write_private(stage / "control.json", control.model_dump_json().encode())
+        return control
+
+    @staticmethod
+    def _launch_child(control: _WorkerControl, lock_descriptor: int) -> None:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys; from videogenie.core.rendering import "
+                "_render_child; _render_child(sys.argv[1], int(sys.argv[2]))",
+                str(Path(control.stage) / "control.json"),
+                str(lock_descriptor),
+            ],
+            pass_fds=(lock_descriptor,),
+            cwd=control.stage,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            child.wait(timeout=control.provenance.recipe.resources.timeout_seconds + 30)
+        except subprocess.TimeoutExpired as exc:
+            raise VideoGenieError(
+                "LEASE_HELD",
+                "Worker completion remains unresolved",
+                details={"reason": "completion_pending"},
+            ) from exc
+
+    def _control(self, connection: sqlite3.Connection, attempt_id: str) -> _WorkerControl:
+        row = connection.execute(
+            "SELECT * FROM render_controls WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise VideoGenieError(
+                "LEASE_HELD",
+                "Attempt lacks dispatch evidence",
+                details={"reason": "execution_unresolved"},
+            )
+        control = _WorkerControl.model_validate_json(row["control_json"])
+        if control.attempt_id != attempt_id or content_sha256(control) != row["control_sha256"]:
+            raise VideoGenieError("INTERNAL_ERROR", "Stored worker control is inconsistent")
+        expected_stage = self.service.data_dir / "render-execution" / "stages" / attempt_id
+        if control.stage != str(expected_stage) or control.locator != (
+            f"render-execution/artifacts/{control.artifact_id}.mov"
+        ):
+            raise VideoGenieError("INTERNAL_ERROR", "Stored worker paths are inconsistent")
+        return control
+
+    def _completion(self, control: _WorkerControl) -> _WorkerCompletion:
+        try:
+            result = _WorkerCompletion.model_validate_json(
+                _read_private(Path(control.stage) / "completion.json")
+            )
+        except (OSError, ValidationError) as exc:
+            raise VideoGenieError(
+                "LEASE_HELD",
+                "Missing or invalid worker completion",
+                details={"reason": "execution_unresolved"},
+            ) from exc
+        if result.control_sha256 != content_sha256(control):
+            raise VideoGenieError(
+                "LEASE_HELD",
+                "Completion belongs to another dispatch",
+                details={"reason": "execution_unresolved"},
+            )
+        manifest = result.manifest
+        if manifest is not None and (
+            manifest.job_id != control.job_id
+            or manifest.attempt_id != control.attempt_id
+            or manifest.artifact_id != control.artifact_id
+            or manifest.fence != control.fence
+            or manifest.request != control.request
+            or manifest.provenance != control.provenance
+            or manifest.locator != control.locator
+            or manifest.state != "staged"
+        ):
+            raise VideoGenieError("LEASE_HELD", "Completion scope or provenance mismatch")
+        return result
+
+    @staticmethod
+    def _candidate(control: _WorkerControl, completion: _WorkerCompletion) -> Path:
+        relative = Path(completion.candidate or "")
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 2
+            or ".." in relative.parts
+            or relative.name != "candidate.mov"
+            or not relative.parts[0].startswith("videogenie-render-")
+        ):
+            raise VideoGenieError("INPUT_CHANGED", "Invalid owned candidate location")
+        return Path(control.stage) / relative
+
+    @staticmethod
+    def _verify_file(path: Path, manifest: RenderManifest) -> tuple[int, int, int, int, int]:
+        with _directory(path.parent) as directory:
+            descriptor = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size != manifest.byte_size:
+                    raise VideoGenieError("INPUT_CHANGED", "Rendered artifact size/type changed")
+                digest = hashlib.sha256()
+                remaining = manifest.byte_size
+                while remaining:
+                    block = stream.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise VideoGenieError("INPUT_CHANGED", "Rendered artifact was truncated")
+                    digest.update(block)
+                    remaining -= len(block)
+                after = os.fstat(stream.fileno())
+                if (
+                    _fingerprint(before) != _fingerprint(after)
+                    or digest.hexdigest() != manifest.artifact_sha256
+                ):
+                    raise VideoGenieError("INPUT_CHANGED", "Rendered artifact bytes changed")
+                os.fsync(stream.fileno())
+                return _fingerprint(after)
+
+    def _job_row(self, connection: sqlite3.Connection, scope: RenderJobInput) -> sqlite3.Row:
+        row = JobStorage(self.service)._row(
+            connection, scope.project_id, scope.job_id, "graphics.render_lower_third"
+        )
+        stored = stored_render_request(row)
+        if (stored.client_id, stored.storyline_id) != (scope.client_id, scope.storyline_id):
+            raise VideoGenieError("NOT_FOUND", "Render job is outside the selected scope")
+        return row
+
+    @staticmethod
+    def _artifact(manifest: RenderManifest) -> MediaArtifact:
+        return MediaArtifact(
+            artifact_id=manifest.artifact_id,
+            job_id=manifest.job_id,
+            project_id=manifest.request.project_id,
+            storyline_id=manifest.request.storyline_id,
+            locator=manifest.locator,
+            sha256=manifest.artifact_sha256,
+            byte_size=manifest.byte_size,
+            manifest_sha256=content_sha256(manifest),
+        )
+
+    def get_job(self, request: RenderJobInput) -> RenderJob:
+        """Read scoped persisted render history, including failed/revoked/archived work."""
+        request = _checked(RenderJobInput, request)
+        self._execution_initialize()
+        with self.service.connection() as connection:
+            row = self._job_row(connection, request)
+            stored = stored_render_request(row)
+            attempts = tuple(
+                RenderAttempt(
+                    attempt_id=item["attempt_id"],
+                    fence=item["fence"],
+                    status=item["status"],
+                    started_at=_timestamp(item["started_at"]),
+                    ended_at=None if item["ended_at"] is None else _timestamp(item["ended_at"]),
+                    provenance=RenderProvenance.model_validate_json(item["provenance_json"]),
+                    failure=None
+                    if item["failure_json"] is None
+                    else ErrorDetail.model_validate_json(item["failure_json"]),
+                )
+                for item in connection.execute(
+                    "SELECT a.*,p.provenance_json FROM job_attempts a "
+                    "JOIN render_attempt_details p "
+                    "USING(attempt_id) WHERE job_id=? ORDER BY fence",
+                    (request.job_id,),
+                )
+            )
+            published = connection.execute(
+                "SELECT artifact_id FROM render_manifests WHERE job_id=? AND state='published'",
+                (request.job_id,),
+            ).fetchall()
+            if len(published) > 1:
+                raise VideoGenieError("INTERNAL_ERROR", "Multiple published results for one job")
+            artifact = None
+            if published:
+                manifest = JobStorage(self.service).read_manifest(
+                    connection, request.project_id, request.job_id, published[0][0], "published"
+                )
+                artifact = self._artifact(manifest)
+            return RenderJob(
+                **request.model_dump(),
+                request=stored,
+                request_sha256=row["request_sha256"],
+                status=row["status"],
+                fence=row["fence"],
+                lease_expires_at=None
+                if row["lease_expires_at"] is None
+                else _timestamp(row["lease_expires_at"]),
+                created_at=_timestamp(row["created_at"]),
+                updated_at=_timestamp(row["updated_at"]),
+                attempts=attempts,
+                result_ref=artifact,
+                failure=None
+                if row["failure_json"] is None
+                else ErrorDetail.model_validate_json(row["failure_json"]),
+            )
+
+    def get_artifact(self, request: ArtifactInput) -> RenderResult:
+        """Read one exact published candidate; no newest selection or owner review implied."""
+        request = _checked(ArtifactInput, request)
+        self._execution_initialize()
+        with self.service.connection() as connection:
+            row = connection.execute(
+                "SELECT job_id FROM render_manifests WHERE artifact_id=? AND state='published'",
+                (request.artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise VideoGenieError("NOT_FOUND", "Published artifact not found")
+            self._job_row(
+                connection,
+                RenderJobInput(
+                    project_id=request.project_id,
+                    storyline_id=request.storyline_id,
+                    client_id=request.client_id,
+                    job_id=row[0],
+                ),
+            )
+            manifest = JobStorage(self.service).read_manifest(
+                connection, request.project_id, row[0], request.artifact_id, "published"
+            )
+            return RenderResult(artifact=self._artifact(manifest), manifest=manifest)
+
+    def list_artifacts(self, request: ListArtifactsInput) -> tuple[MediaArtifact, ...]:
+        """List historical candidates in explicit scope without changing selection."""
+        request = _checked(ListArtifactsInput, request)
+        self._execution_initialize()
+        with self.service.connection() as connection:
+            rows = connection.execute(
+                "SELECT m.* FROM render_manifests m JOIN jobs j "
+                "USING(job_id) WHERE j.project_id=? AND j.storyline_id=? AND m.state='published' "
+                "ORDER BY j.created_at,m.artifact_id",
+                (request.project_id, request.storyline_id),
+            )
+            result = []
+            for row in rows:
+                manifest = JobStorage(self.service).read_manifest(
+                    connection, request.project_id, row["job_id"], row["artifact_id"], "published"
+                )
+                if manifest.request.client_id == request.client_id:
+                    result.append(self._artifact(manifest))
+            return tuple(result)
+
+    def list_jobs(self, request: ProjectAuthorityScope) -> tuple[RenderJob, ...]:
+        """List render history in explicit scope; no implicit active/current job."""
+        request = _checked(ProjectAuthorityScope, request)
+        self._execution_initialize()
+        with self.service.connection() as connection:
+            scopes = []
+            for row in connection.execute(
+                "SELECT * FROM jobs WHERE project_id=? AND storyline_id=? AND operation=? "
+                "ORDER BY created_at,job_id",
+                (request.project_id, request.storyline_id, "graphics.render_lower_third"),
+            ):
+                if stored_render_request(row).client_id == request.client_id:
+                    scopes.append(RenderJobInput(**request.model_dump(), job_id=row["job_id"]))
+        return tuple(self.get_job(scope) for scope in scopes)
+
+    def _record_completion(
+        self, connection: sqlite3.Connection, control: _WorkerControl, completion: _WorkerCompletion
+    ) -> None:
+        prior = connection.execute(
+            "SELECT * FROM render_completions WHERE attempt_id=?", (control.attempt_id,)
+        ).fetchone()
+        digest = content_sha256(completion)
+        if prior is not None:
+            if (
+                prior["receipt_sha256"] != digest
+                or _WorkerCompletion.model_validate_json(prior["receipt_json"]) != completion
+            ):
+                raise VideoGenieError("INPUT_CHANGED", "Completion evidence changed")
+            return
+        connection.execute(
+            "INSERT INTO render_completions VALUES(?,?,?)",
+            (control.attempt_id, completion.model_dump_json(), digest),
+        )
+
+    def _settle_execution(
+        self,
+        connection: sqlite3.Connection,
+        control: _WorkerControl,
+        completion: _WorkerCompletion,
+        outcome: Literal["published", "failed", "quarantined"],
+    ) -> None:
+        self._record_completion(connection, control, completion)
+        row = connection.execute(
+            "SELECT reservation_id FROM render_reservations WHERE attempt_id=?",
+            (control.attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise VideoGenieError("INTERNAL_ERROR", "Attempt reservation missing")
+        evidence = (
+            CostEvidence(
+                source="local_measurement",
+                reference="fixed_local_renderer:no_external_provider_dispatch",
+                sha256=content_sha256(completion),
+            ),
+        )
+        # Release the reserved zero external fee. Actual compute is an unpriced
+        # observed wall duration, never converted into currency or CPU billing.
+        self.authority.costs.transition(
+            ReservationChangeInput(
+                project_id=control.request.project_id,
+                reservation_id=row[0],
+                kind="release",
+                evidence=evidence,
+                idempotency_key=f"render-zero:{control.attempt_id}",
+            ),
+            connection=connection,
+        )
+        divisor = math.gcd(completion.elapsed_ns, 1_000_000_000)
+        self.authority.costs.record(
+            RecordCostInput(
+                project_id=control.request.project_id,
+                storyline_id=control.request.storyline_id,
+                run_id=control.job_id,
+                attempt_id=control.attempt_id,
+                grant_id=control.request.grant_id,
+                kind="unpriced",
+                amount=None,
+                quantity=Quantity(
+                    numerator=completion.elapsed_ns // divisor,
+                    denominator=1_000_000_000 // divisor,
+                    unit="worker_wall_seconds",
+                ),
+                evidence=evidence,
+                idempotency_key=f"render-compute:{control.attempt_id}",
+            ),
+            connection=connection,
+        )
+        connection.execute(
+            "INSERT INTO render_outcomes VALUES(?,?,?)",
+            (control.attempt_id, outcome, completion.model_dump_json()),
+        )
+
+    def _retire(
+        self, control: _WorkerControl, completion: _WorkerCompletion, failure: ErrorDetail
+    ) -> None:
+        """Quarantine by durable exclusion, preserving all files/old attempt identities.
+
+        A completion receipt is mandatory. Expiry alone cannot reach this path.
+        Any existing candidate/final file must still match before being classified.
+        """
+        if completion.manifest is not None:
+            candidate_identity = self._verify_file(
+                self._candidate(control, completion), completion.manifest
+            )
+            final = self.service.data_dir / control.locator
+            if os.path.lexists(final):
+                final_identity = self._verify_file(final, completion.manifest)
+                if candidate_identity[:3] != final_identity[:3]:
+                    raise VideoGenieError(
+                        "INPUT_CHANGED", "Orphan final file is not the owned link"
+                    )
+                with _directory(final.parent) as directory:
+                    os.fsync(directory)
+        with self.service.connection(write=True) as connection:
+            row = JobStorage(self.service)._row(
+                connection, control.request.project_id, control.job_id, control.request.operation
+            )
+            if row["fence"] != control.fence or row["status"] != "running":
+                raise VideoGenieError("LEASE_HELD", "Attempt fence changed before reconciliation")
+            self._settle_execution(
+                connection,
+                control,
+                completion,
+                "quarantined" if completion.manifest is not None else "failed",
+            )
+            now = time.time()
+            connection.execute(
+                "UPDATE job_attempts SET status='interrupted',ended_at=?,failure_json=? "
+                "WHERE attempt_id=?",
+                (now, failure.model_dump_json(), control.attempt_id),
+            )
+            connection.execute(
+                "UPDATE jobs SET status='needs_input',lease_expires_at=NULL,"
+                "updated_at=?,failure_json=? WHERE job_id=?",
+                (now, failure.model_dump_json(), control.job_id),
+            )
+            self.studio.append_event(
+                connection,
+                "render.reconciled",
+                project_id=control.request.project_id,
+                client_id=control.request.client_id,
+                correlation_id=control.job_id,
+                payload={"attempt_id": control.attempt_id, "reason": failure.code},
+            )
+
+    def _publish(self, control: _WorkerControl, completion: _WorkerCompletion) -> None:
+        manifest = completion.manifest
+        assert manifest is not None
+        candidate = self._candidate(control, completion)
+        source_identity = self._verify_file(candidate, manifest)
+        storage = JobStorage(self.service)
+        with self.service.connection(write=True) as connection:
+            self.compile_request(control.request, connection=connection)
+            self._record_completion(connection, control, completion)
+            storage.record_manifest(connection, manifest)
+            verified = RenderManifest.model_validate(manifest.model_dump() | {"state": "verified"})
+            storage.record_manifest(connection, verified)
+        final = self.service.data_dir / control.locator
+        with _directory(candidate.parent) as source, _directory(final.parent) as target:
+            if (
+                _fingerprint(os.stat(candidate.name, dir_fd=source, follow_symlinks=False))
+                != source_identity
+            ):
+                raise VideoGenieError(
+                    "INPUT_CHANGED", "Candidate identity changed before publication"
+                )
+            try:
+                os.link(
+                    candidate.name,
+                    final.name,
+                    src_dir_fd=source,
+                    dst_dir_fd=target,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                # Reconcile only the exact same owned inode; never replace an
+                # unrelated file even if its content happens to have this hash.
+                if (
+                    os.stat(final.name, dir_fd=target, follow_symlinks=False).st_ino
+                    != source_identity[1]
+                ):
+                    raise VideoGenieError(
+                        "INPUT_CHANGED", "Final artifact identity collision"
+                    ) from None
+            except OSError as exc:
+                raise VideoGenieError(
+                    "MEDIA_UNAVAILABLE",
+                    "Atomic publication needs same filesystem",
+                    details={"reason": "publication_unresolved", "errno": exc.errno},
+                ) from exc
+            os.fsync(target)
+        final_identity = self._verify_file(final, manifest)
+        current_source = self._verify_file(candidate, manifest)
+        if final_identity[:3] != current_source[:3]:
+            raise VideoGenieError("INPUT_CHANGED", "Published link differs from owned candidate")
+        with self.service.connection(write=True) as connection:
+            self.compile_request(control.request, connection=connection)
+            storage.check_fence(
+                connection,
+                control.request.project_id,
+                control.job_id,
+                control.fence,
+                expected_operation=control.request.operation,
+            )
+            with _directory(final.parent) as directory:
+                if (
+                    _fingerprint(os.stat(final.name, dir_fd=directory, follow_symlinks=False))
+                    != final_identity
+                ):
+                    raise VideoGenieError(
+                        "INPUT_CHANGED", "Published artifact changed before commit"
+                    )
+            published = RenderManifest.model_validate(
+                manifest.model_dump() | {"state": "published"}
+            )
+            storage.record_manifest(connection, published)
+            self._settle_execution(connection, control, completion, "published")
+            storage.finish(
+                connection,
+                control.request.project_id,
+                control.job_id,
+                control.fence,
+                "succeeded",
+                None,
+                expected_operation=control.request.operation,
+            )
+            self.studio.append_event(
+                connection,
+                "render.published",
+                project_id=control.request.project_id,
+                client_id=control.request.client_id,
+                correlation_id=control.job_id,
+                payload={
+                    "artifact_id": control.artifact_id,
+                    "manifest_sha256": content_sha256(published),
+                },
+            )
+        # Keep the private hardlink and receipt as immutable recovery evidence.
+        # No source/old output deletion; managed retention is a separate action.
+
+    def submit_lower_third(self, request: RenderLowerThirdInput) -> RenderJob:
+        """Run one bounded local render under a persisted authenticated standing grant."""
+        request = _checked(RenderLowerThirdInput, request)
+        self._execution_initialize()
+        try:
+            with self._execution_lock(request) as descriptor:
+                with self.service.connection() as connection:
+                    row = connection.execute(
+                        "SELECT * FROM jobs WHERE project_id=? AND operation=? "
+                        "AND idempotency_key=?",
+                        (request.project_id, request.operation, request.idempotency_key),
+                    ).fetchone()
+                    if row is not None and stored_render_request(row) != request:
+                        raise VideoGenieError(
+                            "IDEMPOTENCY_CONFLICT", "Render key binds another request"
+                        )
+                    previous = None
+                    if row is not None:
+                        scope = RenderJobInput(
+                            project_id=request.project_id,
+                            storyline_id=request.storyline_id,
+                            client_id=request.client_id,
+                            job_id=row["job_id"],
+                        )
+                        if row["status"] == "running":
+                            attempt = connection.execute(
+                                "SELECT attempt_id FROM job_attempts WHERE job_id=? AND fence=?",
+                                (row["job_id"], row["fence"]),
+                            ).fetchone()
+                            previous = self._control(connection, attempt[0])
+                if row is not None and row["status"] == "succeeded":
+                    return self.get_job(scope)
+                if previous is not None:
+                    completion = self._completion(previous)
+                    self._retire(
+                        previous,
+                        completion,
+                        _detail(
+                            VideoGenieError(
+                                "LEASE_HELD",
+                                "Interrupted coordinator reconciled; old output quarantined",
+                                details={"reason": "coordinator_interrupted"},
+                            )
+                        ),
+                    )
+                plan = self.compile_request(request)
+                provenance = self._observe_provenance(plan)
+                claim = self._claim_render(request, provenance)
+                assert claim is not None
+                scope = RenderJobInput(
+                    project_id=request.project_id,
+                    storyline_id=request.storyline_id,
+                    client_id=request.client_id,
+                    job_id=claim.job_id,
+                )
+                control = self._prepare_control(claim)
+                self._launch_child(control, descriptor)
+                completion = self._completion(control)
+                if completion.failure is not None:
+                    self._retire(control, completion, completion.failure)
+                else:
+                    try:
+                        self._publish(control, completion)
+                    except VideoGenieError as error:
+                        if error.code not in {
+                            "ACCESS_DENIED",
+                            "REVISION_CONFLICT",
+                            "PROJECT_ARCHIVED",
+                            "LEASE_HELD",
+                        }:
+                            raise
+                        self._retire(control, completion, _detail(error))
+                return self.get_job(scope)
+        except OSError as exc:
+            raise VideoGenieError(
+                "MEDIA_UNAVAILABLE",
+                "Managed execution storage is unavailable",
+                details={"reason": "execution_unresolved", "errno": exc.errno},
+            ) from exc
+
+    def resume_job(self, request: RenderJobInput) -> RenderJob:
+        """Reconcile evidence before a new attempt; expiry never proves worker cleanup."""
+        snapshot = self.get_job(request)
+        return self.submit_lower_third(snapshot.request)
