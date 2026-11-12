@@ -26,6 +26,7 @@ from videogenie.contracts.authority import (
     ReviewInput,
     SelectOutputInput,
 )
+from videogenie.contracts.color import ApplyColorInput
 from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.discovery import (
     ApprovalOutcome,
@@ -91,6 +92,7 @@ from videogenie.core.activity import ActivityService
 from videogenie.core.assembly import assemble_timeline
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
+from videogenie.core.color import apply_color
 from videogenie.core.costs import CostService
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
@@ -234,6 +236,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "transcript.get": TranscriptInput,
     "resolve.timeline.assemble": AssembleTimelineInput,
     "resolve.render": RenderTimelineInput,
+    "resolve.color.apply": ApplyColorInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -467,6 +470,7 @@ def _dispatch(
                 "transcript.get",
                 "resolve.timeline.assemble",
                 "resolve.render",
+                "resolve.color.apply",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -506,6 +510,8 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "resolve.color.apply":
+        return apply_color(service, ApplyColorInput.model_validate_json(_strict_json(payload)))
     if operation == "resolve.render":
         return render_timeline(
             service, RenderTimelineInput.model_validate_json(_strict_json(payload))

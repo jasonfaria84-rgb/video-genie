@@ -10,12 +10,12 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 68 shared agent operations: projects and clients, cycles and
+This source exposes 69 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests, output selection, dead-space removal, a
-DaVinci Resolve status check, word-level transcripts made in Resolve, and
-timeline assembly and rendering in Resolve. Seven additive discovery reads preserve the earlier
+DaVinci Resolve status check, and word-level transcripts, timeline assembly,
+color grading and rendering in Resolve. Seven additive discovery reads preserve the earlier
 54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
@@ -251,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 68 agent operations. Replace spaces in each CLI command
+The server exposes the same 69 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -471,6 +471,33 @@ adds audio fades at each join. `timeline_name` must be new; existing timelines a
 never edited. The result reports the timeline's ID, length in frames and seconds,
 and `cut_points_seconds`, the output times of every join, which `render.check`-style
 reviews can use.
+
+## Grade color in DaVinci Resolve
+
+`resolve color apply` grades clips on a timeline in the project's own Resolve
+project. The grade goes into a separate color version on each clip (default
+`VideoGenie`), so the original grade stays available in Resolve.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","look":"warm_cinematic","adjustments":{"temperature":0.2}}' \
+  | videogenie resolve color apply --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `look` | `neutral` | `neutral`, `neutral_punch`, `warm_cinematic`, `cool_clean`, `soft_film` or `mono`. |
+| `adjustments.exposure_stops` | 0 | -2 to 2 stops. |
+| `adjustments.contrast` | 1 | 0.5 to 2. |
+| `adjustments.saturation` | 1 | 0 to 2. |
+| `adjustments.temperature` | 0 | -1 (cooler) to 1 (warmer). |
+| `adjustments.tint` | 0 | -1 to 1. |
+| `lut` | none | A LUT installed in Resolve's LUT library, as a relative path such as `Blackmagic Design/Blackmagic 4.6K Film to Rec709.cube`. |
+| `track_index`, `item_numbers` | 1, all | Which clips to grade, by position on the track. |
+| `version_name` | `VideoGenie` | The color version that holds the grade. |
+
+The look and adjustments become ASC CDL values on node 1. Resolve only applies
+LUTs from its own LUT library, so install new LUTs through Resolve first. Raw
+filter text and arbitrary file paths aren't accepted.
 
 ## Render a timeline from DaVinci Resolve
 
