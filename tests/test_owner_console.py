@@ -158,7 +158,17 @@ def test_loopback_launch_single_use_and_no_http_bootstrap(
     assert request(console, "/session")[0] == 403
     assert request(console, "/bootstrap", browser=browser)[0] == 404
     assert request(console, "/enrollment/options", browser=browser)[0] == 403
-    assert request(console, "/", method="GET")[0] == 503
+    status, headers, body = request(console, "/", method="GET")
+    assert status == 200
+    assert headers["Content-Type"] == "text/html; charset=utf-8"
+    assert "<title>VideoGenie · Owner review</title>" in body.decode("utf-8")
+    assert b"<h1>Owner review</h1>" in body
+    assert headers["Cache-Control"] == "no-store"
+    assert headers["X-Content-Type-Options"] == "nosniff"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    csp = headers["Content-Security-Policy"]
+    assert "default-src 'none'" in csp and "frame-ancestors 'none'" in csp
+    assert "'unsafe-inline'" not in csp and "'unsafe-eval'" not in csp
     assert not capsys.readouterr().err
 
 
