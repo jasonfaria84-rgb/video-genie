@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import asdict
 from typing import Any, TypedDict
 from uuid import UUID
 
@@ -24,9 +25,12 @@ from videogenie.contracts.rendering import (
     ListArtifactsInput,
     MediaArtifact,
     RenderAttempt,
+    RenderColorMetadata,
     RenderConfig,
     RenderConfigContent,
     RenderConfigInput,
+    RenderExecutionEvidence,
+    RenderFitMetrics,
     RenderJob,
     RenderJobInput,
     RenderLowerThirdInput,
@@ -36,6 +40,7 @@ from videogenie.contracts.rendering import (
     RenderToolVersions,
 )
 from videogenie.core.jobs import Artifact, Job
+from videogenie.workers.lower_third import ExecutionEvidence, FitMetrics
 
 NOW = "2026-11-12T00:00:00Z"
 LATER = "2026-11-12T00:00:01Z"
@@ -112,6 +117,7 @@ def request() -> RenderLowerThirdInput:
 def manifest() -> RenderManifest:
     submitted = request()
     return RenderManifest(
+        manifest_version="2",
         artifact_id=uid(12),
         job_id=uid(13),
         attempt_id=uid(14),
@@ -119,12 +125,60 @@ def manifest() -> RenderManifest:
         request=submitted,
         request_sha256=content_sha256(submitted),
         provenance=provenance(),
+        execution=execution(),
+        fit=fit(),
+        color_metadata=RenderColorMetadata(
+            color_range=None,
+            color_space=None,
+            color_transfer=None,
+            color_primaries=None,
+        ),
+        ffprobe_version="ffprobe version synthetic-test",
+        decoded_frame_sha256=("d" * 64,) * 150,
         locator="artifacts/fictional/candidate.mov",
         artifact_sha256="b" * 64,
         byte_size=100,
         output=provenance().recipe.output,
         state="published",
         created_at=LATER,
+    )
+
+
+def execution() -> RenderExecutionEvidence:
+    # Synthetic observations shaped exactly like the worker dataclass, not a run.
+    return RenderExecutionEvidence.model_validate(
+        asdict(
+            ExecutionEvidence(
+                renderer="local-lower-third-1",
+                videogenie_version="0.1.0",
+                renderer_source_sha256="c" * 64,
+                text_anchor="ls",
+                entry_slide_pixels=24,
+                panel_entry_frames=12,
+                text_entry_frames=12,
+                text_delay_frames=4,
+                exit_frames=14,
+                exit_motion="fade_only",
+                motion_curve="clamped_smoothstep",
+                requested_color_interpretation="sRGB",
+                alpha_interpretation="straight",
+            )
+        )
+    )
+
+
+def fit() -> RenderFitMetrics:
+    # Font metrics may include side bearings; never substitute decoded ink bounds.
+    return RenderFitMetrics.model_validate(
+        asdict(
+            FitMetrics(
+                name_font_pixels=42,
+                role_font_pixels=22,
+                name_bbox=(163, 833, 600, 875),
+                role_bbox=(163, 904, 544, 920),
+                panel_bbox=(125, 818, 893, 953),
+            )
+        )
     )
 
 
@@ -209,8 +263,257 @@ def test_roundtrip_exact_digest_domains_and_separate_candidate_result() -> None:
     )
     assert (
         final.artifact.manifest_sha256
+        == "6c6ae9a0822650437dec60a6ad37a692607d6b21ce5e9b1fb5ff6c89fc50c2dc"
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "manifest_version",
+        "execution",
+        "fit",
+        "color_metadata",
+        "ffprobe_version",
+        "decoded_frame_sha256",
+    ],
+)
+def test_manifest_observations_are_required_not_inferred(field: str) -> None:
+    value = manifest().model_dump(mode="json")
+    del value[field]
+    with pytest.raises(ValidationError):
+        parse(RenderManifest, value)
+
+
+def test_original_evidence_free_format_is_preserved_as_history_not_auto_upgraded() -> None:
+    original = manifest().model_dump(
+        mode="json",
+        exclude={
+            "manifest_version",
+            "execution",
+            "fit",
+            "color_metadata",
+            "ffprobe_version",
+            "decoded_frame_sha256",
+        },
+    )
+    raw = json.dumps(original, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    assert (
+        hashlib.sha256(raw).hexdigest()
         == "9a76a90149dab17d2ad5bb21aaf9ab7614ab3c59db7add1eaf816efc5f94f941"
     )
+    with pytest.raises(ValidationError):
+        parse(RenderManifest, original)
+    for version in ("1", "3", 2, 2.0, True, None):
+        with pytest.raises(ValidationError):
+            parse(RenderManifest, changed(manifest(), manifest_version=version))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("renderer", "other"),
+        ("text_anchor", "lt"),
+        ("exit_motion", "slide"),
+        ("motion_curve", "linear"),
+        ("requested_color_interpretation", "bt709"),
+        ("alpha_interpretation", "premultiplied"),
+        ("renderer_source_sha256", "G" * 64),
+        ("videogenie_version", " "),
+        ("entry_slide_pixels", 25),
+        ("entry_slide_pixels", -1),
+        ("panel_entry_frames", 0),
+        ("text_delay_frames", 12),
+        ("text_entry_frames", 13),
+        ("exit_frames", 31),
+    ],
+)
+def test_execution_rejects_unsupported_or_contradictory_observations(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        parse(RenderExecutionEvidence, changed(execution(), **{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "entry_slide_pixels",
+        "panel_entry_frames",
+        "text_entry_frames",
+        "text_delay_frames",
+        "exit_frames",
+    ],
+)
+@pytest.mark.parametrize("bad", [True, 1.0, "1"])
+def test_execution_numeric_fields_never_coerce(field: str, bad: object) -> None:
+    value = execution().model_dump() | {field: bad}
+    with pytest.raises(ValidationError):
+        RenderExecutionEvidence.model_validate(value)
+    with pytest.raises(ValidationError):
+        parse(RenderExecutionEvidence, value)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("name_font_pixels", True),
+        ("role_font_pixels", 22.0),
+        ("name_font_pixels", 0),
+        ("name_font_pixels", 121),
+        ("name_bbox", [163, 833, 162, 875]),
+        ("name_bbox", [163, 875, 600, 833]),
+        ("panel_bbox", [125, 818, 125, 953]),
+        ("panel_bbox", [125, 818, 893, 1081]),
+        ("panel_bbox", [-1, 818, 893, 953]),
+        ("panel_bbox", [125, 818, 1921, 953]),
+        ("role_bbox", [163, 904, 544]),
+        ("name_bbox", [163.0, 833, 600, 875]),
+        ("name_bbox", [True, 833, 600, 875]),
+        ("name_bbox", [163, "833", 600, 875]),
+    ],
+)
+def test_fit_numeric_and_coordinate_types_are_strict(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        parse(RenderFitMetrics, changed(fit(), **{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("name_font_pixels", 43),
+        ("role_font_pixels", 16),
+        ("name_bbox", [163, 817, 600, 875]),
+        ("name_bbox", [163, 833, 856, 875]),
+        ("name_bbox", [163, 833, 600, 897]),
+        ("role_bbox", [163, 895, 544, 920]),
+        ("role_bbox", [163, 904, 544, 954]),
+        ("panel_bbox", [124, 818, 893, 953]),
+    ],
+)
+def test_fit_must_match_pinned_layout_and_separated_line_regions(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        parse(RenderManifest, changed(manifest(), fit=changed(fit(), **{field: value})))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("entry_slide_pixels", 23),
+        ("text_delay_frames", 3),
+        ("exit_frames", 13),
+    ],
+)
+def test_effective_motion_is_checked_against_pinned_recipe(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        parse(RenderManifest, changed(manifest(), execution=changed(execution(), **{field: value})))
+
+
+def test_color_absence_is_explicit_and_no_requested_tag_is_substituted() -> None:
+    observed = manifest().color_metadata
+    assert set(observed.model_dump(exclude={"schema_version"}).values()) == {None}
+    for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
+        missing = observed.model_dump(mode="json")
+        del missing[field]
+        with pytest.raises(ValidationError):
+            parse(RenderColorMetadata, missing)
+    for field, value in (
+        ("color_range", "tv"),
+        ("color_space", "bt709"),
+        ("color_transfer", "unknown"),
+        ("color_primaries", False),
+    ):
+        with pytest.raises(ValidationError):
+            parse(RenderColorMetadata, changed(observed, **{field: value}))
+
+
+@pytest.mark.parametrize("hashes", [("d" * 64,) * 149, ("d" * 64,) * 151, ("bad",) * 150])
+def test_decoded_evidence_requires_all_fixed_output_frames(hashes: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError):
+        parse(RenderManifest, changed(manifest(), decoded_frame_sha256=hashes))
+
+
+def test_every_observed_domain_changes_manifest_digest_and_invalidates_prior_reference() -> None:
+    original = manifest()
+    for update in (
+        {"execution": changed(execution(), videogenie_version="0.1.1")},
+        {"execution": changed(execution(), renderer_source_sha256="e" * 64)},
+        {"fit": changed(fit(), name_bbox=[164, 833, 600, 875])},
+        {"fit": changed(fit(), name_font_pixels=41)},
+        {"color_metadata": changed(original.color_metadata, color_primaries="bt709")},
+        {"ffprobe_version": "ffprobe version other-observed-version"},
+        {"decoded_frame_sha256": ("e" * 64,) + original.decoded_frame_sha256[1:]},
+    ):
+        revised = parse(RenderManifest, changed(original, **update))
+        encoded = json.dumps(
+            revised.model_dump(mode="json"),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        assert content_sha256(revised) == hashlib.sha256(encoded).hexdigest()
+        assert content_sha256(revised) != content_sha256(original)
+        with pytest.raises(ValidationError):
+            RenderResult(artifact=artifact(), manifest=revised)
+    with pytest.raises(ValidationError):
+        original.execution.entry_slide_pixels = 1
+    with pytest.raises(ValidationError):
+        original.fit.name_bbox = (1, 2, 3, 4)
+
+
+def with_parameters(name: str, role: str) -> RenderManifest:
+    original = manifest()
+    parameters = LowerThirdParameters(name=name, role=role)
+    content = RenderConfigContent.model_validate(
+        original.provenance.config.model_dump(exclude={"config_sha256"})
+        | {"parameters": parameters.model_dump()}
+    )
+    config = RenderConfig(**content.model_dump(), config_sha256=content_sha256(content))
+    observed = RenderProvenance.model_validate(
+        original.provenance.model_dump() | {"config": config}
+    )
+    submitted = parse(
+        RenderLowerThirdInput, changed(original.request, config_sha256=config.config_sha256)
+    )
+    metrics = (
+        fit() if role else parse(RenderFitMetrics, changed(fit(), role_bbox=[163, 920, 163, 920]))
+    )
+    return parse(
+        RenderManifest,
+        changed(
+            original,
+            provenance=observed.model_dump(mode="json"),
+            request=submitted.model_dump(mode="json"),
+            request_sha256=content_sha256(submitted),
+            fit=metrics.model_dump(mode="json"),
+        ),
+    )
+
+
+def test_empty_role_uses_observed_baseline_metrics_not_invented_visible_box() -> None:
+    original = with_parameters("Fictional Name", "")
+    assert original.fit.role_bbox == (163, 920, 163, 920)
+    for updates in ({"role_bbox": [163, 904, 544, 920]}, {"role_font_pixels": 21}):
+        with pytest.raises(ValidationError):
+            parse(RenderManifest, changed(original, fit=changed(original.fit, **updates)))
+
+
+def test_spacing_metrics_do_not_claim_visible_ink_from_nonempty_strings() -> None:
+    # T282's cmap check proves coverage, not outlines; _fit allows equal edges.
+    # These synthetic observations remain distinct from the actual visible fixture.
+    original = with_parameters("A", "   ")
+    spacing = parse(
+        RenderFitMetrics,
+        changed(
+            original.fit,
+            name_bbox=[163, 873, 163, 873],
+            role_bbox=[163, 920, 183, 920],
+        ),
+    )
+    record = parse(RenderManifest, changed(original, fit=spacing.model_dump(mode="json")))
+    assert record.fit.name_bbox[0] == record.fit.name_bbox[2]
+    assert record.fit.role_bbox[1] == record.fit.role_bbox[3]
+    assert RenderManifest.model_validate_json(record.model_dump_json()) == record
 
 
 @pytest.mark.parametrize(
