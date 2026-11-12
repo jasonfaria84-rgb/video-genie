@@ -1,0 +1,62 @@
+{
+  "schema_version": "1",
+  "fixture": "Fictional local interpretation; not a Fusion port or owner-approved output",
+  "font_sha256": "288316099b1e0a47a4716d159098005eef7c0066921f34e3200393dbdb01947f",
+  "name": "JOS\u00c9 N\u00da\u00d1EZ-\u00d8STBY",
+  "role": "COMMUNITY GARDEN VOLUNTEER",
+  "anchor": "ls (left baseline)",
+  "motion": "Clamped smoothstep; panel entry12, text delay4 then entry12, exit14; at most24px horizontal slide constrained to title-safe",
+  "pixel_policy": "Each real render compares all150 decoded straight-RGBA frame SHA256 values to generated frames. Repeated same-runtime renders must match. No cross-platform encoded-byte identity or unmeasured pixel tolerance is claimed.",
+  "keyframes": [
+    0,
+    16,
+    75,
+    129,
+    149
+  ],
+  "measured_fixture": {
+    "name_font_pixels": 42,
+    "role_font_pixels": 22,
+    "name_bbox": [
+      163,
+      833,
+      600,
+      875
+    ],
+    "role_bbox": [
+      163,
+      904,
+      544,
+      920
+    ],
+    "panel_bbox": [
+      125,
+      818,
+      893,
+      953
+    ]
+  },
+  "reference_runtime": {
+    "system": "darwin",
+    "machine": "arm64",
+    "python": "3.12.13",
+    "pillow": "13.0.0",
+    "fonttools": "4.68.0",
+    "freetype": "2.14.3"
+  },
+  "reference_decoded_keyframes_sha256": {
+    "0": "92d724915684722dca6bc6037126fccaf0a5d0c34e6c7399b3305649ce825dce",
+    "16": "d4f8889c63d70d8530fc7f4dd28c6508820762616525a3a287dd2f81865e70e1",
+    "75": "d4f8889c63d70d8530fc7f4dd28c6508820762616525a3a287dd2f81865e70e1",
+    "129": "d4f8889c63d70d8530fc7f4dd28c6508820762616525a3a287dd2f81865e70e1",
+    "149": "83245f39505b2665e70b947b9ca18283c88901cea065e17ab47d7331f2d5385e"
+  },
+  "observed_color_metadata": {
+    "ffmpeg": "9.0.2",
+    "color_range": null,
+    "color_space": null,
+    "color_transfer": null,
+    "color_primaries": null,
+    "interpretation": "sRGB requested but not recorded by this MOV encoder; straight RGBA verified by exact decoded bytes and compositing, not tags"
+  }
+}

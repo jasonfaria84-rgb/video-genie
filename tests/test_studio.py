@@ -197,7 +197,7 @@ def test_extension_upgrade_preserves_real_probe_and_project(tmp_path: Path) -> N
     )
     with service.connection() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert connection.execute("SELECT version FROM job_schema").fetchone()[0] == 1
+        assert connection.execute("SELECT version FROM job_schema").fetchone()[0] == 2
         assert connection.execute("SELECT version FROM studio_schema").fetchone()[0] == 1
 
 

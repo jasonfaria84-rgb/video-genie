@@ -446,7 +446,7 @@ def test_failed_migration_is_atomic_and_preserves_extensions(tmp_path: Path) -> 
     with service.connection() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert connection.execute("SELECT version FROM studio_schema").fetchone()[0] == 1
-        assert connection.execute("SELECT version FROM job_schema").fetchone()[0] == 1
+        assert connection.execute("SELECT version FROM job_schema").fetchone()[0] == 2
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
