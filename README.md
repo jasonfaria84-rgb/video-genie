@@ -410,8 +410,41 @@ speech. Video is re-encoded as H.264 (CRF 18) with AAC audio; only the first vid
 and audio streams are kept. One render handles up to 2,000 kept segments.
 MCP paths must be absolute; CLI paths may be relative to the current folder.
 
-This uses silence only. Filler words ("um", "uh") and false starts need a
-word-level transcript and aren't detected yet.
+This uses silence only. To remove filler words ("um", "uh") and false starts,
+plan cuts from a transcript as described below.
+
+## Remove filler words and false starts
+
+`edit cuts plan` reads a stored word-level transcript and saves a cut plan that
+removes filler words, false starts and long pauses. It works only on transcript
+timings: it never reads or changes media, and it doesn't transcribe. Transcripts
+come from `transcript.create`, a separate operation. `edit cuts get` reads a saved
+plan again by `plan_id`.
+
+```bash
+printf '%s' '{"transcript_id":"TRANSCRIPT_UUID"}' \
+  | videogenie edit cuts plan --json --input-json -
+printf '%s' '{"plan_id":"PLAN_UUID"}' | videogenie edit cuts get --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `transcript_id` | required | The stored transcript to plan from. |
+| `filler_words` | um, umm, uhm, uh, uhh, er, erm, ah, hmm, mm | Words to cut. Case, spaces and punctuation are ignored, so `" Um,"` matches `um`. A multi-word entry such as `"you know"` matches consecutive words; none are in the default list. |
+| `remove_false_starts` | true | Cut the earlier copy of a word or 1-4 word phrase repeated within about a second (`I I think`, `we should, we should go`). |
+| `max_filler_seconds` | 1.2 | Untranscribed sound (`kind: "sound"`) up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
+| `min_pause_seconds` | 0.5 | Shortest gap between kept words to cut as a pause (0.2 to 30). |
+| `padding_seconds` | 0.15 | Gap kept beside speech on each side of a cut. Must be under half of `min_pause_seconds`. |
+
+Each cut has a reason: `filler`, `false_start`, `pause`, `leading_silence` or
+`trailing_silence`, plus the IDs of the words it removes. A filler or false start
+and the pause around it merge into one cut, reported with the more specific
+reason (`filler` before `false_start` before `pause`). Cuts never start or end
+inside a kept word; a filler that overlaps other speech is left in. Single words
+people often double on purpose, such as "very very" or "that that", aren't treated
+as false starts. If nothing would be left, the plan cuts nothing. The plan's
+`kept` ranges are what remains to assemble; it names the transcript and source
+SHA-256 it was made from. Rendering a plan to a new file isn't implemented yet.
 
 ## Check DaVinci Resolve
 

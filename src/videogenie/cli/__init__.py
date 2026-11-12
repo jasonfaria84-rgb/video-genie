@@ -38,6 +38,7 @@ from videogenie.contracts.discovery import (
     ListRecipeVersionsInput,
     ProjectRecipeContextInput,
 )
+from videogenie.contracts.edit import GetCutPlanInput, PlanCutsInput
 from videogenie.contracts.models import (
     ContractModel,
     Identifier,
@@ -84,6 +85,7 @@ from videogenie.contracts.studio import (
 from videogenie.contracts.transcripts import (
     AssembleTimelineInput,
     CreateTranscriptInput,
+    CutPlan,
     Transcript,
     TranscriptInput,
 )
@@ -94,6 +96,7 @@ from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.color import apply_color
 from videogenie.core.costs import CostService
+from videogenie.core.cut_planning import create_cut_plan
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
 from videogenie.core.recipe_previews import RecipePreviewService
@@ -103,6 +106,7 @@ from videogenie.core.resolve_render import render_timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
+from videogenie.core.transcripts import load as load_record
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -237,6 +241,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "resolve.timeline.assemble": AssembleTimelineInput,
     "resolve.render": RenderTimelineInput,
     "resolve.color.apply": ApplyColorInput,
+    "edit.cuts.plan": PlanCutsInput,
+    "edit.cuts.get": GetCutPlanInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -471,6 +477,8 @@ def _dispatch(
                 "resolve.timeline.assemble",
                 "resolve.render",
                 "resolve.color.apply",
+                "edit.cuts.plan",
+                "edit.cuts.get",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -534,6 +542,11 @@ def _dispatch(
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
         return remove_silence(RemoveSilenceInput.model_validate_json(_strict_json(payload)))
+    if operation == "edit.cuts.plan":
+        return create_cut_plan(service, PlanCutsInput.model_validate_json(_strict_json(payload)))
+    if operation == "edit.cuts.get":
+        selected_plan = GetCutPlanInput.model_validate_json(_strict_json(payload))
+        return load_record(service, CutPlan, selected_plan.plan_id)
     if operation.startswith("client.") or operation in {
         "project.client.get",
         "project.client.assign",
@@ -622,12 +635,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "command",
         nargs="?",
         help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
-        "artifact, cost, approval, grant, output, resolve, or explicit owner launch",
+        "artifact, cost, approval, grant, output, resolve, edit, or explicit owner launch",
     )
     parser.add_argument(
-        "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"
+        "action",
+        nargs="?",
+        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts",
     )
-    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set/detect/remove")
+    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan")
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")

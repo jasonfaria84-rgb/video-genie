@@ -92,6 +92,8 @@ EXPECTED_OPERATIONS = [
     "resolve.timeline.assemble",
     "resolve.render",
     "resolve.color.apply",
+    "edit.cuts.plan",
+    "edit.cuts.get",
 ]
 
 

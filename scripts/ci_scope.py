@@ -51,6 +51,7 @@ KNOWN_TESTS = {
     "tests/test_cli_recipes.py",
     "tests/test_color.py",
     "tests/test_costs.py",
+    "tests/test_cut_planning.py",
     "tests/test_discovery.py",
     "tests/test_discovery_contracts.py",
     "tests/test_external_install.py",
@@ -103,6 +104,7 @@ TRANSPORT_TESTS = {
     "tests/test_assembly.py",
     "tests/test_resolve_render.py",
     "tests/test_color.py",
+    "tests/test_cut_planning.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -231,6 +233,7 @@ PATH_TESTS = {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
     },
+    "src/videogenie/core/cut_planning.py": {"tests/test_cut_planning.py"},
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",
         "tests/test_external_install.py",
