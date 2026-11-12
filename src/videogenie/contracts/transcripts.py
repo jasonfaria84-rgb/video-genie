@@ -25,7 +25,7 @@ class TranscriptWord(ContractModel):
     end_seconds: Seconds
     text: str = Field(max_length=200)
     speaker: str | None = Field(default=None, max_length=200)
-    kind: Literal["word", "silence"] = "word"
+    kind: Literal["word", "silence", "sound"] = "word"
 
     @model_validator(mode="after")
     def _ordered(self) -> Self:
