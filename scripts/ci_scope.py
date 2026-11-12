@@ -43,6 +43,7 @@ KNOWN_TESTS = {
     "tests/test_assets.py",
     "tests/test_authority.py",
     "tests/test_authority_cost_contracts.py",
+    "tests/test_captions.py",
     "tests/test_ci_scope.py",
     "tests/test_cli.py",
     "tests/test_cli_discovery.py",
@@ -95,6 +96,7 @@ TRANSPORT_TESTS = {
     "tests/test_local_studio_install.py",
     "tests/test_recipe_render_install.py",
     "tests/test_silence.py",
+    "tests/test_captions.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -151,7 +153,8 @@ TEST_IMPORTERS = {
         "test_cli_recipes",
         "test_authority",
     },
-    "test_mcp": {"test_mcp_recipes", "test_mcp_discovery", "test_silence"},
+    "test_mcp": {"test_mcp_recipes", "test_mcp_discovery", "test_silence", "test_captions"},
+    "test_silence": {"test_captions"},
     "test_render_plan": {
         "test_cli_discovery",
         "test_discovery",
@@ -198,7 +201,11 @@ PATH_TESTS = {
     },
     "src/videogenie/workers/lower_third.py": RENDER_TESTS,
     "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
-    "src/videogenie/workers/silence.py": {"tests/test_silence.py"},
+    "src/videogenie/workers/silence.py": {"tests/test_silence.py", "tests/test_captions.py"},
+    "src/videogenie/workers/captions.py": {"tests/test_captions.py"},
+    "src/videogenie/core/captions.py": {"tests/test_captions.py"},
+    # Docstrings and fields are the published CLI/MCP schema.
+    "src/videogenie/contracts/captions.py": TRANSPORT_TESTS,
     "src/videogenie/adapters/resolve.py": {"tests/test_resolve.py"},
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",

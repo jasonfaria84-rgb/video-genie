@@ -87,6 +87,7 @@ EXPECTED_OPERATIONS = [
     "media.silence.detect",
     "media.silence.remove",
     "resolve.status",
+    "captions.create",
 ]
 
 

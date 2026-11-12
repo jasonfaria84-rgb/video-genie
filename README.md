@@ -10,12 +10,12 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 64 shared agent operations: projects and clients, cycles and
+This source exposes 65 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, dead-space removal, and a
-DaVinci Resolve status check. Seven additive discovery reads preserve the earlier
-54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
+artifacts, costs, approval requests, output selection, dead-space removal, a
+DaVinci Resolve status check, and subtitles from stored transcripts. Seven additive discovery reads preserve the earlier
+54 operation schemas and results; the dead-space, Resolve and subtitle operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
 Removing filler words such as "um" needs word-level transcription and isn't
@@ -251,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 64 agent operations. Replace spaces in each CLI command
+The server exposes the same 65 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -429,6 +429,41 @@ using set to Local. Set `RESOLVE_SCRIPT_LIB` if Resolve is installed somewhere
 other than the default location. VideoGenie edits only Resolve projects named
 `VideoGenie <project ID>`, and it won't switch away from a project you have open
 unless the request explicitly allows it.
+
+## Create subtitles
+
+`captions create` turns a stored word-level transcript into an SRT file of short
+cues: two spoken words per cue in UPPERCASE by default. Give `cut_plan_id` (a plan
+made from the same transcript) to time cues to the edited output instead of the
+source; words inside cuts are dropped and no cue spans a cut. The SRT is plain UTF-8
+and imports into DaVinci Resolve as a subtitle track. Add `burn_in` to also render
+the subtitles into a new copy of a video with local FFmpeg.
+
+```bash
+printf '%s' '{"transcript_id":"<uuid>","output_path":"/absolute/talk.srt"}' \
+  | videogenie captions create --json --input-json -
+printf '%s' '{"transcript_id":"<uuid>","cut_plan_id":"<uuid>","output_path":"/absolute/talk.srt",
+  "burn_in":{"video_path":"/absolute/talk-edit.mp4","output_path":"/absolute/talk-subtitled.mp4"}}' \
+  | videogenie captions create --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `words_per_cue` | 2 | Spoken words per cue (1 to 12). |
+| `uppercase` | true | Uppercase the text. Leading/trailing punctuation is always removed; apostrophes stay. |
+| `max_cue_seconds` | 3.0 | A cue ends early rather than run longer than this. A pause of 0.5 s or more also ends a cue. |
+| `min_cue_seconds` | 0.35 | Shorter cues join the next (else previous) cue when that fits; otherwise they're lengthened into the following gap. |
+| `burn_in.font_size` | 18 | libass font size on a 288-line canvas, so it scales with video height (8 to 96). |
+| `burn_in.timeout_seconds` | 1800 | Deadline for the burn-in render. |
+
+The result reports the cue count, words captioned and dropped, the SRT's SHA-256 and
+size, and the first five cues. Burn-in reports the new file's SHA-256, size, measured
+duration and the style used. With a cut plan, `burn_in.video_path` must be the edited
+output, not the source. Burn-in needs an FFmpeg built with libass (the `subtitles`
+filter); without it the request fails with `DEPENDENCY_UNAVAILABLE` before anything is
+written, and you can drop `burn_in` to get the SRT alone. Inputs are never modified and
+existing files are never overwritten; a failed burn-in removes the SRT it just wrote.
+MCP paths, including those inside `burn_in`, must be absolute.
 
 ## Recover a probe job
 
