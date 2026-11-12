@@ -96,6 +96,8 @@ EXPECTED_OPERATIONS = [
     "edit.cuts.get",
     "captions.create",
     "render.check",
+    "overlay.renderers",
+    "overlay.place",
 ]
 
 

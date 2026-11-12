@@ -46,6 +46,7 @@ from videogenie.contracts.models import (
     ResultEnvelope,
     VideoGenieError,
 )
+from videogenie.contracts.overlays import OverlayRenderersInput, PlaceOverlayInput
 from videogenie.contracts.previews import CompareBrandInput, CompareRecipeInput, CreatePreviewInput
 from videogenie.contracts.recipes import (
     BrandDraftInput,
@@ -102,6 +103,7 @@ from videogenie.core.costs import CostService
 from videogenie.core.cut_planning import create_cut_plan
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
+from videogenie.core.overlays import place_overlay
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
@@ -111,6 +113,7 @@ from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
 from videogenie.workers.captions import create_captions
+from videogenie.workers.overlay_renderers import detect_renderers
 from videogenie.workers.render_check import check_render
 from videogenie.workers.silence import detect_silence, remove_silence
 
@@ -250,6 +253,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "edit.cuts.get": GetCutPlanInput,
     "captions.create": CreateCaptionsInput,
     "render.check": CheckRenderInput,
+    "overlay.renderers": OverlayRenderersInput,
+    "overlay.place": PlaceOverlayInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -499,6 +504,8 @@ def _dispatch(
                 "edit.cuts.get",
                 "captions.create",
                 "render.check",
+                "overlay.renderers",
+                "overlay.place",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -540,6 +547,11 @@ def _dispatch(
         )
     if operation == "resolve.color.apply":
         return apply_color(service, ApplyColorInput.model_validate_json(_strict_json(payload)))
+    if operation == "overlay.renderers":
+        wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
+        return detect_renderers(wanted_renderers.timeout_seconds)
+    if operation == "overlay.place":
+        return place_overlay(service, PlaceOverlayInput.model_validate_json(_strict_json(payload)))
     if operation == "resolve.render":
         return render_timeline(
             service, RenderTimelineInput.model_validate_json(_strict_json(payload))

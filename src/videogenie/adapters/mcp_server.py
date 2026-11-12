@@ -61,6 +61,7 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "resolve.render": ("output_path",),
                 "captions.create": ("output_path", "burn_in.video_path", "burn_in.output_path"),
                 "render.check": ("rendered_path", "contact_sheet_path"),
+                "overlay.place": ("source_path",),
             }.get(operation, ())
             optional = {"contact_sheet_path"}
             for path_field in path_fields:

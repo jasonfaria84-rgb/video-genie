@@ -65,6 +65,7 @@ KNOWN_TESTS = {
     "tests/test_mcp_recipes.py",
     "tests/test_media_probe.py",
     "tests/test_output_review.py",
+    "tests/test_overlays.py",
     "tests/test_owner_auth.py",
     "tests/test_owner_auth_dependency.py",
     "tests/test_owner_cli.py",
@@ -109,6 +110,7 @@ TRANSPORT_TESTS = {
     "tests/test_cut_planning.py",
     "tests/test_captions.py",
     "tests/test_render_check.py",
+    "tests/test_overlays.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -134,7 +136,7 @@ RENDER_TESTS = (
 # Explicit shared test fixtures, including indirect consumers. The inventory test
 # checks real Python imports so a new helper edge cannot silently narrow selection.
 TEST_IMPORTERS = {
-    "test_assembly": {"test_resolve_render", "test_color"},
+    "test_assembly": {"test_color", "test_overlays", "test_resolve_render"},
     "test_resolve_render": {"test_color"},
     "test_costs": {"test_authority"},
     "test_authority": {
@@ -167,8 +169,14 @@ TEST_IMPORTERS = {
         "test_cli_recipes",
         "test_authority",
     },
-    "test_mcp": {"test_mcp_recipes", "test_mcp_discovery", "test_silence", "test_captions"},
-    "test_silence": {"test_captions"},
+    "test_mcp": {
+        "test_captions",
+        "test_mcp_discovery",
+        "test_mcp_recipes",
+        "test_render_check",
+        "test_silence",
+    },
+    "test_silence": {"test_captions", "test_render_check"},
     "test_render_plan": {
         "test_cli_discovery",
         "test_discovery",
@@ -222,21 +230,30 @@ PATH_TESTS = {
         "tests/test_assembly.py",
         "tests/test_resolve_render.py",
         "tests/test_color.py",
+        "tests/test_overlays.py",
     },
     "src/videogenie/core/transcription.py": {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
+        "tests/test_overlays.py",
     },
     "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
     "src/videogenie/core/resolve_render.py": {
         "tests/test_resolve_render.py",
         "tests/test_color.py",
+        "tests/test_overlays.py",
     },
     "src/videogenie/core/color.py": {"tests/test_color.py"},
+    "src/videogenie/core/overlays.py": {"tests/test_overlays.py"},
+    "src/videogenie/contracts/overlays.py": {"tests/test_overlays.py"} | TRANSPORT_TESTS,
+    "src/videogenie/workers/overlay_renderers.py": {"tests/test_overlays.py"},
     "src/videogenie/core/transcripts.py": {
         "tests/test_transcripts.py",
         "tests/test_transcription.py",
         "tests/test_assembly.py",
+        "tests/test_cut_planning.py",
+        "tests/test_captions.py",
+        "tests/test_render_check.py",
     },
     "src/videogenie/core/cut_planning.py": {"tests/test_cut_planning.py"},
     "src/videogenie/workers/captions.py": {"tests/test_captions.py"},
