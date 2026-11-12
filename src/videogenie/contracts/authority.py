@@ -279,3 +279,41 @@ class SelectOutputInput(ProjectAuthorityScope):
     review_id: Identifier
     expected_selection_revision: Count
     idempotency_key: ShortText
+
+
+class OwnerEnrollmentChallenge(OwnerChallengeInput):
+    """Public registration options, never the trusted console's secret admission ticket."""
+
+    mode: Literal["bootstrap", "recovery"]
+    nonce: Annotated[BinaryText, Field(min_length=43, max_length=43)]
+    user_id: Annotated[BinaryText, Field(min_length=43, max_length=43)]
+    rp_id: Literal["localhost"] = "localhost"
+    origin: ShortText
+    issued_at: Timestamp
+    expires_at: Timestamp
+
+    @model_validator(mode="after")
+    def ordered_expiry(self) -> Self:
+        if datetime.fromisoformat(self.expires_at) <= datetime.fromisoformat(self.issued_at):
+            raise ValueError("Enrollment expiry must follow issuance")
+        return self
+
+
+class RegisterOwnerInput(OwnerChallengeInput):
+    """Untrusted browser registration; secret admission is a separate console-only argument."""
+
+    credential_id: Annotated[BinaryText, Field(max_length=2048)]
+    client_data_json: BinaryText
+    attestation_object: BinaryText
+
+
+class OwnerEnrollmentReceipt(OwnerChallengeInput):
+    """Historical enrollment/recovery record; not an agent-importable authentication proof."""
+
+    receipt_id: Identifier
+    credential_id: Annotated[BinaryText, Field(max_length=2048)]
+    mode: Literal["bootstrap", "recovery"]
+    credential_epoch: PositiveCount
+    user_present: VerifiedFlag
+    user_verified: VerifiedFlag
+    verified_at: Timestamp
