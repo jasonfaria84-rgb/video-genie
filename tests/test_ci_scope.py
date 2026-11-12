@@ -58,7 +58,10 @@ def test_transport_union_and_missing_mapping(root: Path) -> None:
         {"status": "M", "old": None, "new": "tests/test_media_probe.py"},
     ]
     scope = module.select(changes, root)
-    assert set(scope["tests"]) == module.TRANSPORT_TESTS | {"tests/test_media_probe.py"}
+    assert set(scope["tests"]) == module.TRANSPORT_TESTS | {
+        "tests/test_media_probe.py",
+        "tests/test_ci_scope.py",
+    }
     assert scope["build"] and scope["runtime"]
     (root / "tests/test_external_install.py").unlink()
     assert module.select(changes, root)["mode"] == "full"
@@ -300,7 +303,7 @@ def test_studio_tests_are_known_and_selectable(root: Path, name: str) -> None:
     path = "tests/" + name
     module = selector()
     scope = module.select([{"status": "M", "old": None, "new": path}], root)
-    assert scope["mode"] == "targeted" and scope["tests"] == [path]
+    assert scope["mode"] == "targeted" and set(scope["tests"]) == {path, "tests/test_ci_scope.py"}
     assert module.validate_scope(scope) == scope
     (root / path).unlink()
     assert module.select([{"status": "M", "old": None, "new": path}], root)["mode"] == "full"
@@ -325,7 +328,11 @@ def test_studio_harness_and_proof_select_installed_consumer(root: Path, path: st
     changes = [{"status": "M", "old": None, "new": path}]
     scope = module.select(changes, root)
     assert scope["mode"] == "targeted"
-    assert scope["tests"] == ["tests/test_local_studio_install.py"]
+    assert set(scope["tests"]) == (
+        {"tests/test_local_studio_install.py", "tests/test_ci_scope.py"}
+        if path.startswith("scripts/")
+        else {"tests/test_local_studio_install.py"}
+    )
     (root / "tests/test_local_studio_install.py").unlink()
     assert module.select(changes, root)["mode"] == "full"
 
@@ -362,7 +369,7 @@ def test_explicit_inventory_covers_current_tests_and_helper_importers() -> None:
     module = selector()
     repository = Path(__file__).resolve().parents[1]
     actual: dict[str, set[str]] = {}
-    paths = list((repository / "tests").glob("test_*.py"))
+    paths = list((repository / "tests").rglob("*.py"))
     assert {p.relative_to(repository).as_posix() for p in paths} == module.KNOWN_TESTS
     for path in paths:
         for node in ast.walk(ast.parse(path.read_text())):
@@ -436,7 +443,11 @@ def test_shared_or_unassessed_source_retains_full_coverage(root: Path, path: str
 def test_recipe_proof_selects_same_wheel_consumer(root: Path, path: str) -> None:
     scope = selector().select([{"status": "M", "old": None, "new": path}], root)
     assert scope["mode"] == "targeted"
-    assert scope["tests"] == ["tests/test_recipe_render_install.py"]
+    assert set(scope["tests"]) == (
+        {"tests/test_recipe_render_install.py", "tests/test_ci_scope.py"}
+        if path.startswith(("tests/", "scripts/"))
+        else {"tests/test_recipe_render_install.py"}
+    )
     assert scope["build"] and scope["runtime"]
     (root / "tests/test_recipe_render_install.py").unlink()
     assert selector().select([{"status": "M", "old": None, "new": path}], root)["mode"] == "full"
@@ -493,7 +504,7 @@ def test_owner_resources_and_licensed_assets_reach_installed_proof(root: Path, p
 
 def test_standalone_test_modification_does_not_expand_to_unrelated_suites(root: Path) -> None:
     scope = selector().select([{"status": "M", "old": None, "new": "tests/test_assets.py"}], root)
-    assert scope["tests"] == ["tests/test_assets.py"]
+    assert set(scope["tests"]) == {"tests/test_assets.py", "tests/test_ci_scope.py"}
 
 
 def test_runtime_preflight_actual_pinned_dependencies_and_fixture() -> None:
@@ -568,3 +579,86 @@ def test_package_cache_tracks_new_resources_and_proof_without_commit_identity(
     doc.write_text("nonpackaged evidence")
     git("add", ".")
     assert module.distribution_input_hash(tmp_path) == previous
+
+
+def test_targeted_source_maps_cover_every_direct_application_import() -> None:
+    """Independent source inventory catches type/helper callers omitted from grouped maps."""
+    module = selector()
+    repository = Path(__file__).resolve().parents[1]
+    for path in (repository / "tests").glob("test_*.py"):
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+                imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+            elif isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+        for source in module.PATH_TESTS:
+            if not source.startswith("src/") or not source.endswith(".py"):
+                continue
+            name = source.removeprefix("src/").removesuffix(".py").replace("/", ".")
+            name = name.removesuffix(".__init__")
+            if name in imported:
+                scope = module.select([{"status": "M", "old": None, "new": source}], repository)
+                assert path.relative_to(repository).as_posix() in scope["tests"], (
+                    source,
+                    path.name,
+                )
+
+
+def test_every_modified_known_test_runs_inventory_admission(root: Path) -> None:
+    module = selector()
+    for path in module.KNOWN_TESTS:
+        scope = module.select([{"status": "M", "old": None, "new": path}], root)
+        assert {path, "tests/test_ci_scope.py"} <= set(scope["tests"]), path
+
+
+def test_worker_type_callers_are_not_omitted(root: Path) -> None:
+    module = selector()
+    for source, affected in (
+        ("src/videogenie/workers/lower_third.py", "tests/test_render_contracts.py"),
+        ("src/videogenie/workers/probe.py", "tests/test_assets.py"),
+    ):
+        assert (
+            affected in module.select([{"status": "M", "old": None, "new": source}], root)["tests"]
+        )
+
+
+def test_harness_inventory_and_import_edges_cannot_drift() -> None:
+    """New unassessed Python helpers fail admission instead of bypassing known mappings."""
+    module = selector()
+    repository = Path(__file__).resolve().parents[1]
+    consumers = {
+        "dogfood_external_agent": "tests/test_external_install.py",
+        "dogfood_local_studio": "tests/test_local_studio_install.py",
+        "dogfood_recipe_render": "tests/test_recipe_render_install.py",
+    }
+    assert {
+        p.relative_to(repository).as_posix() for p in (repository / "scripts").rglob("*.py")
+    } == {
+        "scripts/ci_scope.py",
+        "scripts/check_repository_hygiene.py",
+        *(f"scripts/{name}.py" for name in consumers),
+    }
+    edges: dict[str, set[str]] = {}
+    for name in consumers:
+        path = repository / "scripts" / f"{name}.py"
+        for node in ast.walk(ast.parse(path.read_text())):
+            imports = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imports = [node.module]
+            elif isinstance(node, ast.Import):
+                imports = [alias.name for alias in node.names]
+            for imported in imports:
+                if imported in consumers:
+                    edges.setdefault(imported, set()).add(name)
+        scope = module.select(
+            [{"status": "M", "old": None, "new": f"scripts/{name}.py"}], repository
+        )
+        assert {consumers[name], "tests/test_ci_scope.py"} <= set(scope["tests"])
+    assert edges == {"dogfood_external_agent": {"dogfood_local_studio", "dogfood_recipe_render"}}
+    for helper, importers in edges.items():
+        scope = module.select(
+            [{"status": "M", "old": None, "new": f"scripts/{helper}.py"}], repository
+        )
+        assert {consumers[name] for name in importers} <= set(scope["tests"])

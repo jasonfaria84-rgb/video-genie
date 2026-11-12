@@ -96,6 +96,7 @@ OWNER_TESTS = {
 RENDER_TESTS = (
     {
         "tests/test_lower_third.py",
+        "tests/test_render_contracts.py",
         "tests/test_artifact_preview.py",
         "tests/test_recipe_previews.py",
         "tests/test_render_plan.py",
@@ -169,6 +170,7 @@ PATH_TESTS = {
     "src/videogenie/workers/probe.py": RENDER_TESTS
     | {
         "tests/test_media_probe.py",
+        "tests/test_assets.py",
         "tests/test_projects.py",
         "tests/test_activity.py",
         "tests/test_job_storage.py",
@@ -257,9 +259,12 @@ def select(changes: list[Change], root: Path) -> Scope:
         elif path in DOCUMENTATION_ONLY:
             continue
         elif path in KNOWN_TESTS:
-            selected.add(path)
+            # Every test edit must admit its new helper edges through the inventory audit.
+            selected.update({path, "tests/test_ci_scope.py"})
         elif path in PATH_TESTS:
             selected.update(PATH_TESTS[path])
+            if path.startswith("scripts/") and path.endswith(".py"):
+                selected.add("tests/test_ci_scope.py")
         else:
             return full("shared, dependency, CI, fixture or unknown path", changes)
     selected = include_test_importers(selected)
