@@ -1,5 +1,8 @@
 """Real media probing, durable recovery, bounded failures, and worker fencing."""
 
+from __future__ import annotations
+
+import errno
 import hashlib
 import json
 import os
@@ -16,7 +19,8 @@ import pytest
 from videogenie.contracts.models import Project, VideoGenieError
 from videogenie.core.jobs import JobService
 from videogenie.core.service import VideoGenieService
-from videogenie.workers.probe import fingerprint, probe_tool
+from videogenie.workers import probe
+from videogenie.workers.probe import bounded_process, fingerprint, probe_tool
 
 
 @pytest.fixture
@@ -207,6 +211,197 @@ def test_bounded_tool_failures(
     assert time.monotonic() - start < 3
     failed = jobs.get_job(project.project_id, str(error.value.details["job_id"]))
     assert failed.status == "needs_input" and failed.result_ref is None
+
+
+def capture_probe_children(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[bytes]]:
+    """Retain actual owned processes so cleanup assertions do not depend on PID lookup."""
+    original = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def spawn(
+        argv: list[str], *, stdin: int, stdout: int, stderr: int, start_new_session: bool
+    ) -> subprocess.Popen[bytes]:
+        child = original(
+            argv, stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=start_new_session
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    return children
+
+
+@pytest.mark.parametrize("group_state", ["absent", "present", "denied"])
+@pytest.mark.parametrize("failure", ["output limit", "deadline"])
+def test_denied_group_cleanup_preserves_primary_and_reaps_owned_child(
+    monkeypatch: pytest.MonkeyPatch, group_state: str, failure: str
+) -> None:
+    children = capture_probe_children(monkeypatch)
+    original_killpg = os.killpg
+    signals: list[int] = []
+
+    def denied(pgid: int, sig: int) -> None:
+        signals.append(sig)
+        if sig != 0 or group_state == "denied":
+            raise PermissionError(errno.EPERM, "injected group denial")
+        if group_state == "absent":
+            original_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", denied)
+    body = "import time; time.sleep(30)"
+    if failure == "output limit":
+        body = "import sys; sys.stdout.write('x' * (1024 * 1024 + 1)); sys.stdout.flush(); " + body
+    with pytest.raises(VideoGenieError) as caught:
+        bounded_process([sys.executable, "-c", body], 0.3)
+    assert caught.value.code == "MEDIA_UNAVAILABLE"
+    assert caught.value.message == f"ffprobe exceeded its {failure}"
+    if group_state == "absent":
+        assert "cleanup" not in caught.value.details
+    else:
+        assert caught.value.details["cleanup"] == {
+            "group_signal_errno": errno.EPERM,
+            "group_cleanup": "unconfirmed",
+        }
+    assert signals == [signal.SIGKILL, 0]
+    assert len(children) == 1 and children[0].returncode == -signal.SIGKILL
+    assert children[0].stdout is not None and children[0].stdout.closed
+    assert children[0].stderr is not None and children[0].stderr.closed
+
+
+@pytest.mark.parametrize("signal_errno", [errno.EPERM, errno.EIO])
+def test_cleanup_error_cannot_turn_success_into_silent_success(
+    monkeypatch: pytest.MonkeyPatch, signal_errno: int
+) -> None:
+    children = capture_probe_children(monkeypatch)
+
+    def denied(pgid: int, sig: int) -> None:
+        if sig:
+            raise OSError(signal_errno, "injected signal failure")
+        # A group still exists, or a reused ID cannot be distinguished safely.
+
+    monkeypatch.setattr(os, "killpg", denied)
+    with pytest.raises(VideoGenieError, match="cleanup could not be confirmed") as caught:
+        bounded_process([sys.executable, "-c", "print('ok')"], 3)
+    assert caught.value.details["group_signal_errno"] == signal_errno
+    assert caught.value.details["group_cleanup"] == "unconfirmed"
+    assert children[0].returncode == 0
+    assert children[0].stdout is not None and children[0].stdout.closed
+    assert children[0].stderr is not None and children[0].stderr.closed
+
+
+def test_success_signals_group_before_reaping_leader(monkeypatch: pytest.MonkeyPatch) -> None:
+    children = capture_probe_children(monkeypatch)
+    original_killpg = os.killpg
+    observed: list[int] = []
+
+    def check_ownership(pgid: int, sig: int) -> None:
+        if sig:
+            assert children[0].returncode is None
+            # A second observation must not consume the owned child's status.
+            probe._wait_for_exit(children[0], time.monotonic() + 1)
+            observed.append(pgid)
+        original_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", check_ownership)
+    assert bounded_process([sys.executable, "-c", "print('ok')"], 3) == b"ok\n"
+    assert observed == [children[0].pid]
+    assert children[0].returncode == 0
+
+
+def test_exit_observation_after_child_has_already_exited() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "pass"], stdout=subprocess.PIPE, start_new_session=True
+    )
+    try:
+        assert child.stdout is not None and child.stdout.read() == b""
+        time.sleep(0.05)
+        probe._wait_for_exit(child, time.monotonic() + 1)
+        probe._wait_for_exit(child, time.monotonic() + 1)
+        assert child.returncode is None
+        assert child.wait(timeout=1) == 0
+    finally:
+        child.kill()
+        child.wait(timeout=1)
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+@pytest.mark.parametrize("sleep_seconds", [0.1, 30])
+def test_closed_pipes_do_not_imply_process_exit(
+    monkeypatch: pytest.MonkeyPatch, sleep_seconds: float
+) -> None:
+    children = capture_probe_children(monkeypatch)
+    body = f"import os,time; os.close(1); os.close(2); time.sleep({sleep_seconds}); os._exit(7)"
+    expected = "could not read valid media" if sleep_seconds < 1 else "exceeded its deadline"
+    with pytest.raises(VideoGenieError, match=expected):
+        bounded_process([sys.executable, "-c", body], 0.5)
+    assert children[0].returncode == (7 if sleep_seconds < 1 else -signal.SIGKILL)
+
+
+def test_unexpected_signal_error_remains_visible_even_when_group_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_killpg = os.killpg
+
+    def failed(pgid: int, sig: int) -> None:
+        if sig:
+            raise OSError(errno.EIO, "injected unexpected error")
+        original_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", failed)
+    with pytest.raises(VideoGenieError, match="cleanup could not be confirmed") as caught:
+        bounded_process([sys.executable, "-c", "print('ok')"], 3)
+    assert caught.value.details == {"group_signal_errno": errno.EIO}
+
+
+def test_cleanup_wait_is_bounded_and_closes_pipes_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_class = subprocess.Popen
+    original_wait = original_class.wait
+    children = capture_probe_children(monkeypatch)
+    waits: list[float | None] = []
+
+    def timed_out(child: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        waits.append(timeout)
+        assert timeout is not None
+        raise subprocess.TimeoutExpired(child.args, timeout)
+
+    # Inject only the cleanup wait; actual termination is still performed.
+    monkeypatch.setattr(original_class, "wait", timed_out)
+    try:
+        with pytest.raises(VideoGenieError, match="exceeded its deadline") as caught:
+            bounded_process([sys.executable, "-c", "import time; time.sleep(30)"], 0.1)
+        assert caught.value.details["cleanup"] == {"child_reap": "deadline_exceeded"}
+        assert waits == [1.0]
+        assert children[0].stdout is not None and children[0].stdout.closed
+        assert children[0].stderr is not None and children[0].stderr.closed
+    finally:
+        for child in children:
+            original_wait(child, timeout=3)
+
+
+def test_timeout_kills_descendant_after_leader_exits(tmp_path: Path) -> None:
+    pid_path = tmp_path / "descendant.pid"
+    # The descendant retains the pipes after its leader exits. Its finite sleep
+    # also bounds the fixture lifetime if the cleanup under test regresses.
+    body = (
+        "import subprocess, sys; from pathlib import Path; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+        f"Path({str(pid_path)!r}).write_text(str(child.pid))"
+    )
+    with pytest.raises(VideoGenieError, match="exceeded its deadline"):
+        bounded_process([sys.executable, "-c", body], 0.5)
+    pid = int(pid_path.read_text())
+    deadline = time.monotonic() + 3
+    while True:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=1
+        ).stdout.strip()
+        if not status or status.startswith("Z"):
+            break
+        assert time.monotonic() < deadline, "descendant remains alive after group cleanup"
+        time.sleep(0.01)
 
 
 def test_changed_input_during_real_probe_is_not_published(
