@@ -27,6 +27,7 @@ from videogenie.contracts.authority import (
 )
 from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.models import (
+    ContractModel,
     Identifier,
     ResultEnvelope,
     VideoGenieError,
@@ -625,8 +626,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     context = payload
     input_model = INPUT_MODELS.get(operation)
-    if input_model is not None:
-        # Rejected extra IDs cannot claim context outside the operation's declared schema.
+    if input_model is not None and (
+        issubclass(input_model, ContractModel) or operation == "recipe.draft.list"
+    ):
+        # Preserve legacy probe error context; new/studio schemas reject injected scope IDs.
         context = {key: value for key, value in payload.items() if key in input_model.model_fields}
     print(
         error.to_envelope(
