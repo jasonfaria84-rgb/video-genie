@@ -23,12 +23,50 @@ The focused test is `uv run --locked pytest tests/test_recipe_render_install.py 
 
 ## What the automation demonstrates
 
-- Both CLI and official MCP SDK discover 54 operations and share persisted project, storyline, recipe, configuration, job, artifact and cost results across restarts and unrelated working directories.
+- Both CLI and official MCP SDK discover 61 operations and share persisted project, storyline, recipe, configuration, job, artifact and cost results across restarts and unrelated working directories.
 - Asset registration checks the supplied font and license bytes. Recipe and brand publication, a zero-provider-fee grant, and output approve/request-changes use the installed supervised owner HTTP channel with genuine verifier transactions and **synthetic test credentials**. A forged signature is rejected. These are automated cryptographic tests, not physical human consent or native browser interaction.
 - Actual MOV output is 1920×1080, 24 fps, 150 frames, qtrle/argb, straight alpha and no audio. The harness hashes the master and independently decodes all 150 frames. Five HTTP PNGs at frames 0, 16, 75, 129 and 149 are checked against the exact published manifest and independently decoded master pixels. These stills do not demonstrate continuous motion.
 - A run limit, new execution after grant revocation, stale binding and superseded output approval reject. Successful historical idempotent replay retains its original result. An interrupted coordinator is resumed only after the real lease expires; the old attempt remains recorded and a new fenced attempt succeeds.
 - A cycle opens before rendering and closes afterward. Processing duration is positive; fixed historical snapshots survive restart/archive, and completed elapsed time remains fixed at a later observation while project age grows. Provider fees are known zero for this local renderer; measured wall time remains unpriced, and unknown client/internal/economic amounts remain null.
 - Output review and explicit selection remain distinct from delivery and project completion. The proof does not manufacture delivery events or billing rates.
+
+## Scope-only continuation
+
+Four fresh isolated consumer processes receive only `state`, the explicit
+`project_id`/`storyline_id`/`client_id` scope, and an actor audit label. Their input
+contains no version, config, policy, grant, challenge, review, owner port or owner
+credential. The label is not authentication. Each process starts from an unrelated
+empty folder and uses the installed CLI plus a fresh official SDK session.
+
+The processes recover recipe/brand identities through draft inventories, then
+published versions, paginated bindings/current independent policy, unused grants,
+pending/completed owner outcomes and actual artifact review IDs. The fictional
+fixture has explicit unique choices; assertions and transcripts record the chosen
+returned rows. The application does not select a grant or promise eligibility.
+Every mutation still performs its own live checks. Pages retain coverage and
+`per_response_live`; separate calls may differ in `observed_at` and do not form a
+historical snapshot.
+
+The fresh render-stage process renders and replays a discovered request. Another fresh
+process discovers the owner-created final review. After explicit rebind and
+restart, a further fresh process discovers a new current-policy unused grant and
+renders again. The original media/recovery/cost/duration assertions remain; all
+three actual masters are independently decoded. Synthetic publications and grants
+are still performed only by the separate test owner channel. The consumer never
+imports application services or reads SQLite.
+
+`native-handoff.json` contains only data root, scope and actor label.
+`auditor-expectations.json` is a separate private oracle and must not be supplied
+to the native agent. A new unused current-policy grant is retained for a later
+fresh native-host run after final installation; preparing that file is not a
+native call. The host must discover its IDs and policy through public tools.
+
+Generated receipts distinguish pytest test counts, transcript event counts and
+actual CLI/SDK/native calls. The historical111-event run is not111 tests or proof
+of this new consumer. The current artifact hash, supplied-wheel flag, installed
+RECORD/dependencies, process admissions, command/protocol results and transcript
+hashes are generated per run. No final wheel checksum is embedded in these
+packaged docs, avoiding a self-referential build hash.
 
 ## Initial artifact and evidence boundaries
 

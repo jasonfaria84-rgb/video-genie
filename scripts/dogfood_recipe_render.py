@@ -302,11 +302,67 @@ class RecipeConsumer(Consumer):
         challenge = data(self.cli("approval.request", {"action": action, "idempotency_key": key}))
         return owner.approve(challenge, preview=preview)
 
+    def scope_process(self, scope: dict[str, JsonValue], stage: str) -> dict[str, JsonValue]:
+        """Start a fresh isolated consumer without inherited domain IDs or owner channel."""
+        folder = self.root / ("scope-" + stage)
+        folder.mkdir()
+        admission: dict[str, JsonValue] = {
+            "state": str(self.state),
+            "scope": scope,
+            "actor": "fictional-agent-" + stage,
+        }
+        argv = [
+            str(self.runtime / "bin" / "python"),
+            "-I",
+            "-c",
+            "import runpy,sys;sys.path.insert(0,sys.argv[1]);"
+            "sys.argv=[sys.argv[1]+'/dogfood_recipe_render.py',*sys.argv[2:]];"
+            "runpy.run_path(sys.argv[0],run_name='__main__')",
+            str(self.root),
+            "--scope-stage",
+            stage,
+        ]
+        self.log.record(
+            "scope-only-admission", stage=stage, admission=admission, argv=[part for part in argv]
+        )
+        child = subprocess.Popen(
+            argv,
+            cwd=folder,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            out, err = child.communicate(json.dumps(admission), timeout=150)
+        except BaseException as failure:
+            child.terminate()
+            try:
+                child.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate(timeout=5)
+                failure.add_note("Owned scope consumer required forced termination")
+            raise
+        self.log.record(
+            "scope-only-exit", stage=stage, exit_code=child.returncode, stdout=out, stderr=err
+        )
+        assert child.returncode == 0, (out, err)
+        result = object_value(json.loads(out))
+        self.log.record(
+            "scope-only-result",
+            stage=stage,
+            result=result,
+            transcript_sha256=sha((folder / "transcript.json").read_bytes()),
+        )
+        return result
+
     async def recipe_scenario(self, owner: SyntheticOwner) -> None:
         """Prepare exact content and prove real rendering/replay through separate public clients."""
         capabilities = data(self.cli("capabilities", {}))
         operations = capabilities["operations"]
-        assert isinstance(operations, list) and len(operations) == 54
+        assert isinstance(operations, list) and len(operations) == 61
         assert capabilities["owner_mutations"] == "console_only"
         fixture = self.root / "fixture"
         lock = object_value(json.loads((fixture / "fonts.lock.json").read_text()))
@@ -401,17 +457,24 @@ class RecipeConsumer(Consumer):
             "fixture": {},
             "idempotency_key": "publication-preview",
         }
-        recipe_version = self.request_action(
-            owner,
-            {
-                "kind": "publish_recipe",
-                "recipe_id": recipe["recipe_id"],
-                "expected_draft_revision": recipe["draft_revision"],
-                "content_sha256": recipe["content_sha256"],
-            },
-            "publish-recipe",
-            preview,
+        pending = data(
+            self.cli(
+                "approval.request",
+                {
+                    "action": {
+                        "kind": "publish_recipe",
+                        "recipe_id": recipe["recipe_id"],
+                        "expected_draft_revision": recipe["draft_revision"],
+                        "content_sha256": recipe["content_sha256"],
+                    },
+                    "idempotency_key": "lost-pending-recipe",
+                },
+            )
         )
+        pending_found = self.scope_process(scope, "pending")
+        pending_ids = pending_found["pending_challenge_ids"]
+        assert isinstance(pending_ids, list) and pending["challenge_id"] in pending_ids
+        recipe_version = owner.approve(pending, preview=preview)
         brand_version = self.request_action(
             owner,
             {
@@ -440,11 +503,13 @@ class RecipeConsumer(Consumer):
             "idempotency_key": "binding",
         }
         config = data(self.cli("project.recipe.bind", binding))
+        observed_binding = data(self.cli("project.recipe.context", scope))
+        policy = object_value(observed_binding["scope"])["current_policy_revision"]
         now = datetime.now(UTC)
         terms: dict[str, JsonValue] = scope | {
             "recipe": recipe_pin,
             "brand": brand_pin,
-            "config_policy_revision": 1,
+            "config_policy_revision": policy,
             "allowed_capabilities": ["graphics.render_lower_third"],
             "allowed_providers": ["local-pillow-ffmpeg"],
             "permitted_input_classes": ["pinned_brand_assets"],
@@ -478,6 +543,12 @@ class RecipeConsumer(Consumer):
             "grant_id": grant["grant_id"],
             "idempotency_key": "first-render",
         }
+        continued = self.scope_process(scope, "render")
+        render = object_value(continued["render_request"])
+        assert render["grant_id"] == grant["grant_id"]
+        completed_ids = continued["completed_challenge_ids"]
+        assert isinstance(completed_ids, list) and pending["challenge_id"] in completed_ids
+        assert object_value(continued["job"])["status"] == "succeeded"
         self.log.record(
             "prepared-public-render",
             scope=scope,
@@ -560,6 +631,8 @@ class RecipeConsumer(Consumer):
             "comments": "Synthetic fixture only",
         }
         approval = self.request_action(owner, action, "approve-output")
+        discovered_review = self.scope_process(scope, "reviews")
+        approval = object_value(discovered_review["latest_review"])
         selected_request = scope | {
             "artifact_id": reference["artifact_id"],
             "artifact_sha256": reference["sha256"],
@@ -721,11 +794,39 @@ class RecipeConsumer(Consumer):
             "revoke",
         )
         assert data(self.cli("graphics.render_lower_third", render)) == job
+        rebound_context = data(self.cli("project.recipe.context", scope))
+        current_policy = object_value(rebound_context["scope"])["current_policy_revision"]
+        self.request_action(
+            owner,
+            {
+                "kind": "issue_grant",
+                "terms": terms | {"config_policy_revision": current_policy, "max_runs": 1},
+                "expected_project_revision": restored["revision"],
+            },
+            "continuation-grant",
+        )
+        rebound = self.scope_process(scope, "rebound")
+        rebound_request = object_value(rebound["render_request"])
+        assert rebound_request["config_revision"] == current_config["config_revision"]
+        self.verify_artifact(object_value(rebound["artifact"]))
+        rebound_grant = data(
+            self.cli("grant.get", scope | {"grant_id": rebound_request["grant_id"]})
+        )
+        self.request_action(
+            owner,
+            scope
+            | {
+                "kind": "revoke_grant",
+                "grant_id": rebound_grant["grant_id"],
+                "expected_grant_revision": rebound_grant["revision"],
+            },
+            "retire-continuation-grant",
+        )
         native_grant = self.request_action(
             owner,
             {
                 "kind": "issue_grant",
-                "terms": terms | {"config_policy_revision": 2, "max_runs": 4},
+                "terms": terms | {"config_policy_revision": current_policy, "max_runs": 4},
                 "expected_project_revision": restored["revision"],
             },
             "native-grant",
@@ -740,6 +841,9 @@ class RecipeConsumer(Consumer):
         handoff: dict[str, JsonValue] = {
             "state": str(self.state),
             "scope": scope,
+            "actor": "native-external-agent",
+        }
+        auditor: dict[str, JsonValue] = {
             "render_request": native_request,
             "activity": closed,
             "duration_request": duration_request,
@@ -748,13 +852,12 @@ class RecipeConsumer(Consumer):
             "cost_data": cost,
             "artifact_request": lookup,
             "artifact_data": artifact,
+            "unused_grant": native_grant,
             "owner_provenance": "synthetic test credential, not human consent",
-            "instructions": (
-                "Open a new cycle, run native request, close cycle; "
-                "restart reads compare exact data."
-            ),
+            "not_for_consumer": True,
         }
         (self.root / "native-handoff.json").write_text(json.dumps(handoff, indent=2) + "\n")
+        (self.root / "auditor-expectations.json").write_text(json.dumps(auditor, indent=2) + "\n")
         self.log.record(
             "recipe-proof-passed",
             scope=scope,
@@ -941,6 +1044,227 @@ class RecipeConsumer(Consumer):
         )
 
 
+class ScopeConsumer(Consumer):
+    """Fresh test client whose only domain input is the explicit public scope."""
+
+    def __init__(self, admission: dict[str, JsonValue]) -> None:
+        assert set(admission) == {"state", "scope", "actor"}
+        self.root = Path.cwd()
+        self.log = Transcript(self.root)
+        self.runtime = Path(sys.executable).parent.parent
+        self.state = Path(string(admission, "state"))
+        assert self.state.is_absolute()
+        self.env = consumer_environment(self.root, self.runtime)
+        self.cli_path = self.runtime / "bin" / "videogenie"
+        self.server_path = self.runtime / "bin" / "videogenie-mcp"
+        self.scope = object_value(admission["scope"])
+        assert set(self.scope) == {"project_id", "storyline_id", "client_id"}
+        for name in ("cli-a", "mcp-b", "cli-c", "mcp-d"):
+            (self.root / name).mkdir()
+        self.log.record(
+            "scope-only-input",
+            admission=admission,
+            actor_is_authority=False,
+            python_isolated_mode=bool(sys.flags.isolated),
+        )
+
+    def pages(self, operation: str, request: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+        """Retain live coverage for every bounded page, without claiming cross-page isolation."""
+        result: list[dict[str, JsonValue]] = []
+        cursor: JsonValue = None
+        for _ in range(20):
+            page = data(self.cli(operation, request | {"limit": 1, "after": cursor}))
+            rows = page["items"]
+            assert isinstance(rows, list) and page["returned_count"] == len(rows)
+            assert page["consistency"] == "per_response_live"
+            assert page["range_exhausted"] is (not page["has_more"])
+            result.extend(object_value(row) for row in rows)
+            if not page["has_more"]:
+                assert page["next_cursor"] is None
+                return result
+            assert page["next_cursor"] is not None and page["next_cursor"] != cursor
+            cursor = page["next_cursor"]
+        raise AssertionError("Fictional fixture exceeded bounded live inventory")
+
+
+def without_observation(value: JsonValue) -> JsonValue:
+    """Separate calls capture distinct observation instants; compare every other field."""
+    if isinstance(value, dict):
+        return {
+            k: "<observation>" if k == "observed_at" else without_observation(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [without_observation(v) for v in value]
+    return value
+
+
+async def scope_continue(admission: dict[str, JsonValue], stage: str) -> dict[str, JsonValue]:
+    """Discover from scope in a new process, then explicitly choose this fictional fixture."""
+    consumer = ScopeConsumer(admission)
+    scope = consumer.scope
+    project = data(consumer.cli("project.get", {"project_id": scope["project_id"]}))
+    association = data(consumer.cli("project.client.get", {"project_id": scope["project_id"]}))
+    assert association["client_id"] == scope["client_id"]
+    assert project["storyline_id"] == scope["storyline_id"]
+    drafts = data(consumer.cli("recipe.draft.list", {}))["recipes"]
+    brands = data(consumer.cli("brand.draft.list", {"client_id": scope["client_id"]}))["brands"]
+    assert isinstance(drafts, list) and len(drafts) == 1
+    assert isinstance(brands, list) and len(brands) == 1
+    recipe_id = object_value(drafts[0])["recipe_id"]
+    brand_id = object_value(brands[0])["brand_id"]
+    recipes = consumer.pages("recipe.version.list", {"recipe_id": recipe_id})
+    versions = consumer.pages(
+        "brand.version.list", {"client_id": scope["client_id"], "brand_id": brand_id}
+    )
+    approvals: list[dict[str, JsonValue]] = []
+    for action_scope in (
+        {"kind": "recipe", "recipe_id": recipe_id},
+        {"kind": "brand", "brand_id": brand_id, "client_id": scope["client_id"]},
+        {"kind": "project", **scope},
+    ):
+        approvals.extend(consumer.pages("approval.list", {"scope": action_scope}))
+    outcomes: list[dict[str, JsonValue]] = []
+    for record in approvals:
+        outcomes.append(
+            data(
+                consumer.cli(
+                    "approval.outcome.get",
+                    {key: record[key] for key in ("application_instance_id", "challenge_id")},
+                )
+            )
+        )
+    context = data(consumer.cli("project.recipe.context", scope))
+    bindings = consumer.pages("project.recipe.context", scope)
+    grants = consumer.pages("grant.list", scope)
+    result: dict[str, JsonValue] = {
+        "pending_challenge_ids": [
+            row["challenge_id"] for row in outcomes if row["status"] == "pending"
+        ],
+        "completed_challenge_ids": [
+            row["challenge_id"] for row in outcomes if row["status"] == "completed"
+        ],
+        "current_policy": object_value(context["scope"])["current_policy_revision"],
+        "actor": admission["actor"],
+    }
+    consumer.log.record(
+        "explicit-fixture-choice",
+        recipe_id=recipe_id,
+        brand_id=brand_id,
+        rationale="Only fictional recipe and client brand; no implicit application choice",
+    )
+    async with consumer.connect("mcp-b") as sdk:
+        capabilities = data(await consumer.mcp(sdk, "capabilities", {}))
+        operations = capabilities["operations"]
+        assert isinstance(operations, list) and len(operations) == 61
+        assert without_observation(
+            data(await consumer.mcp(sdk, "project.recipe.context", scope))
+        ) == without_observation(context)
+        if stage == "pending":
+            pending_ids = result["pending_challenge_ids"]
+            assert isinstance(pending_ids, list) and len(pending_ids) == 1
+            assert not bindings and not grants and not recipes and not versions
+        elif stage in {"render", "rebound"}:
+            policy = result["current_policy"]
+            eligible_bindings = [b for b in bindings if b["config_policy_revision"] == policy]
+            assert len(eligible_bindings) == 1
+            config = object_value(eligible_bindings[0]["config"])
+            assert any(v["version_id"] == config["recipe_version_id"] for v in recipes)
+            assert any(v["version_id"] == config["brand_version_id"] for v in versions)
+            # The fixture has one current unrevoked grant; runtime still decides permission.
+            choices = [
+                g
+                for g in grants
+                if g["revoked_at"] is None
+                and object_value(g["terms"])["config_policy_revision"] == policy
+            ]
+            assert len(choices) == 1
+            grant = choices[0]
+            for kind in ("recipe", "brand"):
+                pin = object_value(object_value(grant["terms"])[kind])
+                assert pin[kind + "_id"] == config[kind + "_id"]
+                assert pin["version_id"] == config[kind + "_version_id"]
+                assert pin["content_sha256"] == config[kind + "_sha256"]
+            activity = data(
+                consumer.cli("project.activity.get", {"project_id": scope["project_id"]})
+            )
+            opened_here = activity["current_cycle"] is None
+            if opened_here:
+                activity = data(
+                    consumer.cli(
+                        "project.cycle.open",
+                        {
+                            "project_id": scope["project_id"],
+                            "expected_activity_revision": activity["revision"],
+                        },
+                    )
+                )
+            request = scope | {
+                "config_id": config["config_id"],
+                "config_revision": config["config_revision"],
+                "config_sha256": config["config_sha256"],
+                "grant_id": grant["grant_id"],
+                "expected_project_revision": project["revision"],
+                "idempotency_key": "scope-" + stage,
+            }
+            consumer.log.record(
+                "explicit-render-choice",
+                config=config,
+                grant=grant,
+                policy=policy,
+                no_read_derived_permission=True,
+            )
+            job = data(await consumer.mcp(sdk, "graphics.render_lower_third", request))
+            assert job["status"] == "succeeded"
+            assert data(consumer.cli("graphics.render_lower_third", request)) == job
+            artifact = data(
+                consumer.cli(
+                    "artifact.get",
+                    scope | {"artifact_id": object_value(job["result_ref"])["artifact_id"]},
+                )
+            )
+            assert (
+                data(
+                    await consumer.mcp(
+                        sdk,
+                        "artifact.get",
+                        scope | {"artifact_id": object_value(job["result_ref"])["artifact_id"]},
+                    )
+                )
+                == artifact
+            )
+            result.update(render_request=request, job=job, artifact=artifact)
+            if opened_here:
+                consumer.cli(
+                    "project.cycle.close",
+                    {
+                        "project_id": scope["project_id"],
+                        "cycle_id": object_value(activity["current_cycle"])["cycle_id"],
+                        "expected_activity_revision": activity["revision"],
+                        "outcome": "completed",
+                    },
+                )
+        else:
+            assert stage == "reviews"
+            jobs = data(consumer.cli("render.job.list", scope))["jobs"]
+            assert isinstance(jobs, list) and len(jobs) == 1
+            artifact_id = object_value(object_value(jobs[0])["result_ref"])["artifact_id"]
+            request = scope | {"artifact_id": artifact_id}
+            reviews = consumer.pages("output.review.list", request)
+            page = data(await consumer.mcp(sdk, "output.review.list", request))
+            latest = object_value(page["latest_review"])
+            assert latest["decision"] == "approved" and latest in reviews
+            result["latest_review"] = latest
+    consumer.log.record(
+        "scope-only-complete",
+        stage=stage,
+        result=result,
+        owner_channel_used=False,
+        human_consent=False,
+    )
+    return result
+
+
 def installed_identity(wheel: Path) -> dict[str, JsonValue]:
     """Compare every wheel package byte and installed RECORD digest outside the checkout."""
     package = distribution("video-genie")
@@ -1115,8 +1439,12 @@ if __name__ == "__main__":
     parser.add_argument("--source-revision")
     parser.add_argument("--consume")
     parser.add_argument("--owner-port", type=int)
+    parser.add_argument("--scope-stage", choices=("pending", "render", "reviews", "rebound"))
     args = parser.parse_args()
-    if args.consume:
+    if args.scope_stage:
+        admission = object_value(json.load(sys.stdin))
+        print(json.dumps(asyncio.run(scope_continue(admission, args.scope_stage))))
+    elif args.consume:
         consume(Path(args.consume), Path(args.wheel), args.owner_port)
     else:
         print(bootstrap(args))
