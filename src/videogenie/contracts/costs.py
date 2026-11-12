@@ -221,3 +221,77 @@ class CostReport(ContractModel):
         ):
             raise ValueError("Attribution does not match project scope")
         return self
+
+
+class RecordCostInput(ContractModel):
+    """Internal estimate/unpriced fact request; attribution and knowledge are service-owned."""
+
+    project_id: Identifier
+    storyline_id: Identifier
+    run_id: Identifier
+    attempt_id: Identifier | None = None
+    grant_id: Identifier | None = None
+    kind: Literal["estimate", "unpriced"]
+    amount: Money | None
+    quantity: Quantity
+    evidence: Annotated[tuple[CostEvidence, ...], Field(min_length=1, max_length=32)]
+    occurred_at: Timestamp | None = None
+    idempotency_key: ShortText
+
+    @model_validator(mode="after")
+    def coherent_amount(self) -> Self:
+        if self.kind == "unpriced" and self.amount is not None:
+            raise ValueError("Unpriced quantities cannot imply a price")
+        if self.kind == "estimate" and (self.amount is None or self.amount.minor_units < 0):
+            raise ValueError("Estimates require nonnegative explicit money")
+        return self
+
+
+class ReserveCostInput(ContractModel):
+    """Internal reservation request, never proof of owner authority or a claim itself."""
+
+    project_id: Identifier
+    storyline_id: Identifier
+    run_id: Identifier
+    attempt_id: Identifier
+    grant_id: Identifier
+    amount: MonetaryCap
+    quantity: Quantity
+    estimate_ref: Identifier | None = None
+    evidence: Annotated[tuple[CostEvidence, ...], Field(min_length=1, max_length=32)]
+    occurred_at: Timestamp | None = None
+    idempotency_key: ShortText
+
+
+class ReservationChangeInput(ContractModel):
+    """Append a full settlement/release or unresolved-outcome fact against one reservation."""
+
+    project_id: Identifier
+    reservation_id: Identifier
+    kind: Literal["settlement", "release", "unknown"]
+    amount: MonetaryCap | None = None
+    external_receipt_ref: ShortText | None = None
+    evidence: Annotated[tuple[CostEvidence, ...], Field(min_length=1, max_length=32)]
+    occurred_at: Timestamp | None = None
+    idempotency_key: ShortText
+
+    @model_validator(mode="after")
+    def settlement_amount(self) -> Self:
+        if self.kind == "settlement":
+            if self.amount is None or self.external_receipt_ref is None:
+                raise ValueError("Settlement requires explicit actual money and receipt identity")
+        elif self.amount is not None or self.external_receipt_ref is not None:
+            raise ValueError("Only settlement accepts money and a receipt")
+        return self
+
+
+class AdjustCostInput(ContractModel):
+    """Append a sourced correction/refund to an original settlement, never overwrite it."""
+
+    project_id: Identifier
+    adjusts_entry_id: Identifier
+    amount: Money
+    external_receipt_ref: ShortText
+    evidence: Annotated[tuple[CostEvidence, ...], Field(min_length=1, max_length=32)]
+    occurred_at: Timestamp | None = None
+    idempotency_key: ShortText
