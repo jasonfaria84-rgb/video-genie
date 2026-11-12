@@ -4,10 +4,13 @@ No HTTP route mints bootstrap/recovery admission. Same-account arbitrary code is
 outside this boundary; a browser session never replaces per-action WebAuthn proof.
 """
 
+import base64
+import difflib
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import stat
 import tempfile
@@ -23,12 +26,26 @@ from webauthn.helpers import bytes_to_base64url
 
 from videogenie.adapters.owner_auth import EnrollmentTicket
 from videogenie.contracts.authority import (
+    IssueGrantAction,
     OwnerActionRequest,
     OwnerChallengeInput,
+    PublishBrandAction,
+    PublishRecipeAction,
     RegisterOwnerInput,
     VerifyOwnerActionInput,
 )
 from videogenie.contracts.models import VideoGenieError
+from videogenie.contracts.recipes import (
+    BrandDraft,
+    BrandDraftInput,
+    BrandVersionInput,
+    PublishedBrand,
+    PublishedRecipe,
+    RecipeDraft,
+    RecipeDraftInput,
+    RecipeVersionInput,
+    content_sha256,
+)
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.job_storage import JobStorage
 from videogenie.core.service import validate_identifier
@@ -245,6 +262,7 @@ class OwnerConsole:
         length: int,
         *,
         cookie: str | None = None,
+        page_csp: str | None = None,
     ) -> None:
         handler.send_response(status)
         handler.send_header("Content-Type", mime)
@@ -254,7 +272,8 @@ class OwnerConsole:
         handler.send_header("Referrer-Policy", "no-referrer")
         handler.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            page_csp
+            or "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
             "img-src 'self' blob:; media-src 'self' blob:; frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'none'",
         )
@@ -285,7 +304,25 @@ class OwnerConsole:
                     self._json(handler, 503, {"ok": False, "error": {"reason": "ui_not_installed"}})
                     return
                 raw = page.read_bytes()
-                self._headers(handler, 200, "text/html; charset=utf-8", len(raw))
+                # Only these exact bundled inline bytes execute; no unsafe-inline/eval.
+                text = raw.decode("utf-8")
+                policies = []
+                for tag in ("script", "style"):
+                    blocks = re.findall(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+                    hashes = " ".join(
+                        "'sha256-"
+                        + base64.b64encode(hashlib.sha256(block.encode()).digest()).decode()
+                        + "'"
+                        for block in blocks
+                    )
+                    policies.append(f"{tag}-src {hashes or chr(39) + 'none' + chr(39)}")
+                csp = (
+                    "default-src 'none'; "
+                    + "; ".join(policies)
+                    + "; connect-src 'self'; img-src 'self' blob:; media-src 'self' blob:; "
+                    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+                )
+                self._headers(handler, 200, "text/html; charset=utf-8", len(raw), page_csp=csp)
                 handler.wfile.write(raw)
                 return
             if handler.command == "POST":
@@ -381,6 +418,149 @@ class OwnerConsole:
                         handler, 200, {"ok": True, "data": challenge.model_dump(mode="json")}
                     )
                     return
+                if handler.path == "/action/review":
+                    challenge = self.authority.get_challenge(
+                        OwnerChallengeInput.model_validate_json(body)
+                    )
+                    action = challenge.action
+                    draft: RecipeDraft | BrandDraft | None = None
+                    if isinstance(action, PublishRecipeAction):
+                        draft = self.authority.recipes.get_recipe_draft(
+                            RecipeDraftInput(recipe_id=action.recipe_id)
+                        )
+                    elif isinstance(action, PublishBrandAction):
+                        draft = self.authority.recipes.get_brand_draft(
+                            BrandDraftInput(brand_id=action.brand_id, client_id=action.client_id)
+                        )
+                    if draft is not None and isinstance(
+                        action, (PublishRecipeAction, PublishBrandAction)
+                    ):
+                        if (
+                            draft.draft_revision != action.expected_draft_revision
+                            or draft.content_sha256 != action.content_sha256
+                        ):
+                            raise _HttpError(409, "review_draft_changed")
+                    baseline: PublishedRecipe | PublishedBrand | None = None
+                    if draft is not None:
+                        identity = (
+                            draft.recipe_id if isinstance(draft, RecipeDraft) else draft.brand_id
+                        )
+                        with self.authority.service.connection() as connection:
+                            row = connection.execute(
+                                "SELECT version_id FROM content_versions WHERE identity_id=? "
+                                "ORDER BY ordinal DESC LIMIT 1",
+                                (identity,),
+                            ).fetchone()
+                        if row is not None:
+                            if isinstance(draft, RecipeDraft):
+                                baseline = self.authority.recipes.get_recipe_version(
+                                    RecipeVersionInput(recipe_id=identity, version_id=row[0])
+                                )
+                            else:
+                                baseline = self.authority.recipes.get_brand_version(
+                                    BrandVersionInput(
+                                        brand_id=identity,
+                                        client_id=draft.client_id,
+                                        version_id=row[0],
+                                    )
+                                )
+                    summary = []
+                    if isinstance(action, IssueGrantAction):
+                        terms = action.terms
+                        summary = [
+                            {"label": label, "value": str(value)}
+                            for label, value in (
+                                ("Project", terms.project_id),
+                                ("Storyline", terms.storyline_id),
+                                ("Client", terms.client_id),
+                                ("Maximum runs", terms.max_runs),
+                                ("Attempts per run", terms.max_attempts_per_run),
+                                ("Concurrent runs", terms.max_concurrent),
+                                ("Valid from", terms.valid_from),
+                                ("Expires", terms.expires_at),
+                                ("Recipe version", terms.recipe.version_id),
+                                ("Brand version", terms.brand.version_id),
+                                ("Provider", ", ".join(terms.allowed_providers)),
+                                ("Capabilities", ", ".join(terms.allowed_capabilities)),
+                            )
+                        ]
+                        for cap in terms.monetary_caps_by_currency:
+                            scale = cap.currency.exponent
+                            digits = str(cap.minor_units).zfill(scale + 1)
+                            amount = digits[:-scale] + "." + digits[-scale:] if scale else digits
+                            summary.append(
+                                {
+                                    "label": "Budget cap · " + cap.currency.code,
+                                    "value": amount
+                                    + " ("
+                                    + str(cap.minor_units)
+                                    + " minor units; exponent "
+                                    + str(scale)
+                                    + ")",
+                                }
+                            )
+                    before = baseline.content.model_dump_json(indent=2) if baseline else ""
+                    after = draft.content.model_dump_json(indent=2) if draft else ""
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "data": challenge.model_dump(mode="json"),
+                            "action_json": challenge.action.model_dump_json(indent=2),
+                            "summary": summary,
+                            "draft": draft.model_dump(mode="json") if draft is not None else None,
+                            "draft_content_json": after,
+                            "baseline_version_id": baseline.version_id if baseline else None,
+                            "content_diff": "\n".join(
+                                difflib.unified_diff(
+                                    before.splitlines(),
+                                    after.splitlines(),
+                                    fromfile="published version " + baseline.version_id
+                                    if baseline
+                                    else "first publication",
+                                    tofile="prepared draft",
+                                    lineterm="",
+                                )
+                            ),
+                            "preview_available": False,
+                        },
+                    )
+                    return
+                if handler.path == "/artifact/review":
+                    scope = json.loads(body)
+                    if set(scope) != {"project_id", "storyline_id", "job_id", "artifact_id"}:
+                        raise _HttpError(400, "invalid_arguments")
+                    project, storyline, job, artifact = [
+                        validate_identifier(scope[key], key)
+                        for key in ("project_id", "storyline_id", "job_id", "artifact_id")
+                    ]
+                    with self.authority.service.connection() as connection:
+                        if (
+                            connection.execute(
+                                "SELECT 1 FROM sqlite_master WHERE name='render_manifests'"
+                            ).fetchone()
+                            is None
+                        ):
+                            raise _HttpError(404, "artifact_not_found")
+                        manifest = JobStorage(self.authority.service).read_manifest(
+                            connection, project, job, artifact, "published"
+                        )
+                    if manifest.request.storyline_id != storyline:
+                        raise _HttpError(404, "artifact_not_found")
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "data": manifest.model_dump(mode="json"),
+                            "manifest_sha256": content_sha256(manifest),
+                            "manifest_json": manifest.model_dump_json(indent=2),
+                            "artifact_url": f"/artifacts/{project}/{storyline}/{job}/{artifact}",
+                            "approval_available": False,
+                        },
+                    )
+                    return
                 if handler.path == "/action/select":
                     challenge = self.authority.get_challenge(
                         OwnerChallengeInput.model_validate_json(body)
@@ -406,7 +586,15 @@ class OwnerConsole:
                     if challenge.action_sha256 != session.selected_digest:
                         raise _HttpError(403, "action_changed")
                     result = self.authority.apply_action(proof)
-                    self._json(handler, 200, {"ok": True, "data": result.model_dump(mode="json")})
+                    self._json(
+                        handler,
+                        200,
+                        {
+                            "ok": True,
+                            "data": result.model_dump(mode="json"),
+                            "result_json": result.model_dump_json(indent=2),
+                        },
+                    )
                     return
                 raise _HttpError(404, "route_not_found")
         except _HttpError as exc:
