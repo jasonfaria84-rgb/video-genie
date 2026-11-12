@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from videogenie.adapters.owner_auth import OwnerAuth
+from videogenie.adapters.resolve import resolve_status
 from videogenie.cli.owner import HELP as OWNER_HELP
 from videogenie.cli.owner import MODES as OWNER_MODES
 from videogenie.cli.owner import run_owner
@@ -25,6 +26,8 @@ from videogenie.contracts.authority import (
     ReviewInput,
     SelectOutputInput,
 )
+from videogenie.contracts.captions import CreateCaptionsInput
+from videogenie.contracts.color import ApplyColorInput
 from videogenie.contracts.costs import CostReportInput
 from videogenie.contracts.discovery import (
     ApprovalOutcome,
@@ -36,12 +39,14 @@ from videogenie.contracts.discovery import (
     ListRecipeVersionsInput,
     ProjectRecipeContextInput,
 )
+from videogenie.contracts.edit import GetCutPlanInput, PlanCutsInput
 from videogenie.contracts.models import (
     ContractModel,
     Identifier,
     ResultEnvelope,
     VideoGenieError,
 )
+from videogenie.contracts.overlays import OverlayRenderersInput, PlaceOverlayInput
 from videogenie.contracts.previews import CompareBrandInput, CompareRecipeInput, CreatePreviewInput
 from videogenie.contracts.recipes import (
     BrandDraftInput,
@@ -54,6 +59,7 @@ from videogenie.contracts.recipes import (
     UpdateBrandDraftInput,
     UpdateRecipeDraftInput,
 )
+from videogenie.contracts.render_check import CheckRenderInput
 from videogenie.contracts.rendering import (
     ArtifactInput,
     BindRenderConfigInput,
@@ -63,6 +69,8 @@ from videogenie.contracts.rendering import (
     RenderLowerThirdInput,
     RenderResult,
 )
+from videogenie.contracts.resolve import ResolveStatusInput
+from videogenie.contracts.resolve_render import RenderTimelineInput
 from videogenie.contracts.silence import DetectSilenceInput, RemoveSilenceInput
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -77,17 +85,36 @@ from videogenie.contracts.studio import (
     ProjectClientInput,
     SetWaitInput,
 )
+from videogenie.contracts.transcripts import (
+    AssembleTimelineInput,
+    CreateTranscriptInput,
+    CutPlan,
+    Transcript,
+    TranscriptInput,
+)
+from videogenie.core import transcripts
+from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
+from videogenie.core.assembly import assemble_timeline
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
+from videogenie.core.color import apply_color
 from videogenie.core.costs import CostService
+from videogenie.core.cut_planning import create_cut_plan
 from videogenie.core.discovery import DiscoveryService
 from videogenie.core.jobs import JobService
+from videogenie.core.overlays import place_overlay
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
+from videogenie.core.resolve_render import render_timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
+from videogenie.core.transcription import create_transcript
+from videogenie.core.transcripts import load as load_record
+from videogenie.workers.captions import create_captions
+from videogenie.workers.overlay_renderers import detect_renderers
+from videogenie.workers.render_check import check_render
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -216,6 +243,18 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "approval.list": ListApprovalsInput,
     "media.silence.detect": DetectSilenceInput,
     "media.silence.remove": RemoveSilenceInput,
+    "resolve.status": ResolveStatusInput,
+    "transcript.create": CreateTranscriptInput,
+    "transcript.get": TranscriptInput,
+    "resolve.timeline.assemble": AssembleTimelineInput,
+    "resolve.render": RenderTimelineInput,
+    "resolve.color.apply": ApplyColorInput,
+    "edit.cuts.plan": PlanCutsInput,
+    "edit.cuts.get": GetCutPlanInput,
+    "captions.create": CreateCaptionsInput,
+    "render.check": CheckRenderInput,
+    "overlay.renderers": OverlayRenderersInput,
+    "overlay.place": PlaceOverlayInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -280,13 +319,24 @@ def _context_id(value: JsonValue | None) -> str | None:
     return None
 
 
-def _strict_json(payload: dict[str, JsonValue]) -> str:
-    """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
+def _anchor(payload: dict[str, JsonValue], fields: tuple[str, ...]) -> dict[str, JsonValue]:
+    """Resolve relative CLI file paths against the current folder; other values pass."""
     anchored = dict(payload)
-    for field in ("source_path", "output_path"):
+    for field in fields:
         value = anchored.get(field)
         if isinstance(value, str) and value and "://" not in value:
             anchored[field] = value if Path(value).is_absolute() else str(Path.cwd() / value)
+    return anchored
+
+
+def _strict_json(
+    payload: dict[str, JsonValue], fields: tuple[str, ...] = ("source_path", "output_path")
+) -> str:
+    """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
+    anchored = _anchor(payload, fields)
+    burn_in = anchored.get("burn_in")
+    if isinstance(burn_in, dict):
+        anchored["burn_in"] = _anchor(burn_in, ("video_path", "output_path"))
     return json.dumps(anchored, allow_nan=False)
 
 
@@ -444,6 +494,18 @@ def _dispatch(
                 "graphics.render_lower_third",
                 "media.silence.detect",
                 "media.silence.remove",
+                "resolve.status",
+                "transcript.create",
+                "transcript.get",
+                "resolve.timeline.assemble",
+                "resolve.render",
+                "resolve.color.apply",
+                "edit.cuts.plan",
+                "edit.cuts.get",
+                "captions.create",
+                "render.check",
+                "overlay.renderers",
+                "overlay.place",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -483,10 +545,53 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "resolve.color.apply":
+        return apply_color(service, ApplyColorInput.model_validate_json(_strict_json(payload)))
+    if operation == "overlay.renderers":
+        wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
+        return detect_renderers(wanted_renderers.timeout_seconds)
+    if operation == "overlay.place":
+        return place_overlay(service, PlaceOverlayInput.model_validate_json(_strict_json(payload)))
+    if operation == "resolve.render":
+        return render_timeline(
+            service, RenderTimelineInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "resolve.timeline.assemble":
+        return assemble_timeline(
+            service, AssembleTimelineInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "transcript.create":
+        return create_transcript(
+            service, CreateTranscriptInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "transcript.get":
+        wanted = TranscriptInput.model_validate_json(_strict_json(payload))
+        return transcript_store.load(service, Transcript, wanted.transcript_id)
+    if operation == "resolve.status":
+        checked = ResolveStatusInput.model_validate_json(_strict_json(payload))
+        return resolve_status(checked.timeout_seconds)
+    if operation == "captions.create":
+        captions = CreateCaptionsInput.model_validate_json(_strict_json(payload))
+        return create_captions(service, captions)
+    if operation == "render.check":
+        render = CheckRenderInput.model_validate_json(
+            _strict_json(payload, ("rendered_path", "contact_sheet_path"))
+        )
+        plan = (
+            None
+            if render.cut_plan_id is None
+            else transcripts.load(service, CutPlan, render.cut_plan_id)
+        )
+        return check_render(render, plan)
     if operation in {"media.silence.detect", "media.silence.remove"}:
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
         return remove_silence(RemoveSilenceInput.model_validate_json(_strict_json(payload)))
+    if operation == "edit.cuts.plan":
+        return create_cut_plan(service, PlanCutsInput.model_validate_json(_strict_json(payload)))
+    if operation == "edit.cuts.get":
+        selected_plan = GetCutPlanInput.model_validate_json(_strict_json(payload))
+        return load_record(service, CutPlan, selected_plan.plan_id)
     if operation.startswith("client.") or operation in {
         "project.client.get",
         "project.client.assign",
@@ -566,21 +671,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="videogenie",
         add_help=False,
         description="Video Genie — agentic multicam video production.",
-        epilog="Project/client lifecycle, local recipes, previews, authorized renders and "
-        "dead-space removal (media silence detect/remove) are available. "
+        epilog="Project/client lifecycle, local recipes, previews, authorized renders, "
+        "dead-space removal (media silence detect/remove) and render checks (render check) "
+        "are available. "
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
     parser.add_argument(
         "command",
         nargs="?",
-        help="capabilities, project, client, asset, recipe, brand, graphics, render, artifact, "
-        "cost, approval, grant, output, or explicit owner launch",
+        help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
+        "artifact, cost, approval, grant, output, resolve, edit, captions, overlay, "
+        "or explicit owner launch",
     )
     parser.add_argument(
-        "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"
+        "action",
+        nargs="?",
+        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts/check/...",
     )
-    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set/detect/remove")
+    parser.add_argument(
+        "detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan/assemble/apply"
+    )
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")

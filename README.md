@@ -10,20 +10,25 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 63 shared agent operations: projects and clients, cycles and
+This source exposes 75 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, and dead-space removal.
-Seven additive discovery reads preserve the earlier 54 operation schemas and
-results, and two dead-space operations follow them. A separate supervised
-owner console handles enrollment, publication, budget grants, and final review.
+artifacts, costs, approval requests and output selection, plus an editing toolkit:
+dead-space removal, word-level transcripts made in DaVinci Resolve, cut plans that
+remove filler words and false starts, timeline assembly, color grading and
+rendering in Resolve, subtitles, motion graphics overlays placed on Resolve
+timelines, and a self-check of every cut in a render. Seven
+additive discovery reads preserve the earlier 54 operation schemas and results; the
+editing operations follow them. A separate supervised owner console handles
+enrollment, publication, budget grants, and final review.
 
-Removing filler words such as "um" needs word-level transcription and isn't
-implemented yet. General video editing, reusable project templates, additional storyline creation,
-paid provider integrations/billing, and hosted tenancy remain outside this slice.
-Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
-environment doesn't configure a VideoGenie integration. Physical owner consent
-and hosted deployment aren't established by synthetic test fixtures.
+Rendering overlays with Fusion, Remotion, HyperFrames or Manim, reusable project
+templates, additional storyline
+creation, paid provider integrations/billing, and hosted tenancy remain outside this
+slice. Resolve operations need DaVinci Resolve Studio running on the same machine
+with external scripting set to Local. Higgsfield and ElevenLabs access elsewhere in
+an agent's environment doesn't configure a VideoGenie integration. Physical owner
+consent and hosted deployment aren't established by synthetic test fixtures.
 
 ## Install
 
@@ -251,7 +256,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 63 agent operations. Replace spaces in each CLI command
+The server exposes the same 75 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -410,8 +415,254 @@ speech. Video is re-encoded as H.264 (CRF 18) with AAC audio; only the first vid
 and audio streams are kept. One render handles up to 2,000 kept segments.
 MCP paths must be absolute; CLI paths may be relative to the current folder.
 
-This uses silence only. Filler words ("um", "uh") and false starts need a
-word-level transcript and aren't detected yet.
+This uses silence only. To remove filler words ("um", "uh") and false starts,
+plan cuts from a transcript as described below.
+
+## Remove filler words and false starts
+
+`edit cuts plan` reads a stored word-level transcript and saves a cut plan that
+removes filler words, false starts and long pauses. It works only on transcript
+timings: it never reads or changes media, and it doesn't transcribe. Transcripts
+come from `transcript.create`, a separate operation. `edit cuts get` reads a saved
+plan again by `plan_id`.
+
+```bash
+printf '%s' '{"transcript_id":"TRANSCRIPT_UUID"}' \
+  | videogenie edit cuts plan --json --input-json -
+printf '%s' '{"plan_id":"PLAN_UUID"}' | videogenie edit cuts get --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `transcript_id` | required | The stored transcript to plan from. |
+| `filler_words` | um, umm, uhm, uh, uhh, er, erm, ah, hmm, mm | Words to cut. Case, spaces and punctuation are ignored, so `" Um,"` matches `um`. A multi-word entry such as `"you know"` matches consecutive words; none are in the default list. |
+| `remove_false_starts` | true | Cut the earlier copy of a word or 1-4 word phrase repeated within about a second (`I I think`, `we should, we should go`). |
+| `max_filler_seconds` | 1.2 | Untranscribed sound (`kind: "sound"`) up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
+| `min_pause_seconds` | 0.5 | Shortest gap between kept words to cut as a pause (0.2 to 30). |
+| `padding_seconds` | 0.15 | Gap kept beside speech on each side of a cut. Must be under half of `min_pause_seconds`. |
+
+Each cut has a reason: `filler`, `false_start`, `pause`, `leading_silence` or
+`trailing_silence`, plus the IDs of the words it removes. A filler or false start
+and the pause around it merge into one cut, reported with the more specific
+reason (`filler` before `false_start` before `pause`). Cuts never start or end
+inside a kept word; a filler that overlaps other speech is left in. Single words
+people often double on purpose, such as "very very" or "that that", aren't treated
+as false starts. If nothing would be left, the plan cuts nothing. The plan's
+`kept` ranges are what remains to assemble; it names the transcript and source
+SHA-256 it was made from. Use `resolve timeline assemble` to turn one or more
+plans into a Resolve timeline, then `resolve render` to make the file.
+
+## Create subtitles
+
+`captions create` turns a stored word-level transcript into an SRT file of short
+cues: two spoken words per cue in UPPERCASE by default. Give `cut_plan_id` (a plan
+made from the same transcript) to time cues to the edited output instead of the
+source; words inside cuts are dropped and no cue spans a cut. The SRT is plain UTF-8
+and imports into DaVinci Resolve as a subtitle track. Add `burn_in` to also render
+the subtitles into a new copy of a video with local FFmpeg.
+
+```bash
+printf '%s' '{"transcript_id":"<uuid>","output_path":"/absolute/talk.srt"}' \
+  | videogenie captions create --json --input-json -
+printf '%s' '{"transcript_id":"<uuid>","cut_plan_id":"<uuid>","output_path":"/absolute/talk.srt",
+  "burn_in":{"video_path":"/absolute/talk-edit.mp4","output_path":"/absolute/talk-subtitled.mp4"}}' \
+  | videogenie captions create --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `words_per_cue` | 2 | Spoken words per cue (1 to 12). |
+| `uppercase` | true | Uppercase the text. Leading/trailing punctuation is always removed; apostrophes stay. |
+| `max_cue_seconds` | 3.0 | A cue ends early rather than run longer than this. A pause of 0.5 s or more also ends a cue. |
+| `min_cue_seconds` | 0.35 | Shorter cues join the next (else previous) cue when that fits; otherwise they're lengthened into the following gap. |
+| `burn_in.font_size` | 18 | libass font size on a 288-line canvas, so it scales with video height (8 to 96). |
+| `burn_in.timeout_seconds` | 1800 | Deadline for the burn-in render. |
+
+The result reports the cue count, words captioned and dropped, the SRT's SHA-256 and
+size, and the first five cues. Burn-in reports the new file's SHA-256, size, measured
+duration and the style used. With a cut plan, `burn_in.video_path` must be the edited
+output, not the source. Burn-in needs an FFmpeg built with libass (the `subtitles`
+filter); without it the request fails with `DEPENDENCY_UNAVAILABLE` before anything is
+written, and you can drop `burn_in` to get the SRT alone. Inputs are never modified and
+existing files are never overwritten; a failed burn-in removes the SRT it just wrote.
+MCP paths, including those inside `burn_in`, must be absolute.
+
+## Check a render before delivery
+
+`render check` inspects every cut of a finished render before anyone calls it final.
+It reads the file only (its SHA-256 is checked before and after) and uses local FFmpeg.
+Give cut positions in output time, either as `cut_points_seconds` or as the
+`cut_plan_id` of a stored cut plan, where cuts fall at the joins of its kept ranges.
+For a `media silence remove` result, the cut points are the running totals of the
+kept segments' durations, without the last one.
+
+```bash
+printf '%s' '{"rendered_path":"/absolute/talk-tight.mp4","cut_points_seconds":[1.733,3.066],"contact_sheet_path":"/absolute/talk-cuts.png"}' \
+  | videogenie render check --json --input-json -
+```
+
+Each cut gets a pass or fail with reasons:
+
+| Reason | Fails when | Default |
+| --- | --- | --- |
+| `audio_jump` | The 10 ms audio level before the cut and after it differ by more than `max_audio_jump_db`. Levels are dBFS, floored at -60 so room tone can't jump. | 20 dB |
+| `audio_click` | The largest sample step within 5 ms of the cut is more than `max_click_db` above the largest step in the surrounding 100 ms (48 kHz mono). | 12 dB |
+| `black_frame` | The frame just before or just after the cut is black: 98% of pixels at or below `black_luma_threshold`. | 0.1 |
+| `frozen_frame` | Three consecutive frames within three frames of the cut differ by less than `freeze_max_difference` (mean luma, 0-255). 0 turns this off. | 0.1 |
+
+The whole file also fails with `av_drift` when its audio and video stream durations
+differ by more than `max_av_drift_seconds` (default 0.05), or with
+`av_drift_unmeasured` when the container doesn't report them. Calibration on generated
+media: clean silence-removal cuts measure a 0 dB jump and a -40 dB click score; an
+abrupt quiet-to-loud join measured a 34 dB jump, and a same-level phase jump a 21 dB click
+score. Frames in a freeze differ by under 0.01; moving test video by 2 or more.
+
+Cut times should be within 5 ms of the real join, and frames are located assuming a
+constant frame rate starting at zero, as FFmpeg renders are. A hard cut into loud
+speech fails `audio_jump` even when it doesn't click; still slides and screen
+recordings can fail `frozen_frame`. Raise the threshold, or set it to 0 for frozen
+frames, when that is intended. `contact_sheet_path` writes a new `.png` or `.jpg` grid,
+one cell per cut: the frame before the cut on the left, after it on the right, failed
+cuts labelled in red. Existing files are never overwritten. Up to 2,000 cuts are checked
+per call.
+
+## Check DaVinci Resolve
+
+`resolve status` reports whether DaVinci Resolve Studio is open and scriptable,
+without changing anything in Resolve. When it isn't, `reason` and `fix` say why
+(`library_missing`, `library_unloadable`, `not_running_or_scripting_disabled`,
+`timeout` or `free_edition`).
+
+```bash
+printf '{}' | videogenie resolve status --json --input-json -
+```
+
+Resolve must be open with Preferences > System > General > External scripting
+using set to Local. Set `RESOLVE_SCRIPT_LIB` if Resolve is installed somewhere
+other than the default location. VideoGenie edits only Resolve projects named
+`VideoGenie <project ID>`, and it won't switch away from a project you have open
+unless the request explicitly allows it.
+
+## Transcribe with DaVinci Resolve
+
+`transcript create` imports one local file into the project's own Resolve project
+(`VideoGenie <project_id>`), transcribes it word by word with Resolve Studio, and
+stores the result. `transcript get` reads it back by `transcript_id`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
+  | videogenie transcript create --json --input-json -
+```
+
+Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
+`kind`. Resolve leaves filler words such as "um" and "uh" out of its text, so
+VideoGenie checks every gap between words with FFmpeg: quiet stretches become
+`kind: "silence"` and audible ones `kind: "sound"`, which usually means a filler,
+breath or noise. Transcripts are tied to the source file's SHA-256.
+
+The call refuses when you have a different Resolve project open; pass
+`"allow_switch": true` after saving your work to let VideoGenie open its own
+project. `speaker_detection` (default true), `noise_threshold_db` (default -35)
+and `timeout_seconds` (default 900) are optional. The file must be a format Resolve
+imports; Resolve rejects the AIFF files written by macOS `say`, for example.
+
+## Assemble an edit in DaVinci Resolve
+
+`resolve timeline assemble` builds a new timeline in the project's own Resolve
+project from the kept ranges of one or more takes, in the order given. Each take is
+named by a stored cut plan, whose transcript names the source file; a source that
+changed since transcription is refused.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"},{"cut_plan_id":"<uuid>"}]}' \
+  | videogenie resolve timeline assemble --json --input-json -
+```
+
+The timeline uses the first take's frame rate and resolution, and every take must
+share that frame rate. `fade_frames` (default 1, the shortest fade Resolve allows)
+adds audio fades at each join. `timeline_name` must be new; existing timelines are
+never edited. The result reports the timeline's ID, length in frames and seconds,
+and `cut_points_seconds`, the output times of every join, which `render.check`-style
+reviews can use.
+
+## Grade color in DaVinci Resolve
+
+`resolve color apply` grades clips on a timeline in the project's own Resolve
+project. The grade goes into a separate color version on each clip (default
+`VideoGenie`), so the original grade stays available in Resolve.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","look":"warm_cinematic","adjustments":{"temperature":0.2}}' \
+  | videogenie resolve color apply --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `look` | `neutral` | `neutral`, `neutral_punch`, `warm_cinematic`, `cool_clean`, `soft_film` or `mono`. |
+| `adjustments.exposure_stops` | 0 | -2 to 2 stops. |
+| `adjustments.contrast` | 1 | 0.5 to 2. |
+| `adjustments.saturation` | 1 | 0 to 2. |
+| `adjustments.temperature` | 0 | -1 (cooler) to 1 (warmer). |
+| `adjustments.tint` | 0 | -1 to 1. |
+| `lut` | none | A LUT installed in Resolve's LUT library, as a relative path such as `Blackmagic Design/Blackmagic 4.6K Film to Rec709.cube`. |
+| `track_index`, `item_numbers` | 1, all | Which clips to grade, by position on the track. |
+| `version_name` | `VideoGenie` | The color version that holds the grade. |
+
+The look and adjustments become ASC CDL values on node 1. Resolve only applies
+LUTs from its own LUT library, so install new LUTs through Resolve first. Raw
+filter text and arbitrary file paths aren't accepted.
+
+## Render a timeline from DaVinci Resolve
+
+`resolve render` renders one timeline of the project's own Resolve project to a
+new `.mp4` or `.mov` file with H.264, using a Resolve render preset (default
+`H.264 Master`). Resolve renders into a private folder under the data directory;
+VideoGenie checks that the file's duration matches the timeline, then publishes it
+to `output_path`, which must not exist. If the render fails or passes
+`timeout_seconds`, it is stopped and nothing is published.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","output_path":"/absolute/final.mp4"}' \
+  | videogenie resolve render --json --input-json -
+```
+
+## Place motion graphics overlays
+
+`overlay renderers` reports which motion-graphics renderers this machine can use:
+`pil` (Pillow and FFmpeg, used by `graphics render_lower_third`), `fusion` and
+`lottie` (DaVinci Resolve Studio), and `remotion`, `hyperframes` and `manim`
+(found on `PATH`). Each entry has `available`, `version`, `missing`, a `fix` hint
+and a `note`. Detection installs and downloads nothing, and every version check
+has a time limit. Remotion, HyperFrames and Manim are detected only; VideoGenie
+doesn't render with them yet. Remotion's license is free only for individuals
+and companies of 1–3 people, so it stays off until the owner decides.
+
+```bash
+printf '{}' | videogenie overlay renderers --json --input-json -
+```
+
+`overlay place` puts an existing overlay file on a named timeline in the
+project's own Resolve project: a `.mov` with alpha (such as the lower third's
+QuickTime Animation file) or a `.png` still. The file is imported into the media
+pool once and reused after that. Fusion `.comp` files aren't supported yet and
+return `DEPENDENCY_UNAVAILABLE`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","source_path":"/absolute/lower-third.mov","start_seconds":2,"duration_seconds":5}' \
+  | videogenie overlay place --json --input-json -
+```
+
+`start_seconds` counts from the start of the timeline. With `track` set to
+`"auto"` (the default), the overlay goes on the lowest video track above
+everything in that time range, and a track is added when needed. An explicit
+`track` must be 2 or higher and free over the range. Existing items are never
+moved, trimmed or overwritten; a clash is an error. `position_x` and
+`position_y` (pixels from the frame centre), `scale` (0.05–4) and `opacity`
+(0–1) set Resolve's Pan, Tilt, Zoom and Opacity. A movie must have the timeline's
+frame rate and be at least `duration_seconds` long. The result gives the new
+item's `timeline_item_id`, `track_index`, record frames (end exclusive) and the
+properties read back from Resolve. If any check fails after placing, the item
+(and any track it added) is removed.
 
 ## Recover a probe job
 

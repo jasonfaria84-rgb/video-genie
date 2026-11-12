@@ -6,10 +6,23 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 63 shared agent operations, including local recipe/brand drafts, immutable
+expose 75 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
-seven additive discovery reads, and two dead-space operations (`media.silence.detect`
-reads only; `media.silence.remove` writes a new file and never overwrites). General editing/templates, paid provider
+seven additive discovery reads, and the editing toolkit that follows them:
+`media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
+never overwrites), `resolve.status`, `transcript.create`/`get` (Resolve transcription
+with FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches),
+`resolve.timeline.assemble` (new timeline from cut plans; never edits an existing
+one), `resolve.render` (private render, verified, published without overwriting),
+`resolve.color.apply` (looks and bounded adjustments as CDL in a separate color
+version; LUTs only from Resolve's library), `edit.cuts.plan`/`get` (fillers, false
+starts and pauses from a transcript), `captions.create` (SRT, optional FFmpeg
+burn-in that needs libass), `render.check` (per-cut review and contact sheet), and
+`overlay.renderers`/`overlay.place` (renderer detection; alpha .mov or .png placed above
+the footage without overlapping existing items).
+Resolve work happens only in Resolve projects named
+`VideoGenie <project ID>`; never switch away from a person's open project unless
+the request explicitly allows it. General editing/templates, paid provider
 integrations/billing, hosted tenancy, and a physical owner's consent remain
 unproved. Don't claim direct external-tool activity was performed by VideoGenie.
 

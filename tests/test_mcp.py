@@ -86,6 +86,18 @@ EXPECTED_OPERATIONS = [
     "approval.list",
     "media.silence.detect",
     "media.silence.remove",
+    "resolve.status",
+    "transcript.create",
+    "transcript.get",
+    "resolve.timeline.assemble",
+    "resolve.render",
+    "resolve.color.apply",
+    "edit.cuts.plan",
+    "edit.cuts.get",
+    "captions.create",
+    "render.check",
+    "overlay.renderers",
+    "overlay.place",
 ]
 
 
