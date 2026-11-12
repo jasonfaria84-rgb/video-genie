@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue
 
 from videogenie.contracts.models import ContractModel, ErrorDetail, Identifier, VideoGenieError
-from videogenie.contracts.recipes import content_sha256
 from videogenie.contracts.rendering import RenderLowerThirdInput
+from videogenie.core.job_storage import JobStorage, TerminalStatus, stored_render_request
 from videogenie.core.service import VideoGenieService, validate_identifier, validate_text
 from videogenie.workers.probe import (
     Fingerprint,
@@ -272,25 +272,7 @@ def read_render_request(
     ).fetchone()
     if row is None:
         raise VideoGenieError("NOT_FOUND", "Render job not found in the selected project")
-    try:
-        request = RenderLowerThirdInput.model_validate_json(row["render_request_json"])
-    except ValidationError as exc:
-        raise VideoGenieError("INTERNAL_ERROR", "Stored render request is invalid") from exc
-    if content_sha256(request) != row["request_sha256"] or (
-        request.project_id,
-        request.storyline_id,
-        request.idempotency_key,
-        request.operation,
-        request.operation_version,
-    ) != (
-        row["project_id"],
-        row["storyline_id"],
-        row["idempotency_key"],
-        row["operation"],
-        row["operation_version"],
-    ):
-        raise VideoGenieError("INTERNAL_ERROR", "Stored render request integrity check failed")
-    return request
+    return stored_render_request(row)
 
 
 class Attempt(ContractModel):
@@ -363,6 +345,7 @@ class JobService:
         self.timeout_seconds = float(timeout_seconds)
         self.lease_seconds = float(lease_seconds)
         self._initialize()
+        self.storage = JobStorage(service)
 
     def _initialize(self) -> None:
         with self.service.connection(write=True) as connection:
@@ -534,35 +517,16 @@ class JobService:
             job = self._read(connection, project_id, job_id)
             if job.status == "succeeded":
                 return job
-            self.service.require_storyline(connection, project_id, job.storyline_id, active=True)
-            now = time.time()
-            if (
-                job.status == "running"
-                and job.lease_expires_at is not None
-                and job.lease_expires_at > now
-            ):
-                raise VideoGenieError(
-                    "LEASE_HELD",
-                    "Job already has a live worker",
-                    details={"job_id": job_id, "lease_expires_at": job.lease_expires_at},
-                )
-            connection.execute(
-                "UPDATE job_attempts SET status='interrupted', ended_at=? "
-                "WHERE job_id=? AND status='running'",
-                (now, job_id),
+            claim = self.storage.claim(
+                connection,
+                project_id,
+                job_id,
+                expected_operation="media.probe",
+                lease_seconds=self.lease_seconds,
             )
-            fence = job.fence + 1
-            connection.execute(
-                "UPDATE jobs SET status='running',fence=?,lease_expires_at=?,updated_at=?,"
-                "failure_json=NULL WHERE job_id=?",
-                (fence, now + self.lease_seconds, now, job_id),
-            )
-            connection.execute(
-                "INSERT INTO job_attempts (attempt_id,job_id,fence,status,started_at) "
-                "VALUES (?,?,?,'running',?)",
-                (str(uuid4()), job_id, fence, now),
-            )
-        return self._execute(job, fence)
+            if claim is None:
+                return job
+        return self._execute(job, claim.fence)
 
     def _execute(self, job: Job, fence: int) -> Job:
         try:
@@ -641,39 +605,27 @@ class JobService:
             ) from error
 
     def _check_fence(self, connection: sqlite3.Connection, job: Job, fence: int) -> None:
-        row = connection.execute(
-            "SELECT fence,status,lease_expires_at FROM jobs WHERE job_id=? "
-            "AND operation='media.probe' AND operation_version='1'",
-            (job.job_id,),
-        ).fetchone()
-        if (
-            row is None
-            or row["fence"] != fence
-            or row["status"] != "running"
-            or row["lease_expires_at"] <= time.time()
-        ):
-            raise VideoGenieError(
-                "LEASE_HELD",
-                "Worker lease expired or was replaced; resume the job",
-                details={"job_id": job.job_id},
-            )
+        self.storage.check_fence(
+            connection, job.project_id, job.job_id, fence, expected_operation="media.probe"
+        )
 
     def _finish(
         self,
         connection: sqlite3.Connection,
         job_id: str,
         fence: int,
-        status: str,
+        status: TerminalStatus,
         failure: ErrorDetail | None,
     ) -> None:
-        now = time.time()
-        payload = failure.model_dump_json() if failure else None
-        connection.execute(
-            "UPDATE jobs SET status=?,lease_expires_at=NULL,updated_at=?,failure_json=? "
-            "WHERE job_id=? AND fence=?",
-            (status, now, payload, job_id, fence),
-        )
-        connection.execute(
-            "UPDATE job_attempts SET status=?,ended_at=?,failure_json=? WHERE job_id=? AND fence=?",
-            ("succeeded" if status == "succeeded" else "failed", now, payload, job_id, fence),
+        row = connection.execute("SELECT project_id FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            raise VideoGenieError("NOT_FOUND", "Probe job not found")
+        self.storage.finish(
+            connection,
+            row["project_id"],
+            job_id,
+            fence,
+            status,
+            failure,
+            expected_operation="media.probe",
         )

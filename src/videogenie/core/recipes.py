@@ -1,4 +1,4 @@
-"""Revisioned content drafts and immutable version reads; publication is not exposed."""
+"""Revisioned drafts and immutable versions; owner authority owns publication commits."""
 
 import sqlite3
 from datetime import UTC, datetime
@@ -7,6 +7,12 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from videogenie.contracts.authority import (
+    OwnerActionReceipt,
+    OwnerChallenge,
+    PublishBrandAction,
+    PublishRecipeAction,
+)
 from videogenie.contracts.models import ContractModel, VideoGenieError
 from videogenie.contracts.recipes import (
     BrandContent,
@@ -406,7 +412,7 @@ class RecipeService:
         return result
 
     def get_recipe_version(self, request: RecipeVersionInput) -> PublishedRecipe:
-        """Read immutable storage; publication writes await authenticated authority integration."""
+        """Read immutable storage; this read does not itself authenticate publication."""
         request = _checked(RecipeVersionInput, request)
         with self.service.connection() as connection:
             result = self._version(connection, "recipe", request.recipe_id, request.version_id)
@@ -449,3 +455,86 @@ class RecipeService:
         if result.content_sha256 != pin.content_sha256:
             raise VideoGenieError("INPUT_CHANGED", "Brand pin does not match the immutable version")
         return result
+
+    def _publish(
+        self,
+        connection: sqlite3.Connection,
+        action: PublishRecipeAction | PublishBrandAction,
+        receipt: OwnerActionReceipt,
+    ) -> PublishedRecipe | PublishedBrand:
+        """Internal write after live verification in OwnerAuthorityService's transaction.
+
+        JSON receipts cannot authorize this method: require its exact persisted verifier
+        record/action. The authority service owns consumption, replay and final commit.
+        """
+        if not connection.in_transaction or not any(
+            row[1] == "main" and row[2] == str(self.service.db_path)
+            for row in connection.execute("PRAGMA database_list")
+        ):
+            raise VideoGenieError("INVALID_ARGUMENT", "Publication needs this registry transaction")
+        stored = connection.execute(
+            "SELECT r.record_json,c.record_json AS challenge_json "
+            "FROM owner_receipts r JOIN owner_challenges c USING(challenge_id) "
+            "WHERE r.receipt_id=? AND r.kind='action'",
+            (receipt.receipt_id,),
+        ).fetchone()
+        if stored is None or (
+            OwnerActionReceipt.model_validate_json(stored["record_json"]) != receipt
+            or OwnerChallenge.model_validate_json(stored["challenge_json"]).action != action
+            or receipt.action_sha256 != content_sha256(action)
+        ):
+            raise VideoGenieError(
+                "ACCESS_DENIED",
+                "Live verified publication is required",
+                details={"reason": "owner_proof_required"},
+            )
+        kind: Kind = "brand" if isinstance(action, PublishBrandAction) else "recipe"
+        client_id = action.client_id if isinstance(action, PublishBrandAction) else None
+        identity_id = (
+            action.brand_id if isinstance(action, PublishBrandAction) else action.recipe_id
+        )
+        draft = self._draft(connection, kind, identity_id, client_id)
+        if (
+            draft.draft_revision != action.expected_draft_revision
+            or draft.content_sha256 != action.content_sha256
+        ):
+            raise VideoGenieError("REVISION_CONFLICT", "Draft changed before publication")
+        if isinstance(draft, BrandDraft):
+            if self.studio.require_client(connection, draft.client_id).status != "active":
+                raise VideoGenieError(
+                    "ACCESS_DENIED",
+                    "Restore the client before publication",
+                    details={"reason": "client_archived"},
+                )
+            self._verify_assets(draft.content)
+        ordinal = connection.execute(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM content_versions WHERE identity_id=?",
+            (identity_id,),
+        ).fetchone()[0]
+        values = dict(
+            version_id=str(uuid4()),
+            ordinal=ordinal,
+            content_sha256=draft.content_sha256,
+            publication_receipt_id=receipt.receipt_id,
+            published_at=receipt.verified_at,
+        )
+        published: PublishedRecipe | PublishedBrand
+        if isinstance(draft, BrandDraft):
+            published = PublishedBrand(
+                brand_id=draft.brand_id, client_id=draft.client_id, content=draft.content, **values
+            )
+        else:
+            published = PublishedRecipe(recipe_id=draft.recipe_id, content=draft.content, **values)
+        connection.execute(
+            "INSERT INTO content_versions VALUES(?,?,?,?,?,?,?)",
+            (
+                published.version_id,
+                identity_id,
+                kind,
+                client_id,
+                ordinal,
+                receipt.receipt_id,
+                published.model_dump_json(),
+            ),
+        )
+        return published
