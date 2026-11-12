@@ -77,6 +77,13 @@ EXPECTED_OPERATIONS = [
     "output.review.get",
     "output.select",
     "output.selection.get",
+    "recipe.version.list",
+    "brand.version.list",
+    "project.recipe.context",
+    "grant.list",
+    "approval.outcome.get",
+    "output.review.list",
+    "approval.list",
 ]
 
 
