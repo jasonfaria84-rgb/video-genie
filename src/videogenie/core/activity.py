@@ -22,6 +22,7 @@ from videogenie.contracts.studio import (
     WaitInterval,
     WaitReason,
 )
+from videogenie.core.jobs import job_schema_version
 from videogenie.core.studio import StudioService
 
 _TABLES = {"activity_schema", "activity_projects", "activity_cycles", "activity_waits"}
@@ -302,17 +303,8 @@ class ActivityService:
         known: list[Interval] = []
         unknown: list[Interval] = []
         notes: set[str] = set()
-        tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        if "job_schema" not in tables:
-            if {"jobs", "job_attempts"} & tables:
-                raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete job evidence schema")
+        if job_schema_version(connection) is None:
             return known, unknown, notes
-        versions = connection.execute("SELECT version FROM job_schema").fetchall()
-        if len(versions) != 1 or versions[0][0] != 1 or not {"jobs", "job_attempts"} <= tables:
-            raise VideoGenieError("UNSUPPORTED_SCHEMA", "Unsupported job evidence schema")
         for row in connection.execute(
             "SELECT a.* FROM job_attempts a JOIN jobs j ON j.job_id=a.job_id WHERE j.project_id=?",
             (project_id,),
