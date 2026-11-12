@@ -6,11 +6,11 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 22 operations for project and client lifecycle, client associations,
-work cycles, duration reports, and durable local media probes. Recipes, brand
-kits, templates, cost ledgers/provider billing, hosted tenancy, provider adapters,
-and editing/rendering remain planned; don't claim direct
-external-tool activity was performed by VideoGenie.
+expose 61 shared agent operations, including local recipe/brand drafts, immutable
+versions/assets, bounded lower-third rendering, costs, output review preparation,
+and seven additive discovery reads. General editing/templates, paid provider
+integrations/billing, hosted tenancy, and a physical owner's consent remain
+unproved. Don't claim direct external-tool activity was performed by VideoGenie.
 
 ## Architecture and state
 
@@ -39,10 +39,49 @@ external-tool activity was performed by VideoGenie.
 - Keep source changes bounded and reversible. Inspect callers and tests before
   changing contracts. Report incomplete coverage and unsupported capabilities.
 
+## Resume using public scope and explicit choices
+
+- Follow the README's public discovery workflow. Starting with project/storyline/
+  client scope, `recipe.draft.list` and client-scoped `brand.draft.list` expose
+  recipe/brand identities; published version lists expose exact pins. Choose each
+  identity/version explicitly. No latest-content or grant auto-selection.
+- The seven additive operations are `recipe.version.list`, `brand.version.list`,
+  `project.recipe.context`, `grant.list`, `approval.outcome.get`,
+  `output.review.list`, and `approval.list`. Preserve the original 54 input/result
+  shapes and catalog prefix; `INPUT_MODELS` remains the shared CLI/MCP registry.
+- `approval.list` takes an explicit recipe, client+brand, or project/storyline/
+  client scope. It recovers pending handles and completed outcomes without
+  credential/proof exposure. `approval.outcome.get` takes the returned
+  application-instance/challenge IDs; enrollment/recovery aren't agent operations.
+- `project.recipe.context` returns latest config revisions within the requested
+  client scope and independent current policy. Filter by client before latest.
+  `grant.list` includes unused/expired/revoked history. Compare stored binding
+  policy with observed current policy; config revision isn't a policy epoch.
+- Read `output.review.list.latest_review` for the actual artifact, not the last
+  page item. Explicit selection needs a current eligible approval and CAS.
+  Historical selection/replay remains a record, not current execution permission.
+- Page limits are strict (default 50/max 200). Retain scope, follow `next_cursor`
+  only while `has_more`, and inspect `returned_count`, `range_exhausted`,
+  `observed_at`, and `storage`. `per_response_live` promises one-response snapshot
+  coherence, not a stable snapshot across pages. Concurrent insertion behind a
+  cursor can require restarting enumeration. Uninitialized isn't available-empty.
+- New discovery reads don't initialize/migrate optional domains. Existing base
+  CLI/MCP startup can create the registry; older operations keep their established
+  initialization behavior. Don't claim completely filesystem-free discovery.
+- Reassignment, archive, revocation, and recovery don't erase historical outcomes.
+  Observe current client match/status and independent assignment/policy values;
+  all mutations must recheck current eligibility. No read grants authority.
+- Agents draft and request approvals. Only the supervised owner console/passkey
+  publishes, grants, revokes, or reviews outputs. Ordinary actor flags, host tool
+  consent, and synthetic credentials cannot stand in for owner consent. Keep
+  owner launch/recovery secrets out of messages, logs, and ordinary JSON output.
+
 ## Verify a change
 
 Use Python 3.12 and `uv sync --locked`. Run focused pytest files during iteration
-and `make check` before completing a code change. Record which commands ran and
+and the relevant hygiene/lint/typecheck/build gates before review. Hosted CI
+runs affected tests with conservative fallback; don't rerun the full local suite
+for a bounded change. Record which commands ran and
 their results; don't substitute a scaffold test for an actual media/transport
 proof. CI must preserve affected consumers and broad fallback when scope is
 unclear.
@@ -53,6 +92,12 @@ Keep installed-client tests outside the source tree and verify non-editable
 imports. See `docs/external-agent-proof.md` for probe/host evidence and
 `docs/local-studio-proof.md` for client/cycle proof. Compare duration reports using
 one explicit as_of. A successful editable test isn't an installed-wheel proof.
+`docs/local-recipe-proof.md` retains exact historical 54-operation source/wheel and
+native-host evidence. The current 61-operation source needs its own generated
+receipts and actual host calls; don't relabel old proofs or a prepared invocation
+as final installation/native success. Bind supplied-wheel bytes, installed RECORD,
+locked runtime dependencies, and source provenance separately. Keep physical
+owner acceptance distinct from genuine but synthetic WebAuthn tests.
 
 Use task-linked commits when a task tracker is configured. Follow repository
 checks and protected-branch review; don't bypass hooks or force-push main.
