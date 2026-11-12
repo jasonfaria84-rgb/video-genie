@@ -279,7 +279,7 @@ The 61-operation catalog includes these seven additive reads:
 | `grant.list` | Same three scope IDs | Latest scoped grant revisions, including unused, expired, and revoked history |
 | `approval.list` | Discriminated `scope` object | Pending and completed ordinary action handles/outcomes; no enrollment or recovery records |
 | `approval.outcome.get` | `application_instance_id`, `challenge_id` | Exact action outcome and, when completed, its immutable domain result |
-| `output.review.list` | Three scope IDs, `job_id`, `artifact_id` | Reviews of that artifact and a separately reported `latest_review` |
+| `output.review.list` | Three scope IDs, `artifact_id` | Reviews of that artifact and a separately reported `latest_review` |
 
 A fresh caller doesn't need a prior conversation or repository files:
 
