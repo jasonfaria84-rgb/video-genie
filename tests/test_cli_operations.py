@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -485,6 +486,18 @@ def test_not_found_and_storage_failures(executable: Path, tmp_path: Path) -> Non
         ("media.probe", {"project_id", "storyline_id", "path", "idempotency_key"}),
         ("job.get", {"project_id", "job_id"}),
         ("job.resume", {"project_id", "job_id"}),
+        ("client.create", {"name", "idempotency_key"}),
+        ("client.list", set()),
+        ("client.get", {"client_id"}),
+        ("client.archive", {"client_id", "expected_revision"}),
+        ("client.restore", {"client_id", "expected_revision"}),
+        ("project.client.get", {"project_id"}),
+        ("project.client.assign", {"project_id", "client_id", "expected_project_revision"}),
+        ("project.activity.get", {"project_id"}),
+        ("project.cycle.open", {"project_id", "expected_activity_revision"}),
+        ("project.cycle.close", {"project_id", "cycle_id", "expected_activity_revision"}),
+        ("project.wait.set", {"project_id", "cycle_id", "expected_activity_revision", "reason"}),
+        ("project.duration", {"project_id"}),
     ],
 )
 def test_operation_schema_without_state(
@@ -505,7 +518,7 @@ def test_operation_schema_without_state(
     assert all(isinstance(field, str) for field in required_fields)
     assert set(required_fields) == required
     assert required <= fields.keys()
-    if operation == "project.list":
+    if operation in {"project.list", "client.list"}:
         assert fields["include_archived"] == {
             "default": False,
             "title": "Include Archived",
@@ -514,6 +527,28 @@ def test_operation_schema_without_state(
     if "expected_revision" in fields:
         revision = fields["expected_revision"]
         assert isinstance(revision, dict) and revision["minimum"] == 1
+    for name, minimum in (("expected_project_revision", 1), ("expected_activity_revision", 0)):
+        if name in fields:
+            revision_field = fields[name]
+            assert isinstance(revision_field, dict) and revision_field["minimum"] == minimum
+    for name in (
+        {"client_id"}
+        if operation == "project.client.assign"
+        else {"reason"}
+        if operation == "project.wait.set"
+        else set()
+    ):
+        nullable = fields[name]
+        assert isinstance(nullable, dict)
+        alternatives = nullable["anyOf"]
+        assert isinstance(alternatives, list) and {"type": "null"} in alternatives
+        assert "default" not in nullable
+    if operation == "project.cycle.close":
+        outcome = fields["outcome"]
+        assert isinstance(outcome, dict) and outcome["default"] == "completed"
+    if operation == "project.duration":
+        as_of = fields["as_of"]
+        assert isinstance(as_of, dict) and as_of["default"] is None
     assert not state.exists()
     assert list(tmp_path.iterdir()) == []
 
@@ -537,7 +572,16 @@ def test_human_operation_help_without_state(executable: Path, tmp_path: Path) ->
     assert not state.exists()
 
 
-@pytest.mark.parametrize("command", [["unknown"], ["project", "unknown"], ["media", "render"]])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["unknown"],
+        ["project", "unknown"],
+        ["media", "render"],
+        ["project", "client", "unknown"],
+        ["project", "client", "get", "extra"],
+    ],
+)
 def test_unknown_operation_help_is_structured(
     executable: Path, tmp_path: Path, command: list[str]
 ) -> None:
@@ -546,3 +590,218 @@ def test_unknown_operation_help_is_structured(
     error = response["error"]
     assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
     assert not state.exists()
+
+
+def test_installed_studio_lifecycle_and_duration(executable: Path, tmp_path: Path) -> None:
+    """Each call is a fresh process; IDs, independent revisions and durations persist."""
+    state = tmp_path / "state"
+
+    def call(
+        operation: str, payload: dict[str, JsonValue], expected: int = 0
+    ) -> dict[str, JsonValue]:
+        response = invoke(
+            executable, tmp_path, state, operation.split("."), payload, expected=expected
+        )
+        if expected == 0 and operation.startswith("client."):
+            assert response["project_id"] is response["storyline_id"] is None
+        if expected == 0 and operation.startswith("project.") and operation != "project.create":
+            assert response["project_id"] == payload["project_id"]
+            assert response["storyline_id"] is None
+        return response
+
+    client_request: dict[str, JsonValue] = {"name": "Studio 🎬", "idempotency_key": "studio"}
+    client = data(call("client.create", client_request))
+    client_id = string(client, "client_id")
+    assert data(call("client.create", client_request)) == client
+    conflict = call("client.create", {**client_request, "name": "Changed"}, 5)
+    conflict_error = conflict["error"]
+    assert isinstance(conflict_error, dict) and conflict_error["code"] == "IDEMPOTENCY_CONFLICT"
+    assert data(call("client.list", {}))["clients"] == [client]
+    assert data(call("client.get", {"client_id": client_id})) == client
+    project = data(call("project.create", {"name": "Episode", "idempotency_key": "episode"}))
+    project_id = string(project, "project_id")
+    args: dict[str, JsonValue] = {"project_id": project_id}
+    assert data(call("project.client.get", args))["client_id"] is None
+    assert data(call("project.activity.get", args))["revision"] == 0
+    before = data(call("project.duration", args))
+    assert before["project_elapsed_seconds"] is before["project_elapsed_end_at"] is None
+    initial_age = before["project_age_seconds"]
+    assert isinstance(initial_age, (int, float)) and initial_age >= 0
+    assigned = data(
+        call(
+            "project.client.assign",
+            {
+                **args,
+                "client_id": client_id,
+                "expected_project_revision": 1,
+            },
+        )
+    )
+    assert assigned == {
+        "schema_version": "1",
+        "project_id": project_id,
+        "client_id": client_id,
+        "project_revision": 2,
+    }
+    stale = call(
+        "project.client.assign",
+        {
+            **args,
+            "client_id": None,
+            "expected_project_revision": 1,
+        },
+        5,
+    )
+    stale_error = stale["error"]
+    assert isinstance(stale_error, dict) and stale_error["code"] == "REVISION_CONFLICT"
+    archived = data(call("client.archive", {"client_id": client_id, "expected_revision": 1}))
+    assert archived["revision"] == 2 and archived["status"] == "archived"
+    assert data(call("client.list", {}))["clients"] == []
+    assert data(call("client.list", {"include_archived": True}))["clients"] == [archived]
+    assert data(call("project.client.get", args)) == assigned
+    refused = call(
+        "project.client.assign",
+        {
+            **args,
+            "client_id": client_id,
+            "expected_project_revision": 2,
+        },
+        2,
+    )
+    refused_error = refused["error"]
+    assert isinstance(refused_error, dict)
+    details = refused_error["details"]
+    assert isinstance(details, dict) and details["reason"] == "client_archived"
+    assert (
+        data(
+            call(
+                "project.client.assign",
+                {
+                    **args,
+                    "client_id": None,
+                    "expected_project_revision": 2,
+                },
+            )
+        )["project_revision"]
+        == 3
+    )
+    restored = data(call("client.restore", {"client_id": client_id, "expected_revision": 2}))
+    assert restored["revision"] == 3 and restored["status"] == "active"
+
+    opened = data(call("project.cycle.open", {**args, "expected_activity_revision": 0}))
+    assert opened["revision"] == 1
+    cycle = opened["current_cycle"]
+    assert isinstance(cycle, dict)
+    cycle_id = string(cycle, "cycle_id")
+    cycle_args: dict[str, JsonValue] = {**args, "cycle_id": cycle_id}
+    waiting = data(
+        call(
+            "project.wait.set",
+            {
+                **cycle_args,
+                "expected_activity_revision": 1,
+                "reason": "owner",
+            },
+        )
+    )
+    assert waiting["revision"] == 2 and waiting["active_wait"] == "owner"
+    stale_wait = call(
+        "project.wait.set",
+        {
+            **cycle_args,
+            "expected_activity_revision": 1,
+            "reason": None,
+        },
+        5,
+    )
+    stale_wait_error = stale_wait["error"]
+    assert isinstance(stale_wait_error, dict) and stale_wait_error["code"] == "REVISION_CONFLICT"
+    assert data(call("project.activity.get", args)) == waiting
+    cleared = data(
+        call(
+            "project.wait.set",
+            {
+                **cycle_args,
+                "expected_activity_revision": 2,
+                "reason": None,
+            },
+        )
+    )
+    assert cleared["revision"] == 3 and cleared["active_wait"] is None
+    closed = data(call("project.cycle.close", {**cycle_args, "expected_activity_revision": 3}))
+    assert closed["revision"] == 4 and closed["current_cycle"] is None
+    cycles = closed["cycles"]
+    assert isinstance(cycles, list) and isinstance(cycles[0], dict)
+    closed_at = string(cycles[0], "closed_at")
+    as_of = datetime.fromisoformat(closed_at) + timedelta(days=1)
+    report = data(call("project.duration", {**args, "as_of": as_of.isoformat()}))
+    later = data(
+        call("project.duration", {**args, "as_of": (as_of + timedelta(days=1)).isoformat()})
+    )
+    assert report["project_elapsed_end_at"] == later["project_elapsed_end_at"] == closed_at
+    assert report["project_elapsed_seconds"] == later["project_elapsed_seconds"]
+    later_age, report_age = later["project_age_seconds"], report["project_age_seconds"]
+    assert isinstance(later_age, (int, float)) and isinstance(report_age, (int, float))
+    assert later_age > report_age
+    owner_wait = report["owner_wait_seconds"]
+    assert isinstance(owner_wait, (int, float)) and owner_wait >= 0
+    reopened = data(call("project.cycle.open", {**args, "expected_activity_revision": 4}))
+    new_cycle = reopened["current_cycle"]
+    assert isinstance(new_cycle, dict) and new_cycle["cycle_id"] != cycle_id
+    historical = data(call("project.duration", {**args, "as_of": closed_at}))
+    assert historical["project_elapsed_end_at"] == closed_at
+    historical_cycles = historical["cycles"]
+    assert isinstance(historical_cycles, list) and len(historical_cycles) == 1
+    second_close = data(
+        call(
+            "project.cycle.close",
+            {
+                **args,
+                "cycle_id": new_cycle["cycle_id"],
+                "expected_activity_revision": 5,
+                "outcome": "cancelled",
+            },
+        )
+    )
+    assert second_close["revision"] == 6
+    assert data(call("project.activity.get", args)) == second_close
+    assert data(call("project.client.get", args))["project_revision"] == 3
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("client.create", {"name": " ", "idempotency_key": "bad"}),
+        ("client.list", {"include_archived": "false"}),
+        ("client.get", {"client_id": "invalid"}),
+        ("client.archive", {"client_id": str(uuid4()), "expected_revision": True}),
+        ("project.client.assign", {"project_id": str(uuid4()), "expected_project_revision": 1}),
+        ("project.cycle.open", {"project_id": str(uuid4()), "expected_activity_revision": -1}),
+        (
+            "project.cycle.close",
+            {
+                "project_id": str(uuid4()),
+                "cycle_id": str(uuid4()),
+                "expected_activity_revision": 0,
+                "outcome": "delivered",
+            },
+        ),
+        (
+            "project.wait.set",
+            {"project_id": str(uuid4()), "cycle_id": str(uuid4()), "expected_activity_revision": 0},
+        ),
+        ("project.duration", {"project_id": "invalid", "as_of": None}),
+        ("project.duration", {"project_id": str(uuid4()), "as_of": "2026-11-11T12:00:00"}),
+        ("project.duration", {"project_id": str(uuid4()), "extra": True}),
+    ],
+)
+def test_studio_invalid_inputs_are_structured(
+    executable: Path, tmp_path: Path, operation: str, payload: dict[str, JsonValue]
+) -> None:
+    response = invoke(
+        executable, tmp_path, tmp_path / "state", operation.split("."), payload, expected=2
+    )
+    error = response["error"]
+    assert isinstance(error, dict) and error["code"] == "INVALID_ARGUMENT"
+    if payload.get("project_id") == "invalid":
+        assert response["project_id"] is None
