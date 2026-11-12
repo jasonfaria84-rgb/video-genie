@@ -65,6 +65,17 @@ NEW_OPERATIONS = [
 ]
 
 
+DISCOVERY_OPERATIONS = [
+    "recipe.version.list",
+    "brand.version.list",
+    "project.recipe.context",
+    "grant.list",
+    "approval.outcome.get",
+    "output.review.list",
+    "approval.list",
+]
+
+
 def invoke(
     executable: Path,
     cwd: Path,
@@ -113,8 +124,10 @@ def test_installed_catalog_and_pure_schemas(installed: Path, tmp_path: Path) -> 
     cwd = tmp_path / "fresh-consumer"
     cwd.mkdir()
     state = tmp_path / "absent-state"
-    assert list(INPUT_MODELS)[22:] == NEW_OPERATIONS
-    for operation in NEW_OPERATIONS:
+    assert list(INPUT_MODELS)[22:54] == NEW_OPERATIONS
+    assert list(INPUT_MODELS)[54:] == DISCOVERY_OPERATIONS
+    assert len(INPUT_MODELS) == 61
+    for operation in NEW_OPERATIONS + DISCOVERY_OPERATIONS:
         help = data(invoke(installed, cwd, state, operation, help=True))
         assert help["input_schema"] == INPUT_MODELS[operation].model_json_schema()
         assert not state.exists()
