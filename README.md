@@ -10,14 +10,16 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 61 shared agent operations: projects and clients, cycles and
+This source exposes 63 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, and output selection. Seven additive discovery
-reads preserve the earlier 54 operation schemas and results. A separate supervised
+artifacts, costs, approval requests, output selection, and dead-space removal.
+Seven additive discovery reads preserve the earlier 54 operation schemas and
+results, and two dead-space operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
-General video editing, reusable project templates, additional storyline creation,
+Removing filler words such as "um" needs word-level transcription and isn't
+implemented yet. General video editing, reusable project templates, additional storyline creation,
 paid provider integrations/billing, and hosted tenancy remain outside this slice.
 Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
 environment doesn't configure a VideoGenie integration. Physical owner consent
@@ -249,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 61 agent operations. Replace spaces in each CLI command
+The server exposes the same 63 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -377,6 +379,39 @@ amounts, and client charges. Preserve currencies and explicit snapshot cutoffs
 including `knowledge_sequence`; don't invent exchange rates or treat unpriced
 compute/labor as free. Historical cost attribution stays immutable while current
 client metadata is displayed separately.
+
+## Remove dead space from dialogue
+
+`media silence detect` finds pauses in a file's first audio stream and returns the
+cut list without writing anything. `media silence remove` renders a tightened copy
+to a new `.mp4`, `.mov` or `.m4a` file. The source is never modified, and an
+existing output file is never overwritten.
+
+```bash
+printf '%s' '{"source_path":"/absolute/talk.mp4"}' \
+  | videogenie media silence detect --json --input-json -
+printf '%s' '{"source_path":"/absolute/talk.mp4","output_path":"/absolute/talk-tight.mp4"}' \
+  | videogenie media silence remove --json --input-json -
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `min_silence_seconds` | 0.5 | Shortest pause to cut (0.2 to 30). |
+| `noise_threshold_db` | -35 | Audio quieter than this counts as silence (-90 to -10). Raise it toward -25 for noisy rooms. |
+| `padding_seconds` | 0.15 | Silence kept beside speech on each side of a cut, so a 0.5 s pause becomes 0.3 s. Must be under half of `min_silence_seconds`. |
+| `fade_seconds` | 0.03 | Audio fade at each cut so joins don't click (remove only, 0 to 0.25). |
+| `timeout_seconds` | 300 / 1800 | Deadline for detect / remove. |
+
+The result lists every detected silence, each cut with its reason
+(`leading_silence`, `pause` or `trailing_silence`), the kept segments, and the
+original and tightened durations. Remove also reports the output's SHA-256, size
+and measured duration. Cut edges are aligned to video frames, moving away from
+speech. Video is re-encoded as H.264 (CRF 18) with AAC audio; only the first video
+and audio streams are kept. One render handles up to 2,000 kept segments.
+MCP paths must be absolute; CLI paths may be relative to the current folder.
+
+This uses silence only. Filler words ("um", "uh") and false starts need a
+word-level transcript and aren't detected yet.
 
 ## Recover a probe job
 

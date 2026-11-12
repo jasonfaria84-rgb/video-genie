@@ -63,6 +63,7 @@ from videogenie.contracts.rendering import (
     RenderLowerThirdInput,
     RenderResult,
 )
+from videogenie.contracts.silence import DetectSilenceInput, RemoveSilenceInput
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
     ClientInput,
@@ -87,6 +88,7 @@ from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
+from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
     "INVALID_ARGUMENT": 2,
@@ -212,6 +214,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "approval.outcome.get": ApprovalOutcomeInput,
     "output.review.list": ListOutputReviewsInput,
     "approval.list": ListApprovalsInput,
+    "media.silence.detect": DetectSilenceInput,
+    "media.silence.remove": RemoveSilenceInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -274,6 +278,16 @@ def _context_id(value: JsonValue | None) -> str | None:
         except ValueError:
             pass
     return None
+
+
+def _strict_json(payload: dict[str, JsonValue]) -> str:
+    """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
+    anchored = dict(payload)
+    for field in ("source_path", "output_path"):
+        value = anchored.get(field)
+        if isinstance(value, str) and value and "://" not in value:
+            anchored[field] = value if Path(value).is_absolute() else str(Path.cwd() / value)
+    return json.dumps(anchored, allow_nan=False)
 
 
 def _recipe_dispatch(
@@ -425,7 +439,12 @@ def _dispatch(
             **JobService(service).capabilities(),
             "api_version": "1",
             "operations": list(OPERATIONS),
-            "supported_capabilities": ["media.probe", "graphics.render_lower_third"],
+            "supported_capabilities": [
+                "media.probe",
+                "graphics.render_lower_third",
+                "media.silence.detect",
+                "media.silence.remove",
+            ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
             "owner_mutations": "console_only",
@@ -464,6 +483,10 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation in {"media.silence.detect", "media.silence.remove"}:
+        if operation == "media.silence.detect":
+            return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
+        return remove_silence(RemoveSilenceInput.model_validate_json(_strict_json(payload)))
     if operation.startswith("client.") or operation in {
         "project.client.get",
         "project.client.assign",
@@ -543,8 +566,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="videogenie",
         add_help=False,
         description="Video Genie — agentic multicam video production.",
-        epilog="Project/client lifecycle, local recipes, previews and authorized renders "
-        "are available. "
+        epilog="Project/client lifecycle, local recipes, previews, authorized renders and "
+        "dead-space removal (media silence detect/remove) are available. "
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
@@ -555,9 +578,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cost, approval, grant, output, or explicit owner launch",
     )
     parser.add_argument(
-        "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume"
+        "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"
     )
-    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set")
+    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set/detect/remove")
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")

@@ -59,8 +59,8 @@ def test_catalog_schemas_and_no_owner_mutation_tools(tmp_path: Path) -> None:
         root = tmp_path / "state"
         async with connect(root, tmp_path / "client") as client:
             listed = await client.list_tools()
-            assert len(listed.tools) == 61
-            assert EXPECTED_OPERATIONS[54:] == [
+            assert len(listed.tools) == 63
+            assert EXPECTED_OPERATIONS[54:61] == [
                 "recipe.version.list",
                 "brand.version.list",
                 "project.recipe.context",

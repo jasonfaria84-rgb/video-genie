@@ -190,7 +190,9 @@ def _wait_for_exit(process: subprocess.Popen[bytes], deadline: float) -> None:
         time.sleep(min(remaining, 0.01))
 
 
-def _cleanup_process(process: subprocess.Popen[bytes]) -> VideoGenieError | None:
+def _cleanup_process(
+    process: subprocess.Popen[bytes], tool: str = "ffprobe"
+) -> VideoGenieError | None:
     """Signal before reaping; bound direct-child cleanup and expose unresolved errors."""
     problems: dict[str, JsonValue] = {}
     group_denied = False
@@ -236,12 +238,12 @@ def _cleanup_process(process: subprocess.Popen[bytes]) -> VideoGenieError | None
                     problems["pipe_close_errno"] = error.errno
     if problems:
         return VideoGenieError(
-            "MEDIA_UNAVAILABLE", "ffprobe cleanup could not be confirmed", details=problems
+            "MEDIA_UNAVAILABLE", f"{tool} cleanup could not be confirmed", details=problems
         )
     return None
 
 
-def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
+def bounded_process(argv: list[str], timeout_seconds: float, *, tool: str = "ffprobe") -> bytes:
     """Capture at most 1 MiB across both pipes and kill the child group on timeout."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise VideoGenieError("INVALID_ARGUMENT", "Probe timeout must be positive and finite")
@@ -254,7 +256,7 @@ def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
             start_new_session=True,
         )
     except OSError as exc:
-        raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "ffprobe cannot be executed") from exc
+        raise VideoGenieError("DEPENDENCY_UNAVAILABLE", f"{tool} cannot be executed") from exc
     output = bytearray()
     total = 0
     deadline = time.monotonic() + timeout_seconds
@@ -266,7 +268,7 @@ def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe exceeded its deadline")
+                    raise VideoGenieError("MEDIA_UNAVAILABLE", f"{tool} exceeded its deadline")
                 for key, _ in selector.select(min(remaining, 0.1)):
                     chunk = os.read(key.fd, 8192)
                     if not chunk:
@@ -275,16 +277,16 @@ def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
                     total += len(chunk)
                     if total > MAX_OUTPUT_BYTES:
                         raise VideoGenieError(
-                            "MEDIA_UNAVAILABLE", "ffprobe exceeded its output limit"
+                            "MEDIA_UNAVAILABLE", f"{tool} exceeded its output limit"
                         )
                     if key.data:
                         output.extend(chunk)
             _wait_for_exit(process, deadline)
     except subprocess.TimeoutExpired as exc:
-        raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe exceeded its deadline") from exc
+        raise VideoGenieError("MEDIA_UNAVAILABLE", f"{tool} exceeded its deadline") from exc
     finally:
         primary = sys.exception()
-        cleanup = _cleanup_process(process)
+        cleanup = _cleanup_process(process, tool)
         if cleanup is not None:
             if primary is None:
                 raise cleanup
@@ -292,7 +294,7 @@ def bounded_process(argv: list[str], timeout_seconds: float) -> bytes:
             if isinstance(primary, VideoGenieError):
                 primary.details["cleanup"] = cleanup.details
     if process.returncode != 0:
-        raise VideoGenieError("MEDIA_UNAVAILABLE", "ffprobe could not read valid media")
+        raise VideoGenieError("MEDIA_UNAVAILABLE", f"{tool} could not read valid media")
     return bytes(output)
 
 
