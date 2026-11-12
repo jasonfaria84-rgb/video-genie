@@ -6,10 +6,13 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 63 shared agent operations, including local recipe/brand drafts, immutable
+expose 64 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and two dead-space operations (`media.silence.detect`
-reads only; `media.silence.remove` writes a new file and never overwrites). General editing/templates, paid provider
+reads only; `media.silence.remove` writes a new file and never overwrites), and
+`resolve.status`. Resolve work happens only in Resolve projects named
+`VideoGenie <project ID>`; never switch away from a person's open project unless
+the request explicitly allows it. General editing/templates, paid provider
 integrations/billing, hosted tenancy, and a physical owner's consent remain
 unproved. Don't claim direct external-tool activity was performed by VideoGenie.
 

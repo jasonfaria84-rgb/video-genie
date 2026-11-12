@@ -86,6 +86,7 @@ EXPECTED_OPERATIONS = [
     "approval.list",
     "media.silence.detect",
     "media.silence.remove",
+    "resolve.status",
 ]
 
 

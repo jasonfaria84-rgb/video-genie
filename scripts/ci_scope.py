@@ -73,6 +73,7 @@ KNOWN_TESTS = {
     "tests/test_recipe_previews.py",
     "tests/test_recipe_render_install.py",
     "tests/test_recipes.py",
+    "tests/test_resolve.py",
     "tests/test_silence.py",
     "tests/test_render_contracts.py",
     "tests/test_render_jobs.py",
@@ -197,6 +198,7 @@ PATH_TESTS = {
     "src/videogenie/workers/lower_third.py": RENDER_TESTS,
     "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
     "src/videogenie/workers/silence.py": {"tests/test_silence.py"},
+    "src/videogenie/adapters/resolve.py": {"tests/test_resolve.py"},
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",
         "tests/test_external_install.py",

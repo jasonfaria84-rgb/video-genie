@@ -10,12 +10,12 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 63 shared agent operations: projects and clients, cycles and
+This source exposes 64 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, and dead-space removal.
-Seven additive discovery reads preserve the earlier 54 operation schemas and
-results, and two dead-space operations follow them. A separate supervised
+artifacts, costs, approval requests, output selection, dead-space removal, and a
+DaVinci Resolve status check. Seven additive discovery reads preserve the earlier
+54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
 Removing filler words such as "um" needs word-level transcription and isn't
@@ -251,7 +251,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 63 agent operations. Replace spaces in each CLI command
+The server exposes the same 64 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -412,6 +412,23 @@ MCP paths must be absolute; CLI paths may be relative to the current folder.
 
 This uses silence only. Filler words ("um", "uh") and false starts need a
 word-level transcript and aren't detected yet.
+
+## Check DaVinci Resolve
+
+`resolve status` reports whether DaVinci Resolve Studio is open and scriptable,
+without changing anything in Resolve. When it isn't, `reason` and `fix` say why
+(`library_missing`, `library_unloadable`, `not_running_or_scripting_disabled`,
+`timeout` or `free_edition`).
+
+```bash
+printf '{}' | videogenie resolve status --json --input-json -
+```
+
+Resolve must be open with Preferences > System > General > External scripting
+using set to Local. Set `RESOLVE_SCRIPT_LIB` if Resolve is installed somewhere
+other than the default location. VideoGenie edits only Resolve projects named
+`VideoGenie <project ID>`, and it won't switch away from a project you have open
+unless the request explicitly allows it.
 
 ## Recover a probe job
 

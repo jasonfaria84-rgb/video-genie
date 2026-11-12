@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from videogenie.adapters.owner_auth import OwnerAuth
+from videogenie.adapters.resolve import resolve_status
 from videogenie.cli.owner import HELP as OWNER_HELP
 from videogenie.cli.owner import MODES as OWNER_MODES
 from videogenie.cli.owner import run_owner
@@ -63,6 +64,7 @@ from videogenie.contracts.rendering import (
     RenderLowerThirdInput,
     RenderResult,
 )
+from videogenie.contracts.resolve import ResolveStatusInput
 from videogenie.contracts.silence import DetectSilenceInput, RemoveSilenceInput
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -216,6 +218,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "approval.list": ListApprovalsInput,
     "media.silence.detect": DetectSilenceInput,
     "media.silence.remove": RemoveSilenceInput,
+    "resolve.status": ResolveStatusInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -444,6 +447,7 @@ def _dispatch(
                 "graphics.render_lower_third",
                 "media.silence.detect",
                 "media.silence.remove",
+                "resolve.status",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -483,6 +487,9 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "resolve.status":
+        checked = ResolveStatusInput.model_validate_json(_strict_json(payload))
+        return resolve_status(checked.timeout_seconds)
     if operation in {"media.silence.detect", "media.silence.remove"}:
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
@@ -574,8 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        help="capabilities, project, client, asset, recipe, brand, graphics, render, artifact, "
-        "cost, approval, grant, output, or explicit owner launch",
+        help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
+        "artifact, cost, approval, grant, output, resolve, or explicit owner launch",
     )
     parser.add_argument(
         "action", nargs="?", help="create/list/get/rename/archive/restore/probe/resume/silence"
