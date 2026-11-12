@@ -59,6 +59,16 @@ def test_catalog_schemas_and_no_owner_mutation_tools(tmp_path: Path) -> None:
         root = tmp_path / "state"
         async with connect(root, tmp_path / "client") as client:
             listed = await client.list_tools()
+            assert len(listed.tools) == 61
+            assert EXPECTED_OPERATIONS[54:] == [
+                "recipe.version.list",
+                "brand.version.list",
+                "project.recipe.context",
+                "grant.list",
+                "approval.outcome.get",
+                "output.review.list",
+                "approval.list",
+            ]
             assert [tool.name for tool in listed.tools] == [
                 "videogenie_" + operation.replace(".", "_") for operation in EXPECTED_OPERATIONS
             ]

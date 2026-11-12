@@ -10,12 +10,18 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This local release exposes 22 operations: persistent projects and clients,
-client associations, work cycles and duration reports, real media probing, and
-job get/resume. Recipes, brand kits, templates, additional storyline management,
-editing/rendering, cost ledgers, provider billing, hosted tenancy, and Higgsfield,
-ElevenLabs, and DaVinci Resolve adapters remain planned. Provider access elsewhere
-in an agent's environment doesn't configure a VideoGenie integration.
+This source exposes 61 shared agent operations: projects and clients, cycles and
+duration, media probes, immutable assets, recipe and brand drafts/versions,
+fictional previews, explicit render bindings, bounded local lower-third rendering,
+artifacts, costs, approval requests, and output selection. Seven additive discovery
+reads preserve the earlier 54 operation schemas and results. A separate supervised
+owner console handles enrollment, publication, budget grants, and final review.
+
+General video editing, reusable project templates, additional storyline creation,
+paid provider integrations/billing, and hosted tenancy remain outside this slice.
+Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
+environment doesn't configure a VideoGenie integration. Physical owner consent
+and hosted deployment aren't established by synthetic test fixtures.
 
 ## Install
 
@@ -28,7 +34,9 @@ cd video-genie
 uv sync --locked
 uv build
 uv venv --python 3.12 /absolute/runtime
-uv pip install --python /absolute/runtime/bin/python dist/video_genie-0.1.0-py3-none-any.whl
+uv export --frozen --no-dev --no-emit-project --format requirements-txt > /absolute/runtime/requirements.txt
+uv pip sync --python /absolute/runtime/bin/python --require-hashes /absolute/runtime/requirements.txt
+uv pip install --python /absolute/runtime/bin/python --no-deps dist/video_genie-0.1.0-py3-none-any.whl
 /absolute/runtime/bin/videogenie --version
 /absolute/runtime/bin/python -m videogenie --help
 ```
@@ -39,7 +47,12 @@ doesn't establish project provenance. Development uses Python 3.12.13.
 
 Media probes require ffprobe on PATH. Install FFmpeg with your platform's package
 manager and check `ffprobe -version`. Tests also use ffmpeg to generate fixtures.
-The runtime doesn't upload media or render a new video.
+Local lower-third rendering also requires ffmpeg. It uses explicitly registered,
+verified font bytes, Pillow BASIC layout, and a bounded 1920×1080, 24 fps,
+150-frame silent qtrle/straight-alpha MOV. It doesn't upload media. Complex-script
+shaping, logos, general editing, and paid rendering aren't implied. Five verified
+PNG samples are browser-displayable; the MOV is download-only in the console,
+and still samples aren't continuous-motion review.
 
 ## Share state between agents
 
@@ -57,7 +70,10 @@ Credentials, media, databases, and outputs don't belong in Git.
 The local registry assumes cooperative agents under the owner's OS account.
 Project-scope and revision checks protect application operations; they aren't
 hostile-agent isolation from a process with unrestricted access to the same files.
-There is no owner publication, budget-grant, or authenticated client portal yet.
+Owner publication and grants require the local enrolled passkey channel, not an
+agent-supplied actor flag. There is no hosted client portal. Agents may prepare
+approval requests and inspect outcomes; they can't enroll, publish, grant, revoke,
+or approve through the shared CLI/MCP operation catalog.
 
 ## Call the CLI from any folder
 
@@ -95,7 +111,8 @@ replace UUID placeholders and use the latest revision for each mutation.
 
 Responses have seven fields: `schema_version`, `success`, `request_id`,
 `project_id`, `storyline_id`, `data`, and `error`. Successful records are directly
-under `data`; lists use `data.projects` or `data.clients`. Client-only calls leave
+under `data`; legacy lists use named collections such as `data.projects` or
+`data.clients`, while the new discovery pages use `data.items`. Client-only calls leave
 project/storyline context null; studio project calls leave storyline context null.
 Command errors use nonzero exit codes. Also inspect a returned job's `status` and failure details: a successfully retrieved job can
 describe a failed media attempt.
@@ -232,19 +249,134 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 22 operations. Replace spaces in each CLI command
+The server exposes the same 61 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
 Tool discovery provides the exact typed schemas; the JSON inputs in the tables
 above are also the MCP arguments. Client create/list/get/archive/restore and all
 project activity tools use the same shared services and persisted state as CLI.
-MCP media paths must be absolute. Reconnect with the same data directory and
+MCP media and asset source paths must be absolute. Reconnect with the same data directory and
 explicit IDs to continue work started through the CLI.
 
 The lock pins the official MCP SDK 2.3.0. The observed official-client protocol
-is 2026-07-28; compatibility with every host isn't implied. There is no HTTP
-listener, remote authentication, or hosted service in this release.
+is 2026-07-28; compatibility with every host isn't implied. The MCP transport has no HTTP
+listener. The separately launched owner console binds local loopback HTTP; it
+isn't remote authentication or a hosted service.
+
+## Continue a recipe workflow from public scope
+
+Use `capabilities`, operation `--help --json`, or MCP `tools/list` from the installed
+build. CLI names replace operation dots with spaces; MCP names replace them with
+underscores and add `videogenie_`. Discover schemas again after changing builds.
+The 61-operation catalog includes these seven additive reads:
+
+| Operation | Required scope | Result |
+| --- | --- | --- |
+| `recipe.version.list` | `recipe_id` | Immutable published versions, ordered by publication ordinal |
+| `brand.version.list` | `client_id`, `brand_id` | Published versions in that client scope |
+| `project.recipe.context` | `project_id`, `storyline_id`, `client_id` | Latest config revision per config ID in requested client scope, plus independent current policy |
+| `grant.list` | Same three scope IDs | Latest scoped grant revisions, including unused, expired, and revoked history |
+| `approval.list` | Discriminated `scope` object | Pending and completed ordinary action handles/outcomes; no enrollment or recovery records |
+| `approval.outcome.get` | `application_instance_id`, `challenge_id` | Exact action outcome and, when completed, its immutable domain result |
+| `output.review.list` | Three scope IDs, `artifact_id` | Reviews of that artifact and a separately reported `latest_review` |
+
+A fresh caller doesn't need a prior conversation or repository files:
+
+1. Discover projects and clients with `project.list/get`, `client.list/get`, and
+   `project.client.get`. Choose the intended project, its returned storyline ID,
+   and client explicitly. A historical client scope may differ from the current
+   association; don't silently substitute it.
+2. Call `recipe.draft.list` with `{}` and `brand.draft.list` with `client_id`.
+   These existing inventories reveal recipe/brand IDs. Choose the intended draft;
+   create or update through `recipe.draft.*` / `brand.draft.*` if needed. Register
+   licensed assets with `asset.register` and use returned immutable pins. Never
+   infer a recipe/brand pairing from names or list order.
+3. Prepare `recipe.preview` from explicit current draft revision/hash pins, and
+   use `recipe.compare` / `brand.compare` with an explicit prior-version ID or
+   null baseline. Request owner publication using `approval.request` with its
+   advertised action schema. An uninitialized owner returns
+   `ACCESS_DENIED` / `owner_auth_uninitialized`; it doesn't enroll automatically.
+4. Recover a lost publication handle with `approval.list` using
+   `{"scope":{"kind":"recipe","recipe_id":"RECIPE_UUID"}}` or
+   `{"scope":{"kind":"brand","client_id":"CLIENT_UUID","brand_id":"BRAND_UUID"}}`.
+   Poll the returned application-instance/challenge pair with
+   `approval.outcome.get`; `approval.get` still reads the exact challenge.
+   Publication requires an owner action. Use `recipe.version.list` and
+   `brand.version.list` to discover and explicitly choose published version pins.
+5. Bind those exact pins with `project.recipe.bind`, following its project/config
+   CAS inputs. To resume arbitrary existing bindings, call
+   `project.recipe.context` with the three scope IDs and choose a returned config.
+   `config.config_revision`, binding `config_policy_revision`, and
+   `scope.current_policy_revision` are separate values. Don't derive policy from
+   config revision, reuse a grant's policy as current truth, or choose a binding
+   automatically because it appears last.
+6. Request a bounded budget grant through `approval.request`; the owner reviews
+   the exact scope and terms. `approval.list` with
+   `{"scope":{"kind":"project","project_id":"PROJECT_UUID","storyline_id":"STORYLINE_UUID","client_id":"CLIENT_UUID"}}`
+   recovers lost grant/revocation/review handles. `grant.list` discovers unused
+   grants even when no job exists. Choose a grant explicitly; its presence is
+   not permission. Execution rechecks current bindings, assignment, revisions,
+   expiry, revocation, run/concurrency limits, and budget.
+7. Submit `graphics.render_lower_third` with the chosen exact config/grant pins
+   and an idempotency key. `render.job.list` discovers jobs;
+   `render.job.get/resume` continues an exact job. `artifact.list/get` recovers
+   output and provenance. Replaying a completed request returns its historical
+   result; it doesn't authorize a new execution. Open/close explicit project
+   cycles separately and read `cost.report` / `project.duration`.
+8. Use `output.review.prepare` for the actual artifact and request final review
+   through the owner channel. `output.review.list` recovers review IDs; its
+   `latest_review` is insertion-ordered for the artifact, not the last UUID page
+   item. Explicit `output.select` requires the current eligible approval and
+   selection CAS revision. `output.selection.get` reads the historical selection;
+   neither approval nor selection proves delivery or closes a work cycle.
+
+The owner can launch the local console with `videogenie owner --help` guidance.
+`owner serve/review/enroll/recover` are supervised local launch commands, not MCP
+agent tools. Launch URLs, admission tokens, and recovery secrets stay private.
+Every owner domain action requires fresh passkey verification. A valid model,
+read record, host tool approval, or synthetic fixture isn't owner consent.
+
+### Read bounded live pages without inventing a snapshot
+
+All six list/context reads above accept `limit` (default 50, maximum 200) and
+`after` (default null). Version cursors are positive publication ordinals; other
+cursors are UUIDs. Keep scope unchanged and pass the returned `next_cursor` back
+as `after` while `has_more` is true. Each response contains `returned_count`,
+`range_exhausted`, `observed_at`, `storage`, and
+`consistency: "per_response_live"`.
+
+One response is coherent within one read transaction. Several pages aren't a
+historical snapshot: concurrent insertion behind a cursor can be missed, and
+current metadata can change between pages. Restart enumeration when a complete
+current inventory is required; never describe range exhaustion as an immutable
+multi-page snapshot. No discovery read chooses content, a grant, or an output.
+
+Bindings and grants are filtered by the requested client before selecting the
+latest revision for each ID. After reassignment, older client-scoped history can
+remain visible beside `current_client_matches: false`, current project/client
+status, assignment sequence, and current policy. Archive/revocation doesn't erase
+that history or grant new eligibility. Mutation paths perform their own live checks.
+
+`storage: "not_initialized"` differs from an available empty list. Missing required
+client/project identity returns a structured error rather than fabricated scope.
+The seven new reads don't initialize or migrate optional domain tables; existing
+CLI/MCP startup may create the base registry on a fresh data root. This promise
+doesn't apply to older operations such as `render.job.list`, whose established
+initialization behavior is unchanged. Help remains storage-free.
+
+For example, send this object to `project recipe context` using the same stdin
+convention as above; replace the UUID placeholders with chosen public IDs:
+
+```json
+{"project_id":"PROJECT_UUID","storyline_id":"STORYLINE_UUID","client_id":"CLIENT_UUID","limit":50,"after":null}
+```
+
+Cost reports separate estimates, reservations, actual/reconciled facts, unknown
+amounts, and client charges. Preserve currencies and explicit snapshot cutoffs
+including `knowledge_sequence`; don't invent exchange rates or treat unpriced
+compute/labor as free. Historical cost attribution stays immutable while current
+client metadata is displayed separately.
 
 ## Recover a probe job
 
@@ -261,6 +393,16 @@ changed media with a new idempotency key. Revision conflicts require fetching th
 current project and deciding whether the intended mutation still applies.
 
 ## Verify and develop
+
+The [local recipe proof](docs/local-recipe-proof.md) records the historical
+54-operation build, its exact source/wheel hashes, SDK runs, and separately
+identified native-host evidence. Those observations don't prove this 61-operation
+build, a later global installation, or physical owner approval. Repeat installed
+proofs with an explicit `VIDEOGENIE_TEST_WHEEL` artifact and retain their generated
+verification receipts, source/wheel/RECORD hashes, command transcripts, and native
+host events. A passing SDK call isn't a native-agent call; a source label alone
+isn't byte verification. Final-build CI/install/native outcomes must be observed
+before claiming them, and no final wheel hash is embedded in these packaged docs.
 
 The [local studio proof](docs/local-studio-proof.md) covers the client/cycle
 workflow and its installed-wheel evidence. The earlier
