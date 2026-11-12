@@ -6,10 +6,12 @@ import importlib.metadata
 import math
 import os
 import platform
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,9 +26,19 @@ from PIL import features
 from pydantic import Field, ValidationError, model_validator
 
 from videogenie.contracts.assets import AssetPin, Sha256
-from videogenie.contracts.authority import ExecutionGrant, GrantInput, ProjectAuthorityScope
+from videogenie.contracts.authority import (
+    ExecutionGrant,
+    GrantInput,
+    OutputReviewTarget,
+    ProjectAuthorityScope,
+    ReviewInput,
+    ReviewReceipt,
+    SelectOutputInput,
+)
 from videogenie.contracts.costs import (
     CostEvidence,
+    CostReport,
+    CostReportInput,
     MonetaryCap,
     Quantity,
     RecordCostInput,
@@ -34,6 +46,11 @@ from videogenie.contracts.costs import (
     ReserveCostInput,
 )
 from videogenie.contracts.models import ContractModel, ErrorDetail, Identifier, VideoGenieError
+from videogenie.contracts.output_previews import (
+    SAMPLE_FRAMES,
+    OutputPreviewEvidence,
+    OutputPreviewRequest,
+)
 from videogenie.contracts.recipes import (
     BrandDraft,
     BrandDraftInput,
@@ -70,6 +87,8 @@ from videogenie.contracts.studio import Timestamp
 from videogenie.core.authority import OwnerAuthorityService
 from videogenie.core.job_storage import JobStorage, stored_render_request
 from videogenie.core.jobs import JobService
+from videogenie.core.recipe_previews import PreviewMedia
+from videogenie.workers.artifact_preview import extract_artifact_preview
 from videogenie.workers.lower_third import _tool, render_lower_third
 
 
@@ -330,6 +349,23 @@ class RenderClaim:
     reservation_id: str
     plan: CompiledRenderPlan
     provenance: RenderProvenance
+
+
+@dataclass(frozen=True)
+class OutputReviewView:
+    """Current review target, actual-master samples and classified project costs."""
+
+    target: OutputReviewTarget
+    evidence: OutputPreviewEvidence
+    costs: CostReport
+
+
+@dataclass(frozen=True)
+class OutputSelection:
+    """Independent selection revision and immutable historical authenticated review."""
+
+    revision: int
+    review: ReviewReceipt
 
 
 class RenderService:
@@ -1141,6 +1177,8 @@ class RenderService:
                 after = os.fstat(stream.fileno())
                 if (
                     _fingerprint(before) != _fingerprint(after)
+                    or _fingerprint(after)
+                    != _fingerprint(os.stat(path.name, dir_fd=directory, follow_symlinks=False))
                     or digest.hexdigest() != manifest.artifact_sha256
                 ):
                     raise VideoGenieError("INPUT_CHANGED", "Rendered artifact bytes changed")
@@ -1224,6 +1262,465 @@ class RenderService:
                 if row["failure_json"] is None
                 else ErrorDetail.model_validate_json(row["failure_json"]),
             )
+
+    def _review_initialize(self) -> None:
+        """Separate append-only review media/selection storage; no job schema changes."""
+        columns = {
+            "output_review_schema": ["version"],
+            "output_review_previews": ["artifact_id", "manifest_sha256", "stage", "evidence_json"],
+            "output_selections": [
+                "project_id",
+                "storyline_id",
+                "revision",
+                "idempotency_key",
+                "request_sha256",
+                "review_id",
+                "record_json",
+            ],
+        }
+        guards = {
+            f"{table}_no_{op}"
+            for table in ("output_review_previews", "output_selections")
+            for op in ("update", "delete")
+        }
+        with self.service.connection(write=True) as connection:
+            tables = {
+                r[0]
+                for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if columns.keys() & tables:
+                if not columns.keys() <= tables or [
+                    r[0] for r in connection.execute("SELECT version FROM output_review_schema")
+                ] != [1]:
+                    raise VideoGenieError("UNSUPPORTED_SCHEMA", "Incomplete output review schema")
+                for table, fields in columns.items():
+                    if [r[1] for r in connection.execute(f"PRAGMA table_info({table})")] != fields:
+                        raise VideoGenieError("UNSUPPORTED_SCHEMA", "Invalid output review layout")
+                if not guards <= {
+                    r[0]
+                    for r in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger'"
+                    )
+                }:
+                    raise VideoGenieError("UNSUPPORTED_SCHEMA", "Missing output review guards")
+                return
+            connection.execute("CREATE TABLE output_review_schema(version INTEGER NOT NULL)")
+            connection.execute("""CREATE TABLE output_review_previews(
+                artifact_id TEXT PRIMARY KEY, manifest_sha256 TEXT NOT NULL,
+                stage TEXT NOT NULL UNIQUE, evidence_json TEXT NOT NULL)""")
+            connection.execute("""CREATE TABLE output_selections(
+                project_id TEXT NOT NULL REFERENCES projects(project_id),
+                storyline_id TEXT NOT NULL REFERENCES storylines(storyline_id),
+                revision INTEGER NOT NULL CHECK(revision>=1), idempotency_key TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL, review_id TEXT NOT NULL, record_json TEXT NOT NULL,
+                PRIMARY KEY(project_id,storyline_id,revision),
+                UNIQUE(project_id,idempotency_key))""")
+            for table in ("output_review_previews", "output_selections"):
+                for op in ("UPDATE", "DELETE"):
+                    connection.execute(f"""CREATE TRIGGER {table}_no_{op.lower()}
+                        BEFORE {op} ON {table}
+                        BEGIN SELECT RAISE(ABORT,'Output review history is immutable'); END""")
+            connection.execute("INSERT INTO output_review_schema VALUES(1)")
+
+    def _review_artifact(
+        self, connection: sqlite3.Connection, request: ArtifactInput
+    ) -> RenderManifest:
+        tables = {
+            r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        row = (
+            connection.execute(
+                "SELECT job_id FROM render_manifests WHERE artifact_id=? AND state='published'",
+                (request.artifact_id,),
+            ).fetchone()
+            if "render_manifests" in tables
+            else None
+        )
+        if row is None:
+            raise VideoGenieError(
+                "NOT_FOUND",
+                "Published review target not found",
+                details={"reason": "review_target_missing"},
+            )
+        self._job_row(
+            connection,
+            RenderJobInput(
+                project_id=request.project_id,
+                storyline_id=request.storyline_id,
+                client_id=request.client_id,
+                job_id=row[0],
+            ),
+        )
+        return JobStorage(self.service).read_manifest(
+            connection, request.project_id, row[0], request.artifact_id, "published"
+        )
+
+    def _target(
+        self, connection: sqlite3.Connection, manifest: RenderManifest
+    ) -> OutputReviewTarget:
+        config = manifest.provenance.config
+        return OutputReviewTarget(
+            project_id=config.project_id,
+            storyline_id=config.storyline_id,
+            client_id=config.client_id,
+            artifact_id=manifest.artifact_id,
+            artifact_sha256=manifest.artifact_sha256,
+            manifest_sha256=content_sha256(manifest),
+            config_id=config.config_id,
+            config_revision=config.config_revision,
+            recipe=RecipePin(
+                recipe_id=config.recipe_id,
+                version_id=config.recipe_version_id,
+                content_sha256=config.recipe_sha256,
+            ),
+            brand=BrandPin(
+                brand_id=config.brand_id,
+                version_id=config.brand_version_id,
+                content_sha256=config.brand_sha256,
+            ),
+            project_revision_at_review=self.service.require_project(
+                connection, config.project_id
+            ).revision,
+            grant_id=manifest.request.grant_id,
+        )
+
+    def _review_target(
+        self, connection: sqlite3.Connection, target: OutputReviewTarget
+    ) -> RenderManifest:
+        """Validate current policy/scope plus actual master in the decision transaction."""
+        target = _checked(OutputReviewTarget, target)
+        manifest = self._review_artifact(
+            connection,
+            ArtifactInput(
+                project_id=target.project_id,
+                storyline_id=target.storyline_id,
+                client_id=target.client_id,
+                artifact_id=target.artifact_id,
+            ),
+        )
+        if target != self._target(connection, manifest):
+            raise VideoGenieError("REVISION_CONFLICT", "Review target changed")
+        current = RenderLowerThirdInput.model_validate(
+            manifest.request.model_dump()
+            | {
+                "expected_project_revision": target.project_revision_at_review,
+            }
+        )
+        plan = self.compile_request(current, connection=connection)
+        if plan.binding.config != manifest.provenance.config:
+            raise VideoGenieError("INPUT_CHANGED", "Published output configuration differs")
+        try:
+            self._verify_file(self.service.data_dir / manifest.locator, manifest)
+        except OSError as exc:
+            raise VideoGenieError(
+                "MEDIA_UNAVAILABLE", "Published review master unavailable"
+            ) from exc
+        return manifest
+
+    def _preview_row(
+        self, connection: sqlite3.Connection, target: OutputReviewTarget
+    ) -> tuple[OutputPreviewEvidence, Path]:
+        row = connection.execute(
+            "SELECT * FROM output_review_previews WHERE artifact_id=?", (target.artifact_id,)
+        ).fetchone()
+        if row is None:
+            raise VideoGenieError(
+                "NOT_FOUND",
+                "Prepare actual output samples before review",
+                details={"reason": "output_preview_required"},
+            )
+        try:
+            evidence = OutputPreviewEvidence.model_validate_json(row["evidence_json"])
+        except ValidationError as exc:
+            raise VideoGenieError("INTERNAL_ERROR", "Stored output samples are invalid") from exc
+        stage = row["stage"]
+        if (
+            type(stage) is not str
+            or not stage.startswith("videogenie-output-samples-")
+            or Path(stage).name != stage
+            or "/" in stage
+            or "\\" in stage
+            or row["manifest_sha256"] != target.manifest_sha256
+            or evidence.request.manifest_sha256 != target.manifest_sha256
+            or evidence.request.artifact_id != target.artifact_id
+        ):
+            raise VideoGenieError("INPUT_CHANGED", "Stored output sample binding differs")
+        evidence.request.require_manifest(evidence.manifest)
+        return evidence, self.service.data_dir / "output-previews" / stage
+
+    @staticmethod
+    @contextmanager
+    def _sample_bytes(
+        path: Path, size: int, digest: str, media_type: str
+    ) -> Iterator[PreviewMedia]:
+        """Expose only a fully hash-verified no-follow snapshot, never a path reopen."""
+        try:
+            with tempfile.SpooledTemporaryFile[bytes](max_size=1048576) as spool:
+                with _directory(path.parent) as directory:
+                    descriptor = os.open(
+                        path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+                    )
+                    with os.fdopen(descriptor, "rb") as source:
+                        before = os.fstat(source.fileno())
+                        if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+                            raise VideoGenieError("INPUT_CHANGED", "Output review media changed")
+                        observed = hashlib.sha256()
+                        remaining = size
+                        while remaining:
+                            block = source.read(min(1048576, remaining))
+                            if not block:
+                                raise VideoGenieError(
+                                    "INPUT_CHANGED", "Output review media truncated"
+                                )
+                            observed.update(block)
+                            spool.write(block)
+                            remaining -= len(block)
+                        if (
+                            _fingerprint(before) != _fingerprint(os.fstat(source.fileno()))
+                            or observed.hexdigest() != digest
+                        ):
+                            raise VideoGenieError(
+                                "INPUT_CHANGED", "Output review media digest changed"
+                            )
+                spool.seek(0)
+                yield PreviewMedia(spool, media_type, size, digest)
+        except OSError as exc:
+            raise VideoGenieError("MEDIA_UNAVAILABLE", "Output review media unavailable") from exc
+
+    def _require_preview(
+        self, connection: sqlite3.Connection, target: OutputReviewTarget
+    ) -> OutputPreviewEvidence:
+        evidence, stage = self._preview_row(connection, target)
+        with self._sample_bytes(
+            stage / "master.mov",
+            evidence.manifest.byte_size,
+            target.artifact_sha256,
+            "video/quicktime",
+        ):
+            pass
+        for n, sample in enumerate(evidence.keyframes):
+            with self._sample_bytes(
+                stage / f"sample-{n:02d}.png", sample.png_byte_size, sample.png_sha256, "image/png"
+            ):
+                pass
+        return evidence
+
+    def prepare_output_review(self, request: ArtifactInput) -> OutputReviewView:
+        """Cache actual-master samples and return current target plus classified project costs.
+
+        A returned view is not authority; every signed decision revalidates the target.
+        Unregistered stages after interruption/ambiguous commit remain private for diagnosis.
+        """
+        request = _checked(ArtifactInput, request)
+        self._review_initialize()
+        # Reserve writer order before nested asset reads, avoiding SQLite reader/writer inversion.
+        with self.service.connection(write=True) as connection:
+            manifest = self._review_artifact(connection, request)
+            target = self._target(connection, manifest)
+            self._review_target(connection, target)
+            cached = connection.execute(
+                "SELECT 1 FROM output_review_previews WHERE artifact_id=?", (target.artifact_id,)
+            ).fetchone()
+        if cached is None:
+            root = self.service.data_dir / "output-previews"
+            with _directory(root.parent) as parent:
+                try:
+                    os.mkdir(root.name, mode=0o700, dir_fd=parent)
+                    os.fsync(parent)
+                except FileExistsError:
+                    pass
+            with _directory(root):
+                pass
+            produced = extract_artifact_preview(
+                OutputPreviewRequest(
+                    project_id=request.project_id,
+                    storyline_id=request.storyline_id,
+                    client_id=request.client_id,
+                    job_id=manifest.job_id,
+                    artifact_id=request.artifact_id,
+                    artifact_sha256=manifest.artifact_sha256,
+                    manifest_sha256=content_sha256(manifest),
+                ),
+                manifest,
+                self.service.data_dir / manifest.locator,
+                root,
+            )
+            # Keep a private unregistered stage on uncertain commit; never remove a possible
+            # committed reader's files. Concurrent preparation retains one canonical record.
+            try:
+                with self.service.connection(write=True) as connection:
+                    self._review_target(connection, target)
+                    connection.execute(
+                        "INSERT OR IGNORE INTO output_review_previews VALUES(?,?,?,?)",
+                        (
+                            target.artifact_id,
+                            target.manifest_sha256,
+                            produced.directory.name,
+                            produced.evidence.model_dump_json(),
+                        ),
+                    )
+                    selected_stage = connection.execute(
+                        "SELECT stage FROM output_review_previews WHERE artifact_id=?",
+                        (target.artifact_id,),
+                    ).fetchone()[0]
+                if selected_stage != produced.directory.name:
+                    # Our successful worker owns this unregistered loser; no ambiguous commit.
+                    with _directory(produced.directory):
+                        pass
+                    shutil.rmtree(produced.directory)
+            except BaseException as error:
+                failure = (
+                    VideoGenieError("MEDIA_UNAVAILABLE", "Output preview retention unconfirmed")
+                    if isinstance(error, OSError)
+                    else error
+                )
+                failure.add_note(
+                    f"Output preview stage retained for reconciliation: {produced.directory}"
+                )
+                if isinstance(failure, VideoGenieError):
+                    failure.details["retained_preview_stage"] = str(produced.directory)
+                if failure is not error:
+                    raise failure from error
+                raise
+        with self.service.connection(write=True) as connection:
+            self._review_target(connection, target)
+            evidence = self._require_preview(connection, target)
+        costs = self.authority.costs.report(CostReportInput(project_id=request.project_id))
+        return OutputReviewView(target, evidence, costs)
+
+    @contextmanager
+    def read_output_preview(
+        self, request: ArtifactInput, *, frame_index: int | None = None
+    ) -> Iterator[PreviewMedia]:
+        """Serve verified cached pixels/master only for the still-current published target."""
+        request = _checked(ArtifactInput, request)
+        if frame_index is not None and (
+            type(frame_index) is not int or frame_index not in SAMPLE_FRAMES
+        ):
+            raise VideoGenieError("INVALID_ARGUMENT", "Unsupported output sample frame")
+        self._review_initialize()
+        # Reserve writer order before nested asset reads, avoiding SQLite reader/writer inversion.
+        with self.service.connection(write=True) as connection:
+            manifest = self._review_artifact(connection, request)
+            target = self._target(connection, manifest)
+            self._review_target(connection, target)
+            evidence, stage = self._preview_row(connection, target)
+        if frame_index is None:
+            path, size, digest, mime = (
+                stage / "master.mov",
+                manifest.byte_size,
+                manifest.artifact_sha256,
+                "video/quicktime",
+            )
+        else:
+            ordinal = SAMPLE_FRAMES.index(frame_index)
+            sample = evidence.keyframes[ordinal]
+            path, size, digest, mime = (
+                stage / f"sample-{ordinal:02d}.png",
+                sample.png_byte_size,
+                sample.png_sha256,
+                "image/png",
+            )
+        with self._sample_bytes(path, size, digest, mime) as media:
+            with self.service.connection(write=True) as connection:
+                self._review_target(connection, target)
+            yield media
+
+    def select_output(self, request: SelectOutputInput) -> OutputSelection:
+        """CAS selection of an authenticated approved output; replay returns original snapshot."""
+        request = _checked(SelectOutputInput, request)
+        self._review_initialize()
+        digest = content_sha256(request)
+        with self.service.connection(write=True) as connection:
+            old = connection.execute(
+                "SELECT * FROM output_selections WHERE project_id=? AND idempotency_key=?",
+                (request.project_id, request.idempotency_key),
+            ).fetchone()
+            if old is not None:
+                if old["request_sha256"] != digest:
+                    raise VideoGenieError(
+                        "IDEMPOTENCY_CONFLICT", "Selection key describes another request"
+                    )
+                receipt = ReviewReceipt.model_validate_json(old["record_json"])
+                return OutputSelection(old["revision"], receipt)
+            receipt = self.authority._review(
+                connection,
+                ReviewInput(
+                    project_id=request.project_id,
+                    storyline_id=request.storyline_id,
+                    client_id=request.client_id,
+                    review_id=request.review_id,
+                ),
+            )
+            if receipt.decision != "approved" or (request.artifact_id, request.artifact_sha256) != (
+                receipt.target.artifact_id,
+                receipt.target.artifact_sha256,
+            ):
+                raise _denied("output_not_approved")
+            latest = connection.execute(
+                "SELECT result_json FROM authority_results WHERE kind='review_output' "
+                "AND json_extract(result_json,'$.target.artifact_id')=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (request.artifact_id,),
+            ).fetchone()
+            if (
+                latest is None
+                or ReviewReceipt.model_validate_json(latest[0]).review_id != receipt.review_id
+            ):
+                raise VideoGenieError(
+                    "REVISION_CONFLICT", "Approval superseded by a later output review"
+                )
+            self._review_target(connection, receipt.target)
+            self._require_preview(connection, receipt.target)
+            revision = connection.execute(
+                "SELECT COALESCE(MAX(revision),0) FROM output_selections "
+                "WHERE project_id=? AND storyline_id=?",
+                (request.project_id, request.storyline_id),
+            ).fetchone()[0]
+            if revision != request.expected_selection_revision:
+                raise VideoGenieError("REVISION_CONFLICT", "Output selection changed")
+            connection.execute(
+                "INSERT INTO output_selections VALUES(?,?,?,?,?,?,?)",
+                (
+                    request.project_id,
+                    request.storyline_id,
+                    revision + 1,
+                    request.idempotency_key,
+                    digest,
+                    receipt.review_id,
+                    receipt.model_dump_json(),
+                ),
+            )
+            self.studio.append_event(
+                connection,
+                "output.selected",
+                project_id=request.project_id,
+                client_id=request.client_id,
+                correlation_id=receipt.owner_receipt_id,
+                payload={
+                    "review_id": receipt.review_id,
+                    "artifact_id": request.artifact_id,
+                    "selection_revision": revision + 1,
+                },
+            )
+            return OutputSelection(revision + 1, receipt)
+
+    def get_selection(self, request: ProjectAuthorityScope) -> OutputSelection | None:
+        """Historical selection snapshot; current use must revalidate policy and target."""
+        request = _checked(ProjectAuthorityScope, request)
+        self._review_initialize()
+        with self.service.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM output_selections WHERE project_id=? AND storyline_id=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (request.project_id, request.storyline_id),
+            ).fetchone()
+            if row is None:
+                return None
+            receipt = ReviewReceipt.model_validate_json(row["record_json"])
+            if receipt.target.client_id != request.client_id:
+                return None
+            return OutputSelection(row["revision"], receipt)
 
     def get_artifact(self, request: ArtifactInput) -> RenderResult:
         """Read one exact published candidate; no newest selection or owner review implied."""
