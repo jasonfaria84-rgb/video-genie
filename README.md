@@ -10,16 +10,15 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 64 shared agent operations: projects and clients, cycles and
+This source exposes 66 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
-artifacts, costs, approval requests, output selection, dead-space removal, and a
-DaVinci Resolve status check. Seven additive discovery reads preserve the earlier
+artifacts, costs, approval requests, output selection, dead-space removal, a
+DaVinci Resolve status check, and word-level transcripts made in Resolve. Seven additive discovery reads preserve the earlier
 54 operation schemas and results; the dead-space and Resolve operations follow them. A separate supervised
 owner console handles enrollment, publication, budget grants, and final review.
 
-Removing filler words such as "um" needs word-level transcription and isn't
-implemented yet. General video editing, reusable project templates, additional storyline creation,
+General video editing, reusable project templates, additional storyline creation,
 paid provider integrations/billing, and hosted tenancy remain outside this slice.
 Higgsfield, ElevenLabs, and DaVinci Resolve access elsewhere in an agent's
 environment doesn't configure a VideoGenie integration. Physical owner consent
@@ -251,7 +250,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 64 agent operations. Replace spaces in each CLI command
+The server exposes the same 66 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -429,6 +428,29 @@ using set to Local. Set `RESOLVE_SCRIPT_LIB` if Resolve is installed somewhere
 other than the default location. VideoGenie edits only Resolve projects named
 `VideoGenie <project ID>`, and it won't switch away from a project you have open
 unless the request explicitly allows it.
+
+## Transcribe with DaVinci Resolve
+
+`transcript create` imports one local file into the project's own Resolve project
+(`VideoGenie <project_id>`), transcribes it word by word with Resolve Studio, and
+stores the result. `transcript get` reads it back by `transcript_id`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
+  | videogenie transcript create --json --input-json -
+```
+
+Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
+`kind`. Resolve leaves filler words such as "um" and "uh" out of its text, so
+VideoGenie checks every gap between words with FFmpeg: quiet stretches become
+`kind: "silence"` and audible ones `kind: "sound"`, which usually means a filler,
+breath or noise. Transcripts are tied to the source file's SHA-256.
+
+The call refuses when you have a different Resolve project open; pass
+`"allow_switch": true` after saving your work to let VideoGenie open its own
+project. `speaker_detection` (default true), `noise_threshold_db` (default -35)
+and `timeout_seconds` (default 900) are optional. The file must be a format Resolve
+imports; Resolve rejects the AIFF files written by macOS `say`, for example.
 
 ## Recover a probe job
 

@@ -46,6 +46,7 @@ class _Stream(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
     codec_type: str | None = None
     avg_frame_rate: str | None = None
+    duration: str | None = None
     disposition: dict[str, int] = Field(default_factory=dict)
 
 
@@ -66,6 +67,7 @@ class _Media:
     has_audio: bool
     has_video: bool
     frame_rate: Fraction | None
+    audio_duration: float | None = None
 
 
 def _deadline_left(deadline: float) -> float:
@@ -102,7 +104,7 @@ def _media(ffprobe: str, path: Path, deadline: float) -> _Media:
             "-protocol_whitelist",
             "file",
             "-show_entries",
-            "format=duration:stream=codec_type,avg_frame_rate:stream_disposition=attached_pic",
+            "format=duration:stream=codec_type,avg_frame_rate,duration:stream_disposition=attached_pic",
             "-of",
             "json",
             str(path),
@@ -128,11 +130,20 @@ def _media(ffprobe: str, path: Path, deadline: float) -> _Media:
             frame_rate = rate if 1 <= rate <= 240 else None
         except (ValueError, ZeroDivisionError):
             frame_rate = None
+    audio = [stream for stream in parsed.streams if stream.codec_type == "audio"]
+    audio_duration: float | None = None
+    if audio and audio[0].duration:
+        try:
+            measured = float(audio[0].duration)
+            audio_duration = measured if math.isfinite(measured) and measured > 0 else None
+        except ValueError:
+            audio_duration = None
     return _Media(
         duration=duration,
-        has_audio=any(stream.codec_type == "audio" for stream in parsed.streams),
+        has_audio=bool(audio),
         has_video=bool(video),
         frame_rate=frame_rate,
+        audio_duration=audio_duration,
     )
 
 
@@ -256,6 +267,12 @@ def _plan(
     )
     require_unchanged(path, source)
     silences = parse_silences(raw, media.duration)
+    if media.audio_duration is not None and media.duration - media.audio_duration >= 0.05:
+        # Past the end of the audio stream there is nothing to hear.
+        if silences and silences[-1][1] >= media.audio_duration - 0.05:
+            silences[-1] = (silences[-1][0], media.duration)
+        else:
+            silences.append((media.audio_duration, media.duration))
     cuts, keeps = plan_cuts(
         silences,
         media.duration,

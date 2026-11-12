@@ -87,6 +87,8 @@ EXPECTED_OPERATIONS = [
     "media.silence.detect",
     "media.silence.remove",
     "resolve.status",
+    "transcript.create",
+    "transcript.get",
 ]
 
 

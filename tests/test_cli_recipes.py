@@ -126,7 +126,7 @@ def test_installed_catalog_and_pure_schemas(installed: Path, tmp_path: Path) -> 
     state = tmp_path / "absent-state"
     assert list(INPUT_MODELS)[22:54] == NEW_OPERATIONS
     assert list(INPUT_MODELS)[54:61] == DISCOVERY_OPERATIONS
-    assert len(INPUT_MODELS) == 64
+    assert len(INPUT_MODELS) == 66
     for operation in NEW_OPERATIONS + DISCOVERY_OPERATIONS:
         help = data(invoke(installed, cwd, state, operation, help=True))
         assert help["input_schema"] == INPUT_MODELS[operation].model_json_schema()

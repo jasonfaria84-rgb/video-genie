@@ -227,3 +227,20 @@ def test_mcp_tools_require_absolute_paths(tmp_path: Path) -> None:
             assert relative.error is not None and relative.error.code == "INVALID_ARGUMENT"
 
     asyncio.run(scenario())
+
+
+def test_audio_shorter_than_video_tail_is_silence(tmp_path: Path) -> None:
+    source = tmp_path / "short-audio.mp4"
+    subprocess.run(
+        [ffmpeg(), "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:d=4"]
+        + ["-f", "lavfi", "-i", "sine=f=330:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+        + ["-c:a", "aac", str(source)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    state, cwd = tmp_path / "state", tmp_path / "cwd"
+    cwd.mkdir()
+    plan = run(state, cwd, "media.silence.detect", {"source_path": str(source)})["data"]
+    assert plan["cuts"][-1]["reason"] == "trailing_silence"
+    assert plan["cuts"][-1]["end_seconds"] == pytest.approx(4.0, abs=0.05)

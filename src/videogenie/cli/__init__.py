@@ -79,6 +79,8 @@ from videogenie.contracts.studio import (
     ProjectClientInput,
     SetWaitInput,
 )
+from videogenie.contracts.transcripts import CreateTranscriptInput, Transcript, TranscriptInput
+from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
 from videogenie.core.assets import AssetService
 from videogenie.core.authority import OwnerAuthorityService
@@ -90,6 +92,7 @@ from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
+from videogenie.core.transcription import create_transcript
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -219,6 +222,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "media.silence.detect": DetectSilenceInput,
     "media.silence.remove": RemoveSilenceInput,
     "resolve.status": ResolveStatusInput,
+    "transcript.create": CreateTranscriptInput,
+    "transcript.get": TranscriptInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -448,6 +453,8 @@ def _dispatch(
                 "media.silence.detect",
                 "media.silence.remove",
                 "resolve.status",
+                "transcript.create",
+                "transcript.get",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -487,6 +494,13 @@ def _dispatch(
         return JobService(service).submit_probe(
             probe.project_id, probe.storyline_id, path, probe.idempotency_key
         )
+    if operation == "transcript.create":
+        return create_transcript(
+            service, CreateTranscriptInput.model_validate_json(_strict_json(payload))
+        )
+    if operation == "transcript.get":
+        wanted = TranscriptInput.model_validate_json(_strict_json(payload))
+        return transcript_store.load(service, Transcript, wanted.transcript_id)
     if operation == "resolve.status":
         checked = ResolveStatusInput.model_validate_json(_strict_json(payload))
         return resolve_status(checked.timeout_seconds)

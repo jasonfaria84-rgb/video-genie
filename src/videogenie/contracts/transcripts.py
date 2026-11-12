@@ -18,14 +18,19 @@ CutReason = Literal["filler", "false_start", "pause", "leading_silence", "traili
 
 
 class TranscriptWord(ContractModel):
-    """One spoken word, or a silence marker when kind is silence."""
+    """One spoken word, a quiet stretch (silence), or audible but untranscribed sound.
+
+    Speech engines often drop fillers such as "um"; VideoGenie marks a gap between
+    words that is not actually quiet as kind "sound" so editing can treat it as a
+    likely filler, breath or noise.
+    """
 
     word_id: WordID
     start_seconds: Seconds
     end_seconds: Seconds
     text: str = Field(max_length=200)
     speaker: str | None = Field(default=None, max_length=200)
-    kind: Literal["word", "silence"] = "word"
+    kind: Literal["word", "silence", "sound"] = "word"
 
     @model_validator(mode="after")
     def _ordered(self) -> Self:
@@ -60,6 +65,29 @@ class Transcript(ContractModel):
         if self.words and self.words[-1].end_seconds > self.duration_seconds + 0.5:
             raise ValueError("Words cannot extend past the source")
         return self
+
+
+class CreateTranscriptInput(ContractModel):
+    """Transcribe one local media file word by word in DaVinci Resolve Studio and store it.
+
+    The file is imported into the VideoGenie project's own Resolve project
+    ("VideoGenie <project_id>"). If you have another Resolve project open, the call
+    refuses unless allow_switch is true. Gaps between words are checked with FFmpeg:
+    quiet stretches become kind "silence", audible ones kind "sound" (likely fillers).
+    """
+
+    project_id: Identifier
+    source_path: str = Field(min_length=1, max_length=4096)
+    speaker_detection: bool = True
+    allow_switch: bool = False
+    noise_threshold_db: float = Field(default=-35, ge=-90, le=-10, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=900, gt=0, le=7200, allow_inf_nan=False)
+
+
+class TranscriptInput(ContractModel):
+    """Fetch a stored transcript by ID."""
+
+    transcript_id: Identifier
 
 
 class PlannedCut(ContractModel):

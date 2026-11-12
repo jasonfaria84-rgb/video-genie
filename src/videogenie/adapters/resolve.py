@@ -65,7 +65,7 @@ def _load(path: Path) -> ModuleType:
         return module
 
 
-def _call_with_timeout(function: Any, timeout_seconds: float) -> tuple[bool, Any]:
+def call_with_timeout(function: Any, timeout_seconds: float) -> tuple[bool, Any]:
     """Run a scripting call on a daemon thread; Resolve can block while a dialog is open."""
     outcome: dict[str, Any] = {}
 
@@ -105,12 +105,12 @@ def _connect(timeout_seconds: float) -> tuple[ResolveStatus, ResolveApp | None]:
         module = _load(path)
     except (ImportError, OSError):
         return _unreachable("library_unloadable", path), None
-    finished, app = _call_with_timeout(lambda: module.scriptapp("Resolve"), timeout_seconds)
+    finished, app = call_with_timeout(lambda: module.scriptapp("Resolve"), timeout_seconds)
     if not finished:
         return _unreachable("timeout", path), None
     if app is None:
         return _unreachable("not_running_or_scripting_disabled", path), None
-    finished, facts = _call_with_timeout(
+    finished, facts = call_with_timeout(
         lambda: (str(app.GetProductName()), str(app.GetVersionString())), timeout_seconds
     )
     if not finished:
