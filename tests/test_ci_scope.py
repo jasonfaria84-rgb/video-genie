@@ -1,7 +1,9 @@
 """Exercise conservative scope decisions and real Git rename/base handling."""
 
+import ast
 import importlib.util
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -353,3 +355,216 @@ def test_legacy_discovery_requires_original_tools_and_allows_additions() -> None
     for missing in required:
         with pytest.raises(AssertionError, match="Missing legacy tools"):
             module.require_legacy_tools((required - {missing}) | additions)
+
+
+def test_explicit_inventory_covers_current_tests_and_helper_importers() -> None:
+    """A helper import is a real test dependency, even without application changes."""
+    module = selector()
+    repository = Path(__file__).resolve().parents[1]
+    actual: dict[str, set[str]] = {}
+    paths = list((repository / "tests").glob("test_*.py"))
+    assert {p.relative_to(repository).as_posix() for p in paths} == module.KNOWN_TESTS
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            for name in names:
+                if name.startswith("test_"):
+                    actual.setdefault(name, set()).add(path.stem)
+    assert actual == module.TEST_IMPORTERS
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/videogenie/workers/probe.py",
+        "src/videogenie/workers/lower_third.py",
+        "src/videogenie/workers/artifact_preview.py",
+        "src/videogenie/adapters/owner_auth.py",
+    ],
+)
+def test_worker_authority_changes_reach_transitive_public_consumers(root: Path, path: str) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted"
+    assert {
+        "tests/test_lower_third.py",
+        "tests/test_artifact_preview.py",
+        "tests/test_render_jobs.py",
+        "tests/test_output_review.py",
+        "tests/test_owner_console_ui.py",
+        "tests/test_owner_output_review_ui.py",
+        "tests/test_cli_recipes.py",
+        "tests/test_mcp_recipes.py",
+        "tests/test_recipe_render_install.py",
+        "tests/test_external_install.py",
+        "tests/test_local_studio_install.py",
+    } <= set(scope["tests"])
+    assert scope["build"] and scope["runtime"]
+    assert selector().validate_scope(scope) == scope
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/videogenie/core/assets.py",
+        "src/videogenie/core/rendering.py",
+        "src/videogenie/core/authority.py",
+        "src/videogenie/contracts/rendering.py",
+        "src/videogenie/contracts/output_previews.py",
+        "src/videogenie/contracts/authority.py",
+        "src/videogenie/workers/future_worker.py",
+        "src/videogenie/cli/future_command.py",
+    ],
+)
+def test_shared_or_unassessed_source_retains_full_coverage(root: Path, path: str) -> None:
+    assert selector().select([{"status": "M", "old": None, "new": path}], root)["tests"] == [
+        "tests"
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/dogfood_recipe_render.py",
+        "docs/local-recipe-proof.md",
+        "tests/test_recipe_render_install.py",
+    ],
+)
+def test_recipe_proof_selects_same_wheel_consumer(root: Path, path: str) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted"
+    assert scope["tests"] == ["tests/test_recipe_render_install.py"]
+    assert scope["build"] and scope["runtime"]
+    (root / "tests/test_recipe_render_install.py").unlink()
+    assert selector().select([{"status": "M", "old": None, "new": path}], root)["mode"] == "full"
+
+
+def test_test_helper_changes_include_transitive_importers(root: Path) -> None:
+    scope = selector().select(
+        [{"status": "M", "old": None, "new": "tests/test_render_contracts.py"}], root
+    )
+    assert {
+        "tests/test_render_contracts.py",
+        "tests/test_job_storage.py",
+        "tests/test_owner_console.py",
+        "tests/test_owner_console_ui.py",
+        "tests/test_owner_output_review_ui.py",
+        "tests/test_artifact_preview.py",
+        "tests/test_preview_contracts.py",
+    } <= set(scope["tests"])
+    assert "tests/test_costs.py" not in scope["tests"]
+
+
+def test_shared_harness_selects_every_importing_installed_proof(root: Path) -> None:
+    scope = selector().select(
+        [{"status": "M", "old": None, "new": "scripts/dogfood_external_agent.py"}], root
+    )
+    assert set(scope["tests"]) == {
+        "tests/test_ci_scope.py",
+        "tests/test_external_install.py",
+        "tests/test_local_studio_install.py",
+        "tests/test_recipe_render_install.py",
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/videogenie/adapters/owner_console.html",
+        "src/videogenie/adapters/owner_console.py",
+        "src/videogenie/cli/owner.py",
+        "tests/fixtures/fonts/Inter-Bold.ttf",
+        "tests/fixtures/fonts/OFL.txt",
+        "tests/fixtures/fonts/fonts.lock.json",
+    ],
+)
+def test_owner_resources_and_licensed_assets_reach_installed_proof(root: Path, path: str) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": path}], root)
+    assert scope["mode"] == "targeted"
+    assert {
+        "tests/test_owner_console_ui.py",
+        "tests/test_owner_output_review_ui.py",
+        "tests/test_recipe_render_install.py",
+    } <= set(scope["tests"])
+
+
+def test_standalone_test_modification_does_not_expand_to_unrelated_suites(root: Path) -> None:
+    scope = selector().select([{"status": "M", "old": None, "new": "tests/test_assets.py"}], root)
+    assert scope["tests"] == ["tests/test_assets.py"]
+
+
+def test_runtime_preflight_actual_pinned_dependencies_and_fixture() -> None:
+    """Exercise the CI check with real installed packages and exact supplied font bytes."""
+    selector().verify_runtime(Path(__file__).resolve().parents[1])
+
+
+@pytest.mark.parametrize("damage", ["ffmpeg", "ffprobe", "version", "font", "license", "missing"])
+def test_runtime_preflight_fails_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    module = selector()
+    repository = Path(__file__).resolve().parents[1]
+    shutil.copyfile(repository / "pyproject.toml", tmp_path / "pyproject.toml")
+    fixture = tmp_path / "tests/fixtures/fonts"
+    shutil.copytree(repository / "tests/fixtures/fonts", fixture)
+    if damage in {"ffmpeg", "ffprobe"}:
+        original = module.shutil.which
+        monkeypatch.setattr(
+            module.shutil, "which", lambda name: None if name == damage else original(name)
+        )
+        expected = "Required media tool unavailable"
+    elif damage == "version":
+        monkeypatch.setattr(module.importlib.metadata, "version", lambda _: "0.0.0")
+        expected = "pinned dependency"
+    elif damage == "missing":
+
+        def missing(name: str) -> str:
+            raise module.importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(module.importlib.metadata, "version", missing)
+        with pytest.raises(module.importlib.metadata.PackageNotFoundError):
+            module.verify_runtime(tmp_path)
+        return
+    else:
+        (fixture / ("Inter-Bold.ttf" if damage == "font" else "OFL.txt")).write_bytes(b"tampered")
+        expected = "Licensed fixture bytes"
+    with pytest.raises(RuntimeError, match=expected):
+        module.verify_runtime(tmp_path)
+
+
+def test_package_cache_tracks_new_resources_and_proof_without_commit_identity(
+    tmp_path: Path,
+) -> None:
+    module = selector()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    (tmp_path / "README.md").write_text("metadata")
+    git("add", ".")
+    previous = module.distribution_input_hash(tmp_path)
+    for name in (
+        "src/videogenie/adapters/owner_console.html",
+        "tests/fixtures/fonts/Inter-Bold.ttf",
+        "tests/fixtures/fonts/OFL.txt",
+        "tests/fixtures/fonts/fonts.lock.json",
+        "tests/fixtures/lower_third_goldens.json",
+        "scripts/dogfood_recipe_render.py",
+        "tests/test_recipe_render_install.py",
+    ):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("exact packaged resource")
+        git("add", ".")
+        current = module.distribution_input_hash(tmp_path)
+        assert current != previous, name
+        previous = current
+    doc = tmp_path / "docs/local-recipe-proof.md"
+    doc.parent.mkdir()
+    doc.write_text("nonpackaged evidence")
+    git("add", ".")
+    assert module.distribution_input_hash(tmp_path) == previous

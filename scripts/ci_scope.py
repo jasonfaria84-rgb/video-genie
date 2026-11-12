@@ -2,9 +2,13 @@
 
 import argparse
 import hashlib
+import importlib
+import importlib.metadata
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -34,25 +38,174 @@ DOCUMENTATION_ONLY = {
 }
 
 KNOWN_TESTS = {
+    "tests/test_activity.py",
+    "tests/test_artifact_preview.py",
+    "tests/test_assets.py",
+    "tests/test_authority.py",
+    "tests/test_authority_cost_contracts.py",
+    "tests/test_ci_scope.py",
     "tests/test_cli.py",
     "tests/test_cli_operations.py",
-    "tests/test_mcp.py",
-    "tests/test_media_probe.py",
-    "tests/test_projects.py",
+    "tests/test_cli_recipes.py",
+    "tests/test_costs.py",
     "tests/test_external_install.py",
-    "tests/test_ci_scope.py",
-    "tests/test_studio_contracts.py",
-    "tests/test_studio.py",
-    "tests/test_activity.py",
+    "tests/test_job_migration.py",
+    "tests/test_job_storage.py",
     "tests/test_local_studio_install.py",
+    "tests/test_lower_third.py",
+    "tests/test_mcp.py",
+    "tests/test_mcp_recipes.py",
+    "tests/test_media_probe.py",
+    "tests/test_output_review.py",
+    "tests/test_owner_auth.py",
+    "tests/test_owner_auth_dependency.py",
+    "tests/test_owner_cli.py",
+    "tests/test_owner_console.py",
+    "tests/test_owner_console_ui.py",
+    "tests/test_owner_output_review_ui.py",
+    "tests/test_preview_contracts.py",
+    "tests/test_projects.py",
+    "tests/test_recipe_contracts.py",
+    "tests/test_recipe_previews.py",
+    "tests/test_recipe_render_install.py",
+    "tests/test_recipes.py",
+    "tests/test_render_contracts.py",
+    "tests/test_render_jobs.py",
+    "tests/test_render_plan.py",
+    "tests/test_studio.py",
+    "tests/test_studio_contracts.py",
 }
 TRANSPORT_TESTS = {
     "tests/test_cli.py",
     "tests/test_cli_operations.py",
     "tests/test_mcp.py",
+    "tests/test_cli_recipes.py",
+    "tests/test_mcp_recipes.py",
+    "tests/test_owner_cli.py",
     "tests/test_external_install.py",
     "tests/test_local_studio_install.py",
+    "tests/test_recipe_render_install.py",
 }
+OWNER_TESTS = {
+    "tests/test_owner_auth.py",
+    "tests/test_authority.py",
+    "tests/test_owner_console.py",
+    "tests/test_owner_console_ui.py",
+    "tests/test_owner_output_review_ui.py",
+}
+RENDER_TESTS = (
+    {
+        "tests/test_lower_third.py",
+        "tests/test_artifact_preview.py",
+        "tests/test_recipe_previews.py",
+        "tests/test_render_plan.py",
+        "tests/test_render_jobs.py",
+        "tests/test_output_review.py",
+    }
+    | OWNER_TESTS
+    | TRANSPORT_TESTS
+)
+
+# Explicit shared test fixtures, including indirect consumers. The inventory test
+# checks real Python imports so a new helper edge cannot silently narrow selection.
+TEST_IMPORTERS = {
+    "test_costs": {"test_authority"},
+    "test_authority": {
+        "test_render_plan",
+        "test_mcp_recipes",
+        "test_owner_output_review_ui",
+        "test_output_review",
+        "test_artifact_preview",
+        "test_owner_console_ui",
+        "test_cli_recipes",
+        "test_render_jobs",
+    },
+    "test_owner_auth": {
+        "test_render_jobs",
+        "test_render_plan",
+        "test_owner_console",
+        "test_owner_cli",
+        "test_authority",
+    },
+    "test_recipes": {
+        "test_owner_console_ui",
+        "test_recipe_previews",
+        "test_render_plan",
+        "test_mcp_recipes",
+        "test_owner_console",
+        "test_owner_cli",
+        "test_cli_recipes",
+        "test_authority",
+    },
+    "test_mcp": {"test_mcp_recipes"},
+    "test_render_plan": {
+        "test_mcp_recipes",
+        "test_owner_output_review_ui",
+        "test_output_review",
+        "test_artifact_preview",
+        "test_owner_console_ui",
+        "test_cli_recipes",
+        "test_render_jobs",
+    },
+    "test_job_storage": {"test_owner_console", "test_owner_console_ui"},
+    "test_owner_console": {"test_owner_console_ui", "test_owner_output_review_ui"},
+    "test_render_contracts": {
+        "test_artifact_preview",
+        "test_job_storage",
+        "test_preview_contracts",
+    },
+    "test_render_jobs": {"test_owner_console_ui"},
+    "test_cli_operations": {"test_cli_recipes"},
+    "test_owner_cli": {"test_cli_recipes"},
+    "test_lower_third": {"test_recipe_previews"},
+}
+PATH_TESTS = {
+    "src/videogenie/cli/__init__.py": TRANSPORT_TESTS,
+    "src/videogenie/cli/owner.py": OWNER_TESTS | TRANSPORT_TESTS,
+    "src/videogenie/adapters/mcp_server.py": TRANSPORT_TESTS,
+    "src/videogenie/adapters/owner_auth.py": RENDER_TESTS,
+    "src/videogenie/adapters/owner_console.py": OWNER_TESTS | TRANSPORT_TESTS,
+    "src/videogenie/adapters/owner_console.html": OWNER_TESTS | TRANSPORT_TESTS,
+    "src/videogenie/workers/probe.py": RENDER_TESTS
+    | {
+        "tests/test_media_probe.py",
+        "tests/test_projects.py",
+        "tests/test_activity.py",
+        "tests/test_job_storage.py",
+        "tests/test_job_migration.py",
+    },
+    "src/videogenie/workers/lower_third.py": RENDER_TESTS,
+    "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
+    "scripts/dogfood_external_agent.py": {
+        "tests/test_ci_scope.py",
+        "tests/test_external_install.py",
+        "tests/test_local_studio_install.py",
+        "tests/test_recipe_render_install.py",
+    },
+    "scripts/dogfood_local_studio.py": {"tests/test_local_studio_install.py"},
+    "scripts/dogfood_recipe_render.py": {"tests/test_recipe_render_install.py"},
+    "docs/external-agent-proof.md": {"tests/test_external_install.py"},
+    "docs/local-studio-proof.md": {"tests/test_local_studio_install.py"},
+    "docs/local-recipe-proof.md": {"tests/test_recipe_render_install.py"},
+    "tests/fixtures/README.md": RENDER_TESTS,
+    "tests/fixtures/fonts/Inter-Bold.ttf": RENDER_TESTS,
+    "tests/fixtures/fonts/OFL.txt": RENDER_TESTS,
+    "tests/fixtures/fonts/fonts.lock.json": RENDER_TESTS,
+    "tests/fixtures/lower_third_goldens.json": {"tests/test_lower_third.py"},
+}
+
+
+def include_test_importers(selected: set[str]) -> set[str]:
+    """Include transitive users of changed/selected test fixtures without importing them."""
+    result = set(selected)
+    pending = list(selected)
+    while pending:
+        for name in TEST_IMPORTERS.get(Path(pending.pop()).stem, set()):
+            path = f"tests/{name}.py"
+            if path not in result:
+                result.add(path)
+                pending.append(path)
+    return result
 
 
 def parse_changes(raw: bytes) -> list[Change]:
@@ -101,27 +254,15 @@ def select(changes: list[Change], root: Path) -> Scope:
             return full("added/deleted/renamed or unsupported change", changes)
         if path in {"README.md", "LICENSE"}:
             build = True
-        elif path == "docs/external-agent-proof.md":
-            selected.add("tests/test_external_install.py")
-        elif path in {"scripts/dogfood_local_studio.py", "docs/local-studio-proof.md"}:
-            selected.add("tests/test_local_studio_install.py")
         elif path in DOCUMENTATION_ONLY:
             continue
         elif path in KNOWN_TESTS:
             selected.add(path)
-        elif (
-            path.startswith("src/videogenie/cli/")
-            or path == "src/videogenie/adapters/mcp_server.py"
-        ):
-            selected.update(TRANSPORT_TESTS)
-        elif path.startswith("src/videogenie/workers/"):
-            selected.update(
-                TRANSPORT_TESTS | {"tests/test_media_probe.py", "tests/test_projects.py"}
-            )
-        elif path == "scripts/dogfood_external_agent.py":
-            selected.add("tests/test_external_install.py")
+        elif path in PATH_TESTS:
+            selected.update(PATH_TESTS[path])
         else:
             return full("shared, dependency, CI, fixture or unknown path", changes)
+    selected = include_test_importers(selected)
     if any(not (root / test).is_file() for test in selected):
         return full("required mapped suite missing", changes)
     build = build or bool(selected)
@@ -307,6 +448,43 @@ def record_distribution(root: Path, dist: Path) -> None:
     verify_distribution(root, dist)
 
 
+def verify_runtime(root: Path) -> None:
+    """Fail explicitly before tests if a real renderer/verifier prerequisite is unavailable."""
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            raise RuntimeError(f"Required media tool unavailable: {tool}")
+    with (root / "pyproject.toml").open("rb") as stream:
+        requirements = tomllib.load(stream)["project"]["dependencies"]
+    for requirement in requirements:
+        name, pin = requirement.split("==")
+        if importlib.metadata.version(name) != pin:
+            raise RuntimeError(f"Installed runtime does not match pinned dependency: {name}")
+    for module in ("PIL.ImageFont", "fontTools.ttLib", "webauthn", "cbor2", "cryptography"):
+        importlib.import_module(module)
+    fixture = root / "tests/fixtures/fonts"
+    lock = json.loads((fixture / "fonts.lock.json").read_text())
+    for part, name, key in (
+        ("font", "Inter-Bold.ttf", "sha256"),
+        ("license", "OFL.txt", "text_sha256"),
+    ):
+        raw = (fixture / name).read_bytes()
+        if (
+            hashlib.sha256(raw).hexdigest() != lock[part][key]
+            or len(raw) != lock[part]["byte_size"]
+        ):
+            raise RuntimeError(f"Licensed fixture bytes do not match lock: {name}")
+    # Explicit bytes and BASIC: no system font search or assumed Unicode shaping.
+    from PIL import ImageFont
+
+    font = ImageFont.truetype(
+        io.BytesIO((fixture / "Inter-Bold.ttf").read_bytes()),
+        42,
+        layout_engine=ImageFont.Layout.BASIC,
+    )
+    if font.getbbox("VideoGenie")[2] <= 0:
+        raise RuntimeError("Pillow FreeType/BASIC fixture font is unusable")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="")
@@ -314,10 +492,14 @@ def main() -> int:
     parser.add_argument("--pull-request", action="store_true")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--check-results", action="store_true")
+    parser.add_argument("--verify-runtime", action="store_true")
     parser.add_argument("--distribution-key", action="store_true")
     parser.add_argument("--verify-dist", type=Path)
     parser.add_argument("--record-dist", type=Path)
     args = parser.parse_args()
+    if args.verify_runtime:
+        verify_runtime(Path.cwd())
+        return 0
     if args.distribution_key:
         digest = distribution_input_hash(Path.cwd())
         print(digest)
