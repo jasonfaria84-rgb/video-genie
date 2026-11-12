@@ -5,6 +5,7 @@ Storage must serialize/reconstruct guarded snapshots and enforce append-only his
 model construction is neither durable immutability nor an authentication boundary.
 """
 
+import math
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
@@ -160,9 +161,90 @@ class MediaArtifact(ContractModel):
     review_state: Literal["review_candidate"] = "review_candidate"
 
 
-class RenderManifest(ContractModel):
-    """Hashable recovery manifest; its digest lives outside it, avoiding a circular hash."""
+PixelX = Annotated[int, Field(ge=0, le=1920)]
+PixelY = Annotated[int, Field(ge=0, le=1080)]
+PixelBounds = tuple[PixelX, PixelY, PixelX, PixelY]
 
+
+class RenderExecutionEvidence(ContractModel):
+    """Exact T282 worker decisions, not defaults inferred from requested content.
+
+    The source digest identifies observed runtime source bytes; it is not a
+    signed build or execution attestation. Services must copy verified worker
+    evidence and fence publication, not accept caller assertions as authority.
+    """
+
+    renderer: Literal["local-lower-third-1"]
+    videogenie_version: ShortText
+    renderer_source_sha256: Sha256
+    text_anchor: Literal["ls"]
+    entry_slide_pixels: int = Field(ge=0, le=24)
+    panel_entry_frames: int = Field(ge=1, le=30)
+    text_entry_frames: int = Field(ge=1, le=30)
+    text_delay_frames: int = Field(ge=0, le=15)
+    exit_frames: int = Field(ge=1, le=30)
+    exit_motion: Literal["fade_only"]
+    motion_curve: Literal["clamped_smoothstep"]
+    requested_color_interpretation: Literal["sRGB"]
+    alpha_interpretation: Literal["straight"]
+
+    @model_validator(mode="after")
+    def coherent_timing(self) -> Self:
+        if self.text_delay_frames >= self.panel_entry_frames:
+            raise ValueError("Text delay must precede the end of panel entry")
+        if self.text_entry_frames != self.panel_entry_frames:
+            raise ValueError("This renderer uses equal panel/text entry durations")
+        return self
+
+
+class RenderFitMetrics(ContractModel):
+    """Worker's measured font metrics; these are not decoded visible-ink boxes.
+
+    Name/role bounds are Pillow getbbox(anchor='ls') offsets added to rounded
+    left-baseline anchors, with minima floored and maxima ceiled. They include
+    font side bearings/space metrics; thresholded decoded ink may differ by a
+    pixel (as observed in peer review), without implying a universal tolerance.
+    Panel bounds are half-open raster edges: draw through right-1/bottom-1.
+    No validator invents an observed box from the configured font size.
+    Text metrics may be degenerate, including spacing glyphs in a cmap-covered
+    font; their presence does not certify visible ink or legibility.
+    """
+
+    name_font_pixels: int = Field(ge=1, le=120)
+    role_font_pixels: int = Field(ge=1, le=120)
+    name_bbox: PixelBounds
+    role_bbox: PixelBounds
+    panel_bbox: PixelBounds
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> Self:
+        for box in (self.name_bbox, self.role_bbox, self.panel_bbox):
+            if box[0] > box[2] or box[1] > box[3]:
+                raise ValueError("Pixel bounds must be ordered left/top/right/bottom")
+        if self.panel_bbox[0] == self.panel_bbox[2] or self.panel_bbox[1] == self.panel_bbox[3]:
+            raise ValueError("Panel requires nonempty raster bounds")
+        return self
+
+
+class RenderColorMetadata(ContractModel):
+    """Observed ffprobe fields; explicit null means absent, not inferred sRGB tags."""
+
+    color_range: Literal["pc"] | None
+    color_space: Literal["rgb", "gbr"] | None
+    color_transfer: Literal["iec61966-2-1"] | None
+    color_primaries: Literal["bt709"] | None
+
+
+class RenderManifest(ContractModel):
+    """V2 evidence-bearing manifest; digest covers every field/default/schema.
+
+    Explicit manifest_version separates this from the evidence-free original
+    shape. Such historical bytes must not be upgraded by filling guessed facts.
+    Common schema_version remains 1 for the surrounding contract family. Model
+    validity cannot establish actual loaded/rendered bytes or owner approval.
+    """
+
+    manifest_version: Literal["2"]
     artifact_id: Identifier
     job_id: Identifier
     attempt_id: Identifier
@@ -170,6 +252,11 @@ class RenderManifest(ContractModel):
     request: RenderLowerThirdInput
     request_sha256: Sha256
     provenance: RenderProvenance
+    execution: RenderExecutionEvidence
+    fit: RenderFitMetrics
+    color_metadata: RenderColorMetadata
+    ffprobe_version: ShortText
+    decoded_frame_sha256: Annotated[tuple[Sha256, ...], Field(min_length=150, max_length=150)]
     locator: ManagedLocator
     artifact_sha256: Sha256
     byte_size: int = Field(ge=1, le=268435456)
@@ -196,6 +283,59 @@ class RenderManifest(ContractModel):
             raise ValueError("Output format must match the pinned recipe")
         if self.byte_size > self.provenance.recipe.resources.max_artifact_bytes:
             raise ValueError("Artifact exceeds pinned recipe size bound")
+        if not self.ffprobe_version.startswith("ffprobe version "):
+            raise ValueError("Expected an observed ffprobe version string")
+        if self.provenance.brand.logo is not None:
+            raise ValueError("This renderer does not support logo output")
+        layout = self.provenance.recipe.layout
+        panel = (
+            round((layout.panel_center_x - layout.panel_width / 2) * self.output.width),
+            round((layout.panel_center_y - layout.panel_height / 2) * self.output.height),
+            round((layout.panel_center_x + layout.panel_width / 2) * self.output.width),
+            round((layout.panel_center_y + layout.panel_height / 2) * self.output.height),
+        )
+        if self.fit.panel_bbox != panel:
+            raise ValueError("Observed panel bounds contradict the pinned layout")
+        execution = self.execution
+        if (
+            execution.entry_slide_pixels != min(24, max(0, panel[0] - 96))
+            or execution.panel_entry_frames != layout.entry_frames
+            or execution.text_entry_frames != layout.entry_frames
+            or execution.text_delay_frames != layout.text_delay_frames
+            or execution.exit_frames != layout.exit_frames
+        ):
+            raise ValueError("Effective motion contradicts this renderer's pinned layout")
+        x = round(layout.text_x * self.output.width)
+        name_y = round(layout.name_y * self.output.height)
+        role_y = round(layout.role_y * self.output.height)
+        split = (name_y + role_y) // 2
+        right = panel[2] - max(1, x - panel[0])
+        brand = self.provenance.brand
+        for measured, configured, box, top, bottom in (
+            (
+                self.fit.name_font_pixels,
+                brand.name_font_pixels,
+                self.fit.name_bbox,
+                panel[1],
+                split,
+            ),
+            (
+                self.fit.role_font_pixels,
+                brand.role_font_pixels,
+                self.fit.role_bbox,
+                split + 1,
+                panel[3],
+            ),
+        ):
+            if not math.ceil(configured * layout.minimum_text_scale) <= measured <= configured:
+                raise ValueError("Measured text size exceeds the permitted fit interval")
+            if not (panel[0] <= box[0] <= box[2] <= right and top <= box[1] <= box[3] <= bottom):
+                raise ValueError("Measured text bounds exceed their separated panel region")
+        if not config.parameters.role and (
+            self.fit.role_bbox != (x, role_y, x, role_y)
+            or self.fit.role_font_pixels != brand.role_font_pixels
+        ):
+            raise ValueError("Empty role must retain the worker's empty baseline metrics")
         return self
 
 
