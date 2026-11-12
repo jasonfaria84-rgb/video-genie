@@ -95,6 +95,7 @@ EXPECTED_OPERATIONS = [
     "edit.cuts.plan",
     "edit.cuts.get",
     "captions.create",
+    "render.check",
 ]
 
 

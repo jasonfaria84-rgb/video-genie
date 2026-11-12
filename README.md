@@ -446,6 +446,45 @@ as false starts. If nothing would be left, the plan cuts nothing. The plan's
 `kept` ranges are what remains to assemble; it names the transcript and source
 SHA-256 it was made from. Rendering a plan to a new file isn't implemented yet.
 
+## Check a render before delivery
+
+`render check` inspects every cut of a finished render before anyone calls it final.
+It reads the file only (its SHA-256 is checked before and after) and uses local FFmpeg.
+Give cut positions in output time, either as `cut_points_seconds` or as the
+`cut_plan_id` of a stored cut plan, where cuts fall at the joins of its kept ranges.
+For a `media silence remove` result, the cut points are the running totals of the
+kept segments' durations, without the last one.
+
+```bash
+printf '%s' '{"rendered_path":"/absolute/talk-tight.mp4","cut_points_seconds":[1.733,3.066],"contact_sheet_path":"/absolute/talk-cuts.png"}' \
+  | videogenie render check --json --input-json -
+```
+
+Each cut gets a pass or fail with reasons:
+
+| Reason | Fails when | Default |
+| --- | --- | --- |
+| `audio_jump` | The 10 ms audio level before the cut and after it differ by more than `max_audio_jump_db`. Levels are dBFS, floored at -60 so room tone can't jump. | 20 dB |
+| `audio_click` | The largest sample step within 5 ms of the cut is more than `max_click_db` above the largest step in the surrounding 100 ms (48 kHz mono). | 12 dB |
+| `black_frame` | The frame just before or just after the cut is black: 98% of pixels at or below `black_luma_threshold`. | 0.1 |
+| `frozen_frame` | Three consecutive frames within three frames of the cut differ by less than `freeze_max_difference` (mean luma, 0-255). 0 turns this off. | 0.1 |
+
+The whole file also fails with `av_drift` when its audio and video stream durations
+differ by more than `max_av_drift_seconds` (default 0.05), or with
+`av_drift_unmeasured` when the container doesn't report them. Calibration on generated
+media: clean silence-removal cuts measure a 0 dB jump and a -40 dB click score; an
+abrupt quiet-to-loud join measured a 34 dB jump, and a same-level phase jump a 21 dB click
+score. Frames in a freeze differ by under 0.01; moving test video by 2 or more.
+
+Cut times should be within 5 ms of the real join, and frames are located assuming a
+constant frame rate starting at zero, as FFmpeg renders are. A hard cut into loud
+speech fails `audio_jump` even when it doesn't click; still slides and screen
+recordings can fail `frozen_frame`. Raise the threshold, or set it to 0 for frozen
+frames, when that is intended. `contact_sheet_path` writes a new `.png` or `.jpg` grid,
+one cell per cut: the frame before the cut on the left, after it on the right, failed
+cuts labelled in red. Existing files are never overwritten. Up to 2,000 cuts are checked
+per call.
+
 ## Check DaVinci Resolve
 
 `resolve status` reports whether DaVinci Resolve Studio is open and scriptable,

@@ -80,6 +80,7 @@ KNOWN_TESTS = {
     "tests/test_resolve.py",
     "tests/test_resolve_render.py",
     "tests/test_silence.py",
+    "tests/test_render_check.py",
     "tests/test_render_contracts.py",
     "tests/test_render_jobs.py",
     "tests/test_render_plan.py",
@@ -107,6 +108,7 @@ TRANSPORT_TESTS = {
     "tests/test_color.py",
     "tests/test_cut_planning.py",
     "tests/test_captions.py",
+    "tests/test_render_check.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -241,6 +243,7 @@ PATH_TESTS = {
     "src/videogenie/core/captions.py": {"tests/test_captions.py"},
     # Docstrings and fields are the published CLI/MCP schema.
     "src/videogenie/contracts/captions.py": TRANSPORT_TESTS,
+    "src/videogenie/workers/render_check.py": {"tests/test_render_check.py"},
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",
         "tests/test_external_install.py",

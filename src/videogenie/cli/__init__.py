@@ -58,6 +58,7 @@ from videogenie.contracts.recipes import (
     UpdateBrandDraftInput,
     UpdateRecipeDraftInput,
 )
+from videogenie.contracts.render_check import CheckRenderInput
 from videogenie.contracts.rendering import (
     ArtifactInput,
     BindRenderConfigInput,
@@ -90,6 +91,7 @@ from videogenie.contracts.transcripts import (
     Transcript,
     TranscriptInput,
 )
+from videogenie.core import transcripts
 from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
 from videogenie.core.assembly import assemble_timeline
@@ -109,6 +111,7 @@ from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
 from videogenie.workers.captions import create_captions
+from videogenie.workers.render_check import check_render
 from videogenie.workers.silence import detect_silence, remove_silence
 
 EXIT_CODES = {
@@ -246,6 +249,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "edit.cuts.plan": PlanCutsInput,
     "edit.cuts.get": GetCutPlanInput,
     "captions.create": CreateCaptionsInput,
+    "render.check": CheckRenderInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -320,9 +324,11 @@ def _anchor(payload: dict[str, JsonValue], fields: tuple[str, ...]) -> dict[str,
     return anchored
 
 
-def _strict_json(payload: dict[str, JsonValue]) -> str:
+def _strict_json(
+    payload: dict[str, JsonValue], fields: tuple[str, ...] = ("source_path", "output_path")
+) -> str:
     """Validate through JSON so numbers stay numbers and paths are anchored like assets."""
-    anchored = _anchor(payload, ("source_path", "output_path"))
+    anchored = _anchor(payload, fields)
     burn_in = anchored.get("burn_in")
     if isinstance(burn_in, dict):
         anchored["burn_in"] = _anchor(burn_in, ("video_path", "output_path"))
@@ -492,6 +498,7 @@ def _dispatch(
                 "edit.cuts.plan",
                 "edit.cuts.get",
                 "captions.create",
+                "render.check",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -554,6 +561,16 @@ def _dispatch(
     if operation == "captions.create":
         captions = CreateCaptionsInput.model_validate_json(_strict_json(payload))
         return create_captions(service, captions)
+    if operation == "render.check":
+        render = CheckRenderInput.model_validate_json(
+            _strict_json(payload, ("rendered_path", "contact_sheet_path"))
+        )
+        plan = (
+            None
+            if render.cut_plan_id is None
+            else transcripts.load(service, CutPlan, render.cut_plan_id)
+        )
+        return check_render(render, plan)
     if operation in {"media.silence.detect", "media.silence.remove"}:
         if operation == "media.silence.detect":
             return detect_silence(DetectSilenceInput.model_validate_json(_strict_json(payload)))
@@ -642,8 +659,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="videogenie",
         add_help=False,
         description="Video Genie — agentic multicam video production.",
-        epilog="Project/client lifecycle, local recipes, previews, authorized renders and "
-        "dead-space removal (media silence detect/remove) are available. "
+        epilog="Project/client lifecycle, local recipes, previews, authorized renders, "
+        "dead-space removal (media silence detect/remove) and render checks (render check) "
+        "are available. "
         "Full editorial production "
         "commands are not implemented yet. Pass operation fields via --input-json -.",
     )
@@ -657,9 +675,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "action",
         nargs="?",
-        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts",
+        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts/check/...",
     )
-    parser.add_argument("detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan")
+    parser.add_argument(
+        "detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan/assemble/apply"
+    )
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")
     parser.add_argument("--json", action="store_true", help="Emit the versioned JSON envelope")
