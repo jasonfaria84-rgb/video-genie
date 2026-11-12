@@ -176,6 +176,9 @@ jobs:
           fi
           ffmpeg -version
           ffprobe -version
+      - name: Require real render and owner-verifier dependencies
+        if: needs.select.outputs.mode != 'metadata'
+        run: .venv/bin/python scripts/ci_scope.py --verify-runtime
       - name: Verify installed package outside checkout
         shell: bash
         run: |

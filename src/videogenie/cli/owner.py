@@ -41,7 +41,8 @@ Stdout emits one JSON ready envelope without the launch token or recovery secret
 Serve/review do not enroll or approve. Enrollment requires explicit terminal supervision;
 recovery reads only from the controlling terminal without echo. Every domain action still
 requires fresh browser user verification. Same-account arbitrary code is outside this boundary.
-No actual final-output approval endpoint is supplied yet.
+The browser console reviews actual published output; approving or requesting changes
+requires fresh owner passkey verification. Selecting an approved output is a separate action.
 """
 
 
