@@ -52,7 +52,13 @@ def test_page_exact_csp_and_secret_free_resources(console: OwnerConsole) -> None
     for view in ("publication", "budget", "output"):
         assert f'id="{view}"' in page
     assert "userVerification:'required'" in page
-    assert "Final approval — not available" in page
+    assert '<option value="">Choose a decision…</option>' in page
+    assert '<option value="approved">Approve output</option>' in page
+    assert '<option value="changes_requested">Request changes</option>' in page
+    assert (
+        '<button id="confirm-output" class="primary" disabled>'
+        "Confirm output decision with passkey</button>"
+    ) in page
     assert "https://" not in page
     assert "<video" not in page and "output-candidate" in page
     assert 'id="project-id"' not in page
