@@ -594,7 +594,15 @@ printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"},{"cut_plan
 ```
 
 The timeline uses the first take's frame rate and resolution, and every take must
-share that frame rate. `fade_frames` (default 1, the shortest fade Resolve allows)
+share that frame rate. Resolve accepts fractional rates such as 23.976 or 29.97 only
+as a project setting, so VideoGenie first sets its own `VideoGenie <project ID>`
+project's default frame rate to the footage rate; the new timeline inherits it.
+The reported `frame_rate` is read back from the timeline, and a rate that doesn't
+stick is an error. Resolve timelines are at least 256 pixels on each side, so
+smaller footage (such as 320x180) gets a larger frame and renders letterboxed. The
+result's `width` and `height` are read back from Resolve, next to the footage's
+`source_width` and `source_height`, and `resolution_warning` explains any
+difference. `fade_frames` (default 1, the shortest fade Resolve allows)
 adds audio fades at each join. `timeline_name` must be new; existing timelines are
 never edited. The result reports the timeline's ID, length in frames and seconds,
 and `cut_points_seconds`, the output times of every join, which `render.check`-style

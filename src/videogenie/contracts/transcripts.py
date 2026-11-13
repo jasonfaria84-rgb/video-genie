@@ -184,6 +184,10 @@ class AssembleTimelineInput(ContractModel):
 class AssembledTimeline(ContractModel):
     """The created timeline and where its cuts land, for rendering and checking.
 
+    width and height are the timeline size read back from Resolve. Resolve timelines are at
+    least 256 pixels on each side, so smaller footage gets a larger frame: then
+    resolution_warning says so and renders are letterboxed or scaled. source_width and
+    source_height are the first take's size, or null when Resolve doesn't report it.
     subtitle_cue_count and subtitles_sha256 describe the placed SRT, or are null without one.
     """
 
@@ -198,6 +202,11 @@ class AssembledTimeline(ContractModel):
     segment_count: int = Field(ge=0)
     cut_points_seconds: tuple[Seconds, ...]
     cut_plan_ids: tuple[Identifier, ...]
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    source_width: int | None = Field(default=None, gt=0)
+    source_height: int | None = Field(default=None, gt=0)
+    resolution_warning: str | None = None
     subtitle_cue_count: int | None = Field(default=None, ge=1)
     subtitles_sha256: Sha256 | None = None
 

@@ -386,6 +386,8 @@ def test_resolve_backend_records_the_timeline(
             segment_count=len(frames),
             cut_points_seconds=(1.0, 2.0),
             cut_plan_ids=tuple(plan.plan_id for plan in plans),
+            width=1920,
+            height=1080,
         )
 
     def color(service: VideoGenieService, request: Any) -> AppliedColor:

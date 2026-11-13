@@ -115,10 +115,96 @@ def _timeline_names(project: Any) -> set[str]:
     return names
 
 
+Size = tuple[int, int]
+
+
+def parse_resolution(value: object) -> Size | None:
+    """Resolve's clip "Resolution" property, such as "1920x1080", as (width, height)."""
+    width, _, height = str(value or "").partition("x")
+    if width.isdecimal() and height.isdecimal() and int(width) > 0 and int(height) > 0:
+        return int(width), int(height)
+    return None
+
+
+def resolution_warning(source: Size | None, actual: Size) -> str | None:
+    """Explain when the timeline frame differs from the footage, so nobody assumes a match."""
+    if source is None:
+        return f"The footage resolution is unknown; the timeline is {actual[0]}x{actual[1]}"
+    if source == actual:
+        return None
+    return (
+        f"Resolve made the timeline {actual[0]}x{actual[1]}, not the footage's "
+        f"{source[0]}x{source[1]} (Resolve timelines are at least 256 pixels on each side), "
+        "so renders are letterboxed or scaled"
+    )
+
+
+def read_rate(value: object) -> float:
+    """A frame rate setting such as 23.976, "29.97" or "24 DF" as a number, or 0 if unreadable."""
+    try:
+        return float(str(value or "0").split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _project_rate(project: Any, fps: float) -> None:
+    """Make the project's default rate the footage rate before creating the timeline.
+
+    Resolve 21.1 refuses fractional rates such as 23.976 on a timeline's own settings but
+    accepts them on the project, and new timelines inherit the project rate. This only ever
+    changes VideoGenie's own "VideoGenie <project ID>" Resolve project.
+    """
+    if abs(read_rate(project.GetSetting("timelineFrameRate")) - fps) <= 0.01:
+        return
+    if not project.SetSetting("timelineFrameRate", f"{fps:g}"):
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Resolve refused the footage frame rate for the project",
+            details={"footage_fps": fps},
+        )
+
+
+def _apply_format(timeline: Any, fps: float, source: Size | None) -> tuple[float, Size]:
+    """Set custom frame rate and size in the order Resolve needs, then read back what stuck.
+
+    Resolution settings are refused until useCustomSettings is on, and Resolve silently raises
+    each side to at least 256 pixels while still reporting success, so only read-back is trusted.
+    """
+    if not timeline.SetSetting("useCustomSettings", "1"):
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve refused custom settings for the new timeline"
+        )
+    if abs(read_rate(timeline.GetSetting("timelineFrameRate")) - fps) > 0.01:
+        timeline.SetSetting("timelineFrameRate", f"{fps:g}")
+    actual_fps = read_rate(timeline.GetSetting("timelineFrameRate"))
+    if abs(actual_fps - fps) > 0.01:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Resolve did not keep the footage frame rate on the new timeline",
+            details={"footage_fps": fps, "timeline_fps": actual_fps},
+        )
+    if source is not None:
+        timeline.SetSetting("timelineResolutionWidth", str(source[0]))
+        timeline.SetSetting("timelineResolutionHeight", str(source[1]))
+    actual = parse_resolution(
+        f"{timeline.GetSetting('timelineResolutionWidth')}"
+        f"x{timeline.GetSetting('timelineResolutionHeight')}"
+    )
+    if actual is None:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve did not report the new timeline's resolution"
+        )
+    return actual_fps, actual
+
+
 def assemble_timeline(
     service: VideoGenieService, request: AssembleTimelineInput
 ) -> AssembledTimeline:
-    """Create a new timeline; refuse stale sources, mixed frame rates and name reuse."""
+    """Create a new timeline; refuse stale sources, mixed frame rates and name reuse.
+
+    The project's default frame rate is set to the footage rate first, because Resolve only
+    accepts fractional rates such as 23.976 there; the timeline then inherits it.
+    """
     deadline = time.monotonic() + request.timeout_seconds
     service.get_project(request.project_id)
     takes: list[tuple[CutPlan, Transcript]] = []
@@ -177,19 +263,15 @@ def assemble_timeline(
         raise VideoGenieError(
             "INVALID_ARGUMENT", "A timeline with this name exists; choose a new name"
         )
+    _project_rate(project, fps)
     timeline = pool.CreateEmptyTimeline(name)
     if timeline is None:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not create the timeline")
     project.SetCurrentTimeline(timeline)
-    timeline.SetSetting("useCustomSettings", "1")
-    timeline.SetSetting("timelineFrameRate", f"{fps:g}")
-    resolution = str(clips[0].GetClipProperty("Resolution") or "")
-    width, _, height = resolution.partition("x")
-    if width.isdecimal() and height.isdecimal():
-        timeline.SetSetting("timelineResolutionWidth", width)
-        timeline.SetSetting("timelineResolutionHeight", height)
+    source = parse_resolution(clips[0].GetClipProperty("Resolution"))
+    timeline_fps, size = _apply_format(timeline, fps, source)
     if subtitles is not None:
-        _place_subtitles(pool, timeline, subtitles, fps, infos)
+        _place_subtitles(pool, timeline, subtitles, timeline_fps, infos)
     appended = pool.AppendToTimeline(infos) or []
     if not appended:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not append the takes")
@@ -224,13 +306,18 @@ def assemble_timeline(
         resolve_project=resolve.project_name(request.project_id),
         timeline_name=name,
         timeline_id=str(timeline.GetUniqueId()),
-        frame_rate=fps,
+        frame_rate=timeline_fps,
         start_timecode=str(timeline.GetStartTimecode()),
         duration_frames=duration,
         duration_seconds=round(duration / fps, 3),
         segment_count=len(infos),
         cut_points_seconds=tuple(points),
         cut_plan_ids=tuple(plan.plan_id for plan, _ in takes),
+        width=size[0],
+        height=size[1],
+        source_width=source[0] if source else None,
+        source_height=source[1] if source else None,
+        resolution_warning=resolution_warning(source, size),
         subtitle_cue_count=None if subtitles is None else len(subtitles[2]),
         subtitles_sha256=None if subtitles is None else subtitles[1].sha256,
     )
