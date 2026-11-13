@@ -10,7 +10,7 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 77 shared agent operations: projects and clients, cycles and
+This source exposes 78 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests and output selection, plus an editing toolkit:
@@ -257,7 +257,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 77 agent operations. Replace spaces in each CLI command
+The server exposes the same 78 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -791,7 +791,8 @@ assemble, so it needs `ffmpeg` or `assemble` skipped too. Without `plan_cuts`, w
 takes are used. Without `assemble`, nothing after it runs. Without `render`, there's
 no `check`, and `burn` is skipped while the SRT is still written.
 
-The result is the stored workflow record: `status` (`running`, `done` or `failed`),
+The result is the stored workflow record: `status` (`running`, `done`, `failed`,
+`needs_review` or `rejected`),
 the takes, the request, each step's `status`, `attempts`, times, `result` (IDs, paths
 and measurements) or `error`, and `links`: `transcript_ids`, `cut_plan_ids`,
 `timeline_name`, `render_path`, `captions_path`, `captioned_video_path` and `review`
@@ -799,6 +800,20 @@ and measurements) or `error`, and `links`: `transcript_ids`, `cut_plan_ids`,
 step doesn't fail the call: the envelope succeeds, `status` is `failed`, and that step
 holds the error code and message. Invalid requests still fail before anything runs.
 Records live under the data directory in `workflows/`.
+
+Only `done` means the output is final. When every step finished but the check found a
+bad cut, `status` is `needs_review` and `links.review` says which cuts failed and why.
+Look at them (the contact sheet shows every cut), then decide with `workflow review`:
+
+```bash
+printf '%s' '{"project_id":"<uuid>","workflow_id":"<uuid>","decision":"approve","note":"Cut 4 click is room tone; acceptable"}' \
+  | videogenie workflow review --json --input-json -
+```
+
+`approve` sets `status` to `done`; `reject` sets it to `rejected`, and the output is never
+reported as final (start a new workflow to redo it). The note is required and is stored
+in the record's `decision` with the time. Only a `needs_review` workflow can be decided,
+once; resuming it changes nothing, and no file is changed or deleted.
 
 To resume, fix the cause and call `workflow run` again with `project_id` and
 `resume_workflow_id`. The run continues at the first unfinished step; finished steps,

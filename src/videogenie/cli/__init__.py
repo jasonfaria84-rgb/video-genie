@@ -92,7 +92,7 @@ from videogenie.contracts.transcripts import (
     Transcript,
     TranscriptInput,
 )
-from videogenie.contracts.workflow import GetWorkflowInput, RunWorkflowInput
+from videogenie.contracts.workflow import GetWorkflowInput, ReviewWorkflowInput, RunWorkflowInput
 from videogenie.core import transcripts
 from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
@@ -113,7 +113,7 @@ from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
-from videogenie.core.workflow import get_workflow, run_workflow
+from videogenie.core.workflow import get_workflow, review_workflow, run_workflow
 from videogenie.workers.captions import create_captions
 from videogenie.workers.overlay_renderers import detect_renderers
 from videogenie.workers.render_check import check_render
@@ -259,6 +259,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "overlay.place": PlaceOverlayInput,
     "workflow.run": RunWorkflowInput,
     "workflow.get": GetWorkflowInput,
+    "workflow.review": ReviewWorkflowInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -512,6 +513,7 @@ def _dispatch(
                 "overlay.place",
                 "workflow.run",
                 "workflow.get",
+                "workflow.review",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -560,6 +562,10 @@ def _dispatch(
         )
     if operation == "workflow.get":
         return get_workflow(service, GetWorkflowInput.model_validate_json(_strict_json(payload)))
+    if operation == "workflow.review":
+        return review_workflow(
+            service, ReviewWorkflowInput.model_validate_json(_strict_json(payload))
+        )
     if operation == "overlay.renderers":
         wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
         return detect_renderers(wanted_renderers.timeout_seconds)

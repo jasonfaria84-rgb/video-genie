@@ -100,6 +100,7 @@ EXPECTED_OPERATIONS = [
     "overlay.place",
     "workflow.run",
     "workflow.get",
+    "workflow.review",
 ]
 
 
