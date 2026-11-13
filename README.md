@@ -705,14 +705,16 @@ and `resolve render` do. With `ffmpeg`, they happen locally in one FFmpeg render
 kept ranges are trimmed to whole frames, joins get a 30 ms audio fade, and the
 output is H.264 (CRF 18) with AAC audio. There is no timeline, so `timeline_name`
 stays null. Both backends grade with the same CDL values; FFmpeg applies them with
-`lutrgb` per channel and saturation with `hue`. Takes with a different picture size
-or frame rate from the first are scaled, padded and retimed to match it.
+`lutrgb` per channel and saturation with `hue`. The output takes its picture size and
+frame rate from the first take that keeps anything. Every take is retimed to that
+frame rate before trimming, so variable frame rate footage stays in sync, and takes
+of another size are scaled and padded to fit.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `folder` | required | Folder holding the takes. |
 | `files` | all media | File names inside `folder`, in edit order. Without it, every `.mp4` `.mov` `.m4v` `.mxf` `.wav` `.m4a` file directly in the folder is used, sorted by name (up to 200). Names can't contain path separators. |
-| `output_path` | required | A new `.mp4` or `.mov`. The SRT (`<name>.srt`), contact sheet (`<name>-cuts.png`) and burned-in copy (`<name>-captioned.mp4`) go beside it. None of these may exist yet. |
+| `output_path` | required | A new `.mp4` or `.mov`. The SRT (`<name>.srt`), contact sheet (`<name>-cuts.png`) and burned-in copy (`<name>-captioned` with the output's `.mp4` or `.mov`) go beside it. None of these may exist yet. |
 | `backend` | `resolve` | `resolve` or `ffmpeg`, for assemble, color and render. |
 | `transcribe` | whisper | `engine` (`whisper` or `resolve`), `language`, `whisper_model`, as in `transcript create`. |
 | `cuts` | plan defaults | The `edit cuts plan` settings: `filler_words`, `remove_false_starts`, `cut_sounds`, `max_filler_seconds`, `min_pause_seconds`, `padding_seconds`. |
@@ -745,11 +747,16 @@ and takes already transcribed or planned, aren't repeated. Omit the other fields
 repeat them unchanged; only `timeout_seconds` and `allow_switch` may change. A finished
 workflow is returned as it is. Only one call can run a workflow at a time; another
 gets `LEASE_HELD`. A `running` step in a stored record was interrupted (or is still
-running elsewhere) and runs again on resume. If the interrupted step had already
-published its file, remove that file before resuming.
+running elsewhere) and runs again on resume. A local FFmpeg render that was published
+just before an interruption is kept when its SHA-256 matches the digest recorded
+before publishing. Other files an interrupted step already wrote (a Resolve render,
+the SRT, the burned-in copy, the contact sheet) must be removed before resuming.
+Captions and check refuse with `INPUT_CHANGED` if the render changed since the
+render step.
 
 Burning in captions needs an FFmpeg with libass. Without it the captions step fails
-with `DEPENDENCY_UNAVAILABLE` and its SRT isn't kept. MCP paths must be absolute; CLI
+with `DEPENDENCY_UNAVAILABLE` and its SRT isn't kept. Audio-only takes skip grading
+and burn-in, and the record says why. MCP paths must be absolute; CLI
 paths may be relative to the current folder.
 
 ## Recover a probe job
