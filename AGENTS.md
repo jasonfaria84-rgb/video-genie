@@ -19,8 +19,8 @@ one), `resolve.render` (private render, verified, published without overwriting)
 version; LUTs only from Resolve's library), `edit.cuts.plan`/`get` (fillers, false
 starts and pauses from a transcript), `captions.create` (SRT, optional FFmpeg
 burn-in that needs libass), `render.check` (per-cut review and contact sheet), and
-`overlay.renderers`/`overlay.place` (renderer detection; alpha .mov or .png placed above
-the footage without overlapping existing items).
+`overlay.renderers`/`overlay.place` (renderer detection; alpha .mov, .png or Fusion .comp
+on a transparent carrier, placed above the footage without overlapping existing items).
 Resolve work happens only in Resolve projects named
 `VideoGenie <project ID>`; never switch away from a person's open project unless
 the request explicitly allows it. General editing/templates, paid provider

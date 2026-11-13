@@ -656,9 +656,14 @@ printf '{}' | videogenie overlay renderers --json --input-json -
 
 `overlay place` puts an existing overlay file on a named timeline in the
 project's own Resolve project: a `.mov` with alpha (such as the lower third's
-QuickTime Animation file) or a `.png` still. The file is imported into the media
-pool once and reused after that. Fusion `.comp` files aren't supported yet and
-return `DEPENDENCY_UNAVAILABLE`.
+QuickTime Animation file), a `.png` still, or a Fusion composition (`.comp`, up
+to 16 MiB). The file is imported into the media pool once and reused after that.
+A `.comp` goes on a fully transparent carrier clip that VideoGenie makes with
+FFmpeg at the timeline's size and frame rate (kept in the data directory under
+`overlay-carriers/`), and the composition is attached to that clip so Fusion
+draws it over the footage. Resolve evaluates the composition just as it would
+if you imported it yourself, so pass only compositions you trust. The result's
+`fusion_comp_name` names the active composition on the new item.
 
 ```bash
 printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","source_path":"/absolute/lower-third.mov","start_seconds":2,"duration_seconds":5}' \
