@@ -626,10 +626,13 @@ printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"}],"subtitle
 VideoGenie adds the subtitles while the new timeline is still empty, reads every cue
 back, and checks that each one starts within one frame of its SRT time. Then it places
 the takes from the timeline start. A cue that ends after the assembled length is
-refused before Resolve is touched. If Resolve places the cues anywhere else, the new
-timeline is deleted, so you can retry with the same name. The result adds
-`subtitle_cue_count` and `subtitles_sha256`; both are null without subtitles.
-VideoGenie can't check that the SRT text matches the takes.
+refused before Resolve is touched. If Resolve places the cues anywhere else, or any
+later step fails, the new timeline is deleted, so you can retry with the same name.
+Resolve keeps an imported SRT's cues in its media pool, so VideoGenie imports a private
+copy named by the file's SHA-256 (`subtitles/<sha256>.srt` in the data directory):
+an edited SRT always gets a fresh import. The result adds `subtitle_cue_count` and
+`subtitles_sha256`; both are null without subtitles. VideoGenie can't check that the
+SRT text matches the takes.
 
 Resolve 21.1's scripting API can't put SRT cues at their own times on a timeline
 that already has clips: it places them after the timeline's end. For an existing or

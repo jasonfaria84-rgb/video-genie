@@ -561,6 +561,53 @@ def test_misplaced_subtitles_remove_the_new_timeline(fake_project: Project, tmp_
     assert isinstance(result, AssembledTimeline) and result.timeline_name == "Captioned"
 
 
+def test_failed_assembly_removes_its_timeline_so_the_name_can_be_reused(
+    fake_project: Project,
+    fake_resolve: dict[str, Clip],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Timeline, "refuse_custom", True)
+    with pytest.raises(VideoGenieError, match="custom settings"):
+        assemble_one(fake_resolve, tmp_path, "1920x1080")
+    assert fake_project.pool.timelines == [] and fake_project.pool.deleted == ["take.wav"]
+    monkeypatch.setattr(Timeline, "refuse_custom", False)
+    with monkeypatch.context() as patch:
+        patch.setattr(Pool, "AppendToTimeline", lambda self, infos: [])
+        with pytest.raises(VideoGenieError, match="could not append"):
+            assemble_one(fake_resolve, tmp_path, "1920x1080")
+    assert fake_project.pool.timelines == []
+    result = assemble_one(fake_resolve, tmp_path, "1920x1080")
+    assert isinstance(result, AssembledTimeline) and result.timeline_name == "take.wav"
+
+
+def test_edited_subtitles_get_a_new_pool_item(fake_project: Project, tmp_path: Path) -> None:
+    service = VideoGenieService(tmp_path / "state")
+    request, srt = subtitled(service, tmp_path, fake_project.pool.clips)
+    first = _dispatch(service, "resolve.timeline.assemble", request)
+    assert isinstance(first, AssembledTimeline)
+    copies = service.data_dir / "subtitles"
+    original = copies / f"{first.subtitles_sha256}.srt"
+    assert original.read_bytes() == srt.read_bytes()
+    again = _dispatch(service, "resolve.timeline.assemble", request | {"timeline_name": "Again"})
+    assert isinstance(again, AssembledTimeline)
+    assert again.subtitles_sha256 == first.subtitles_sha256
+    srt.write_text(SRT.replace("HELLO", "HULLO"))  # same times, new text
+    edited = _dispatch(service, "resolve.timeline.assemble", request | {"timeline_name": "Edited"})
+    assert isinstance(edited, AssembledTimeline)
+    assert edited.subtitles_sha256 == fingerprint(srt).sha256 != first.subtitles_sha256
+    subtitle_items = [c.path for c in fake_project.pool.clips.values() if c.kind == "Subtitle"]
+    assert subtitle_items == [str(original), str(copies / f"{edited.subtitles_sha256}.srt")]
+    assert all(Path(path).parent == copies for path in subtitle_items)
+    original.write_text("damaged")  # a damaged private copy is rewritten, never trusted
+    srt.write_text(SRT)
+    _dispatch(service, "resolve.timeline.assemble", request | {"timeline_name": "Restored"})
+    assert original.read_bytes() == SRT.encode()
+    assert sorted(p.name for p in copies.iterdir()) == sorted(
+        [original.name, f"{edited.subtitles_sha256}.srt"]
+    )
+
+
 @pytest.mark.skipif(
     os.environ.get("VIDEOGENIE_LIVE_RESOLVE") != "1" or sys.platform != "darwin",
     reason="set VIDEOGENIE_LIVE_RESOLVE=1 on macOS with Resolve Studio open to run",
