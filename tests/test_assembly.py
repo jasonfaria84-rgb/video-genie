@@ -1,5 +1,6 @@
 """Resolve timeline assembly from cut plans with fake Resolve objects, plus a live check."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -92,12 +93,12 @@ class Item:
 class Timeline:
     refuse_custom = False
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, project_rate: float = 24.0) -> None:
         self.name, self.frames = name, 0
         self.settings_log: dict[str, str] = {}
         self.settings: dict[str, Any] = {
             "useCustomSettings": "0",
-            "timelineFrameRate": 24.0,
+            "timelineFrameRate": project_rate,
             "timelineResolutionWidth": "1920",
             "timelineResolutionHeight": "1080",
         }
@@ -114,6 +115,8 @@ class Timeline:
             if self.settings["useCustomSettings"] != "1":
                 return False
             value = str(max(256, int(value)))
+        if key == "timelineFrameRate" and float(value) != int(float(value)):
+            return False  # Resolve 21.1 refuses fractional rates on a timeline
         self.settings[key] = float(value) if key == "timelineFrameRate" else value
         return True
 
@@ -146,6 +149,7 @@ class Pool:
         self.clips = clips
         self.timelines: list[Timeline] = []
         self.items: list[Item] = []
+        self.project_rate = 24.0
 
     def GetRootFolder(self) -> Any:  # noqa: N802
         clips = list(self.clips.values())
@@ -155,7 +159,7 @@ class Pool:
         return [self.clips[paths[0]]]
 
     def CreateEmptyTimeline(self, name: str) -> Timeline:  # noqa: N802
-        self.timelines.append(Timeline(name))
+        self.timelines.append(Timeline(name, self.project_rate))
         return self.timelines[-1]
 
     def AppendToTimeline(self, infos: list[dict[str, Any]]) -> list[Item]:  # noqa: N802
@@ -171,6 +175,17 @@ class Pool:
 class Project:
     def __init__(self, pool: Pool) -> None:
         self.pool = pool
+        self.rate_changes: list[str] = []
+
+    def GetSetting(self, key: str) -> Any:  # noqa: N802
+        assert key == "timelineFrameRate"
+        return self.pool.project_rate
+
+    def SetSetting(self, key: str, value: str) -> bool:  # noqa: N802
+        assert key == "timelineFrameRate"
+        self.rate_changes.append(value)
+        self.pool.project_rate = float(value)
+        return True
 
     def GetMediaPool(self) -> Pool:  # noqa: N802
         return self.pool
@@ -185,10 +200,14 @@ class Project:
         return True
 
 
+FAKES: dict[str, Any] = {}
+
+
 @pytest.fixture
 def fake_resolve(monkeypatch: pytest.MonkeyPatch) -> dict[str, Clip]:
     clips: dict[str, Clip] = {}
     project = Project(Pool(clips))
+    FAKES["project"] = project
     monkeypatch.setattr(resolve, "connect", lambda timeout: object())
     monkeypatch.setattr(resolve, "open_project", lambda app, pid, allow_switch: project)
     return clips
@@ -240,12 +259,16 @@ def test_assembles_two_takes_with_fades(fake_resolve: dict[str, Clip], tmp_path:
 
 
 def assemble_one(
-    fake_resolve: dict[str, Clip], tmp_path: Path, resolution: str | None, name: str = "take.wav"
+    fake_resolve: dict[str, Clip],
+    tmp_path: Path,
+    resolution: str | None,
+    name: str = "take.wav",
+    fps: float = 30.0,
 ) -> Any:
     service = VideoGenieService(tmp_path / "state")
     project_id = service.create_project("Edit", "edit").project_id
     source = make_audio(tmp_path / name)
-    fake_resolve[str(source.resolve())] = Clip(str(source.resolve()), resolution=resolution)
+    fake_resolve[str(source.resolve())] = Clip(str(source.resolve()), fps, resolution)
     plan_id = stored_plan(service, source, [(0.0, 1.0)])
     return _dispatch(
         service,
@@ -303,6 +326,37 @@ def test_refused_custom_settings_or_rate_fail(
     with pytest.raises(VideoGenieError, match="frame rate") as caught:
         assemble_one(fake_resolve, tmp_path, "1920x1080", "other.wav")
     assert caught.value.details == {"footage_fps": 30.0, "timeline_fps": 24.0}
+
+
+@pytest.mark.parametrize("fps", [23.976, 29.97, 25.0])
+def test_fractional_rates_go_through_the_project(
+    fake_resolve: dict[str, Clip], tmp_path: Path, fps: float
+) -> None:
+    project = FAKES["project"]
+    result = assemble_one(fake_resolve, tmp_path, "1920x1080", fps=fps)
+    assert isinstance(result, AssembledTimeline)
+    assert result.frame_rate == pytest.approx(fps)
+    assert project.rate_changes == [f"{fps:g}"]
+    again = assemble_one(fake_resolve, tmp_path, "1920x1080", "second.wav", fps=fps)
+    assert again.frame_rate == pytest.approx(fps) and len(project.rate_changes) == 1
+
+
+def test_project_already_at_rate_is_left_alone(
+    fake_resolve: dict[str, Clip], tmp_path: Path
+) -> None:
+    project = FAKES["project"]
+    project.pool.project_rate = 30.0
+    result = assemble_one(fake_resolve, tmp_path, "1920x1080")
+    assert result.frame_rate == 30.0 and project.rate_changes == []
+
+
+def test_fractional_rate_without_project_change_is_reported(
+    fake_resolve: dict[str, Clip], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Project, "SetSetting", lambda self, key, value: False)
+    with pytest.raises(VideoGenieError, match="refused the footage frame rate") as caught:
+        assemble_one(fake_resolve, tmp_path, "1920x1080", fps=23.976)
+    assert caught.value.code == "DEPENDENCY_UNAVAILABLE"
 
 
 def test_changed_source_is_refused(fake_resolve: dict[str, Clip], tmp_path: Path) -> None:
@@ -365,3 +419,57 @@ def test_live_assembly(tmp_path: Path, size: str, expected: tuple[int, int]) -> 
     assert (result.width, result.height) == expected
     assert f"{result.source_width}x{result.source_height}" == size
     assert (result.resolution_warning is not None) is (expected != parse_resolution(size))
+
+
+@pytest.mark.skipif(
+    os.environ.get("VIDEOGENIE_LIVE_RESOLVE") != "1" or sys.platform != "darwin",
+    reason="set VIDEOGENIE_LIVE_RESOLVE=1 on macOS with Resolve Studio open to run",
+)
+def test_live_23976_assembles_and_renders_at_footage_rate(tmp_path: Path) -> None:
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    assert ffmpeg is not None and ffprobe is not None
+    source = tmp_path / "ntsc-film.mov"
+    subprocess.run(
+        [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24000/1001:d=3"]
+        + ["-f", "lavfi", "-i", "sine=f=300:d=3", "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+        + ["-c:a", "aac", "-shortest", str(source)],
+        check=True,
+        timeout=60,
+    )
+    service = VideoGenieService(tmp_path / "state")
+    project_id = service.create_project("Live 23.976", "live").project_id
+    plan_id = stored_plan(service, source, [(0.0, 1.0), (2.0, 3.0)])
+    result = _dispatch(
+        service,
+        "resolve.timeline.assemble",
+        {
+            "project_id": project_id,
+            "takes": [{"cut_plan_id": plan_id}],
+            "timeline_name": "Film rate",
+            "allow_switch": True,
+        },
+    )
+    assert isinstance(result, AssembledTimeline)
+    assert result.frame_rate == pytest.approx(23.976, abs=0.001)
+    output = tmp_path / "film-rate.mp4"
+    _dispatch(
+        service,
+        "resolve.render",
+        {
+            "project_id": project_id,
+            "timeline_name": "Film rate",
+            "output_path": str(output),
+            "allow_switch": True,
+            "timeout_seconds": 600,
+        },
+    )
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v", "-count_frames"]
+        + ["-show_entries", "stream=r_frame_rate,nb_read_frames", "-of", "json", str(output)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["r_frame_rate"] == "24000/1001"
+    assert abs(int(stream["nb_read_frames"]) - result.duration_frames) <= 2

@@ -66,7 +66,32 @@ def resolution_warning(source: Size | None, actual: Size) -> str | None:
     )
 
 
-def _apply_format(timeline: Any, fps: float, source: Size | None) -> Size:
+def read_rate(value: object) -> float:
+    """A frame rate setting such as 23.976, "29.97" or "24 DF" as a number, or 0 if unreadable."""
+    try:
+        return float(str(value or "0").split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _project_rate(project: Any, fps: float) -> None:
+    """Make the project's default rate the footage rate before creating the timeline.
+
+    Resolve 21.1 refuses fractional rates such as 23.976 on a timeline's own settings but
+    accepts them on the project, and new timelines inherit the project rate. This only ever
+    changes VideoGenie's own "VideoGenie <project ID>" Resolve project.
+    """
+    if abs(read_rate(project.GetSetting("timelineFrameRate")) - fps) <= 0.01:
+        return
+    if not project.SetSetting("timelineFrameRate", f"{fps:g}"):
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Resolve refused the footage frame rate for the project",
+            details={"footage_fps": fps},
+        )
+
+
+def _apply_format(timeline: Any, fps: float, source: Size | None) -> tuple[float, Size]:
     """Set custom frame rate and size in the order Resolve needs, then read back what stuck.
 
     Resolution settings are refused until useCustomSettings is on, and Resolve silently raises
@@ -76,11 +101,9 @@ def _apply_format(timeline: Any, fps: float, source: Size | None) -> Size:
         raise VideoGenieError(
             "DEPENDENCY_UNAVAILABLE", "Resolve refused custom settings for the new timeline"
         )
-    timeline.SetSetting("timelineFrameRate", f"{fps:g}")
-    try:
-        actual_fps = float(str(timeline.GetSetting("timelineFrameRate") or "0").split()[0])
-    except (ValueError, IndexError):
-        actual_fps = 0.0
+    if abs(read_rate(timeline.GetSetting("timelineFrameRate")) - fps) > 0.01:
+        timeline.SetSetting("timelineFrameRate", f"{fps:g}")
+    actual_fps = read_rate(timeline.GetSetting("timelineFrameRate"))
     if abs(actual_fps - fps) > 0.01:
         raise VideoGenieError(
             "DEPENDENCY_UNAVAILABLE",
@@ -98,13 +121,17 @@ def _apply_format(timeline: Any, fps: float, source: Size | None) -> Size:
         raise VideoGenieError(
             "DEPENDENCY_UNAVAILABLE", "Resolve did not report the new timeline's resolution"
         )
-    return actual
+    return actual_fps, actual
 
 
 def assemble_timeline(
     service: VideoGenieService, request: AssembleTimelineInput
 ) -> AssembledTimeline:
-    """Create a new timeline; refuse stale sources, mixed frame rates and name reuse."""
+    """Create a new timeline; refuse stale sources, mixed frame rates and name reuse.
+
+    The project's default frame rate is set to the footage rate first, because Resolve only
+    accepts fractional rates such as 23.976 there; the timeline then inherits it.
+    """
     deadline = time.monotonic() + request.timeout_seconds
     service.get_project(request.project_id)
     takes: list[tuple[CutPlan, Transcript]] = []
@@ -148,12 +175,13 @@ def assemble_timeline(
         raise VideoGenieError(
             "INVALID_ARGUMENT", "A timeline with this name exists; choose a new name"
         )
+    _project_rate(project, fps)
     timeline = pool.CreateEmptyTimeline(name)
     if timeline is None:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not create the timeline")
     project.SetCurrentTimeline(timeline)
     source = parse_resolution(clips[0].GetClipProperty("Resolution"))
-    size = _apply_format(timeline, fps, source)
+    timeline_fps, size = _apply_format(timeline, fps, source)
     appended = pool.AppendToTimeline(infos) or []
     if not appended:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not append the takes")
@@ -189,7 +217,7 @@ def assemble_timeline(
         resolve_project=resolve.project_name(request.project_id),
         timeline_name=name,
         timeline_id=str(timeline.GetUniqueId()),
-        frame_rate=fps,
+        frame_rate=timeline_fps,
         start_timecode=str(timeline.GetStartTimecode()),
         duration_frames=duration,
         duration_seconds=round(duration / fps, 3),
