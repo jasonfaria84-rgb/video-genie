@@ -6,7 +6,7 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 77 shared agent operations, including local recipe/brand drafts, immutable
+expose 79 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and the editing toolkit that follows them:
 `media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
@@ -15,7 +15,8 @@ which keeps "um"/"uh" as words, or Resolve transcription; FFmpeg-checked gaps; k
 "sound" marks audible untranscribed stretches, cut only with `cut_sounds`),
 `resolve.timeline.assemble` (new timeline from cut plans, optionally with an SRT on
 subtitle track 1; never edits an existing one), `resolve.render` (private render,
-verified, published without overwriting), `resolve.color.apply` (looks and bounded
+verified, published without overwriting), `resolve.render.cancel` (stops a render in the
+project's own Resolve project only; the render then publishes nothing), `resolve.color.apply` (looks and bounded
 adjustments as CDL in a separate color version; LUTs only from Resolve's library),
 `edit.cuts.plan`/`get` (fillers, false starts and pauses from a transcript),
 `captions.create` (SRT, optional FFmpeg burn-in that needs libass), `render.check`
@@ -25,7 +26,8 @@ on a transparent carrier, placed above the footage without overlapping existing 
 and `workflow.run`/`get` (folder of takes to finished video through those steps in order,
 on Resolve or local FFmpeg; each step is recorded under `workflows/`, a failed step is
 returned rather than raised, and `resume_workflow_id` continues at the first unfinished
-step).
+step; a render that fails its check ends as `needs_review`, never `done`, until
+`workflow.review` approves or rejects it with a note).
 Resolve work happens only in Resolve projects named
 `VideoGenie <project ID>`; never switch away from a person's open project unless
 the request explicitly allows it. General editing/templates, paid provider

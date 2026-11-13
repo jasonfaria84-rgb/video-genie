@@ -16,7 +16,8 @@ class RenderTimelineInput(ContractModel):
     Uses a Resolve render preset (default "H.264 Master") with H.264 in the container named
     by output_path (.mp4 or .mov). The file is rendered privately, checked, then published to
     output_path, which must not exist; nothing is ever overwritten. If rendering exceeds
-    timeout_seconds it is stopped and nothing is published.
+    timeout_seconds, fails, is interrupted, or is cancelled with resolve.render.cancel, it is
+    stopped and nothing is published.
     """
 
     project_id: Identifier
@@ -39,3 +40,23 @@ class RenderedTimeline(ContractModel):
     duration_seconds: Seconds
     expected_duration_seconds: Seconds
     render_seconds: Seconds
+
+
+class CancelRenderInput(ContractModel):
+    """Stop rendering in the project's own Resolve project; never in another project.
+
+    Nothing rendering is not an error: the result says cancelled false. The resolve.render
+    call that started the render then fails and publishes nothing.
+    """
+
+    project_id: Identifier
+    allow_switch: bool = False
+    timeout_seconds: float = Field(default=30, gt=0, le=120, allow_inf_nan=False)
+
+
+class CancelledRender(ContractModel):
+    """Whether a render was running and whether it was stopped."""
+
+    project_id: Identifier
+    was_rendering: bool
+    cancelled: bool

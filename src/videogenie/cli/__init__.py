@@ -70,7 +70,7 @@ from videogenie.contracts.rendering import (
     RenderResult,
 )
 from videogenie.contracts.resolve import ResolveStatusInput
-from videogenie.contracts.resolve_render import RenderTimelineInput
+from videogenie.contracts.resolve_render import CancelRenderInput, RenderTimelineInput
 from videogenie.contracts.silence import DetectSilenceInput, RemoveSilenceInput
 from videogenie.contracts.studio import (
     AssignProjectClientInput,
@@ -92,7 +92,7 @@ from videogenie.contracts.transcripts import (
     Transcript,
     TranscriptInput,
 )
-from videogenie.contracts.workflow import GetWorkflowInput, RunWorkflowInput
+from videogenie.contracts.workflow import GetWorkflowInput, ReviewWorkflowInput, RunWorkflowInput
 from videogenie.core import transcripts
 from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
@@ -108,12 +108,12 @@ from videogenie.core.overlays import place_overlay
 from videogenie.core.recipe_previews import RecipePreviewService
 from videogenie.core.recipes import RecipeService
 from videogenie.core.rendering import RenderService
-from videogenie.core.resolve_render import render_timeline
+from videogenie.core.resolve_render import cancel_render, render_timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
-from videogenie.core.workflow import get_workflow, run_workflow
+from videogenie.core.workflow import get_workflow, review_workflow, run_workflow
 from videogenie.workers.captions import create_captions
 from videogenie.workers.overlay_renderers import detect_renderers
 from videogenie.workers.render_check import check_render
@@ -250,6 +250,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "transcript.get": TranscriptInput,
     "resolve.timeline.assemble": AssembleTimelineInput,
     "resolve.render": RenderTimelineInput,
+    "resolve.render.cancel": CancelRenderInput,
     "resolve.color.apply": ApplyColorInput,
     "edit.cuts.plan": PlanCutsInput,
     "edit.cuts.get": GetCutPlanInput,
@@ -259,6 +260,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "overlay.place": PlaceOverlayInput,
     "workflow.run": RunWorkflowInput,
     "workflow.get": GetWorkflowInput,
+    "workflow.review": ReviewWorkflowInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -503,6 +505,7 @@ def _dispatch(
                 "transcript.get",
                 "resolve.timeline.assemble",
                 "resolve.render",
+                "resolve.render.cancel",
                 "resolve.color.apply",
                 "edit.cuts.plan",
                 "edit.cuts.get",
@@ -512,6 +515,7 @@ def _dispatch(
                 "overlay.place",
                 "workflow.run",
                 "workflow.get",
+                "workflow.review",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -560,6 +564,10 @@ def _dispatch(
         )
     if operation == "workflow.get":
         return get_workflow(service, GetWorkflowInput.model_validate_json(_strict_json(payload)))
+    if operation == "workflow.review":
+        return review_workflow(
+            service, ReviewWorkflowInput.model_validate_json(_strict_json(payload))
+        )
     if operation == "overlay.renderers":
         wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
         return detect_renderers(wanted_renderers.timeout_seconds)
@@ -569,6 +577,8 @@ def _dispatch(
         return render_timeline(
             service, RenderTimelineInput.model_validate_json(_strict_json(payload))
         )
+    if operation == "resolve.render.cancel":
+        return cancel_render(service, CancelRenderInput.model_validate_json(_strict_json(payload)))
     if operation == "resolve.timeline.assemble":
         return assemble_timeline(
             service, AssembleTimelineInput.model_validate_json(_strict_json(payload))
@@ -703,7 +713,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="create/list/get/rename/archive/restore/probe/resume/silence/cuts/check/run/...",
     )
     parser.add_argument(
-        "detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan/assemble/apply"
+        "detail",
+        nargs="?",
+        help="get/assign/open/close/set/detect/remove/plan/assemble/apply/cancel",
     )
     parser.add_argument("--data-dir", help="Absolute storage root; overrides VIDEOGENIE_DATA_DIR")
     parser.add_argument("--input-json", metavar="-", help="Read typed operation input from stdin")

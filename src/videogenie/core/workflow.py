@@ -42,9 +42,11 @@ from videogenie.contracts.workflow import (
     RESUME_OVERRIDES,
     STEP_ORDER,
     GetWorkflowInput,
+    ReviewWorkflowInput,
     RunWorkflowInput,
     StepError,
     StepName,
+    WorkflowDecision,
     WorkflowLinks,
     WorkflowRecord,
     WorkflowReview,
@@ -441,7 +443,9 @@ class _Run:
             self.update(name, status="failed", error=error, finished_at=_now())
             self._save(status="failed")
             return self.record
-        self._save(status="done")
+        review = self.record.links.review
+        # A failed render check is never reported as final until a reviewer decides.
+        self._save(status="needs_review" if review is not None and not review.passed else "done")
         return self.record
 
     # Shared inputs for later steps
@@ -951,8 +955,8 @@ def run_workflow(service: VideoGenieService, request: RunWorkflowInput) -> Workf
             if record.project_id != request.project_id:
                 raise VideoGenieError("NOT_FOUND", "workflow not found in this project")
             _require_same_request(request, record.request)
-            if record.status == "done":
-                return record
+            if record.status in {"done", "needs_review", "rejected"}:
+                return record  # every step finished; workflow.review decides needs_review
             return _Run(
                 service,
                 record,
@@ -968,3 +972,36 @@ def run_workflow(service: VideoGenieService, request: RunWorkflowInput) -> Workf
             timeout_seconds=request.timeout_seconds,
             allow_switch=request.allow_switch,
         ).run()
+
+
+def review_workflow(service: VideoGenieService, request: ReviewWorkflowInput) -> WorkflowRecord:
+    """workflow.review: approve or reject a workflow whose render failed its check."""
+    service.get_project(request.project_id)
+    load(service, request.workflow_id)  # NOT_FOUND before creating a lock file
+    with _lock(service, request.workflow_id):
+        record = load(service, request.workflow_id)
+        if record.project_id != request.project_id:
+            raise VideoGenieError("NOT_FOUND", "workflow not found in this project")
+        if record.status != "needs_review":
+            raise VideoGenieError(
+                "INVALID_ARGUMENT",
+                "Only a workflow with status needs_review can be reviewed",
+                details={"status": record.status},
+            )
+        approved = request.decision == "approve"
+        now = _now()
+        # model_copy skips validation; re-validate so the stored record is always coherent.
+        changed = record.model_copy(
+            update={
+                "status": "done" if approved else "rejected",
+                "decision": WorkflowDecision(
+                    decision="approved" if approved else "rejected",
+                    note=request.note.strip(),
+                    decided_at=now,
+                ),
+                "updated_at": now,
+            }
+        )
+        record = WorkflowRecord.model_validate_json(changed.model_dump_json())
+        save(service, record)
+        return record
