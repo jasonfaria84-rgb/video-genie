@@ -12,7 +12,7 @@ import pytest
 from videogenie.adapters import resolve
 from videogenie.cli import _dispatch
 from videogenie.contracts.models import VideoGenieError
-from videogenie.contracts.resolve_render import RenderedTimeline
+from videogenie.contracts.resolve_render import CancelledRender, RenderedTimeline
 from videogenie.core import resolve_render
 from videogenie.core.service import VideoGenieService
 
@@ -53,11 +53,18 @@ class Timeline:
 
 
 class Project:
-    def __init__(self, outcome: str, seconds: float = 2.0) -> None:
-        self.outcome, self.seconds = outcome, seconds
+    def __init__(self, outcome: str, seconds: float = 2.0, name: str = "") -> None:
+        self.outcome, self.seconds, self.name = outcome, seconds, name
         self.settings: dict[str, Any] = {}
         self.deleted: list[str] = []
         self.stopped = False
+        self.rendering = False
+
+    def GetName(self) -> str:  # noqa: N802
+        return self.name
+
+    def IsRenderingInProgress(self) -> bool:  # noqa: N802
+        return self.rendering
 
     def GetTimelineCount(self) -> int:  # noqa: N802
         return 1
@@ -87,13 +94,17 @@ class Project:
     def StartRendering(self, jobs: list[str], isInteractiveMode: bool) -> bool:  # noqa: N802, N803
         if self.outcome == "Complete":
             make_video(Path(self.settings["TargetDir"]) / "render.mp4", self.seconds)
+        # "stopped": Resolve went idle (someone stopped it) without updating the job.
+        self.rendering = self.outcome == "hang"
         return True
 
     def GetRenderJobStatus(self, job: str) -> dict[str, Any]:  # noqa: N802
-        return {"JobStatus": "Rendering" if self.outcome == "hang" else self.outcome}
+        if self.outcome in {"hang", "stopped"}:
+            return {"JobStatus": "Rendering" if self.rendering else "Ready"}
+        return {"JobStatus": self.outcome}
 
     def StopRendering(self) -> None:  # noqa: N802
-        self.stopped = True
+        self.stopped, self.rendering = True, False
 
     def DeleteRenderJob(self, job: str) -> bool:  # noqa: N802
         self.deleted.append(job)
@@ -149,6 +160,126 @@ def test_failures_publish_nothing(
     assert message in caught.value.message
     assert not output.exists() and project.deleted == ["job-1"]
     assert project.stopped == (project.outcome == "hang")
+
+
+@pytest.mark.parametrize("outcome", ["Cancelled", "stopped"])
+def test_cancelled_render_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    project = Project(outcome)
+    service, project_id = scenario(monkeypatch, tmp_path, project)
+    output = tmp_path / "final.mp4"
+    with pytest.raises(VideoGenieError) as caught:
+        render(service, project_id, output)
+    assert caught.value.message == "Resolve render was cancelled; nothing was published"
+    assert caught.value.details == {"status": "Cancelled"}
+    assert not output.exists() and project.deleted == ["job-1"]
+    assert list((tmp_path / "state" / "renders").iterdir()) == []
+
+
+class Interrupted(Project):
+    def GetRenderJobStatus(self, job: str) -> dict[str, Any]:  # noqa: N802
+        raise KeyboardInterrupt
+
+
+def test_interrupted_render_stops_resolve(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    project = Interrupted("hang")
+    service, project_id = scenario(monkeypatch, tmp_path, project)
+    output = tmp_path / "final.mp4"
+    with pytest.raises(KeyboardInterrupt):
+        render(service, project_id, output)
+    assert project.stopped and not project.rendering
+    assert not output.exists() and project.deleted == ["job-1"]
+    assert list((tmp_path / "state" / "renders").iterdir()) == []
+
+
+def test_interrupted_copy_leaves_no_partial_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    service, project_id = scenario(monkeypatch, tmp_path, Project("Complete"))
+
+    def no_link(source: Any, target: Any) -> None:
+        raise OSError("cross-device link")
+
+    def interrupt(source: Any, target: Any) -> None:
+        target.write(b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(shutil, "copyfileobj", interrupt)
+    output = tmp_path / "final.mp4"
+    with pytest.raises(KeyboardInterrupt):
+        render(service, project_id, output)
+    assert not output.exists()
+
+
+class Manager:
+    def __init__(self, current: Project) -> None:
+        self.current = current
+
+    def GetCurrentProject(self) -> Project:  # noqa: N802
+        return self.current
+
+    def LoadProject(self, name: str) -> Project:  # noqa: N802
+        self.current = Project("idle", name=name)
+        return self.current
+
+
+class App:
+    def __init__(self, current: Project) -> None:
+        self.manager = Manager(current)
+
+    def GetProjectManager(self) -> Manager:  # noqa: N802
+        return self.manager
+
+
+def cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, current: Project, **extra: Any
+) -> tuple[Any, Project]:
+    service = VideoGenieService(tmp_path / "state")
+    project_id = service.create_project("Render", "render").project_id
+    app = App(current)
+    monkeypatch.setattr(resolve, "connect", lambda timeout: app)
+    monkeypatch.setattr(resolve_render, "POLL_SECONDS", 0.01)
+    result = _dispatch(service, "resolve.render.cancel", {"project_id": project_id} | extra)
+    return result, app.manager.current
+
+
+@pytest.mark.parametrize("rendering", [True, False])
+def test_cancel_stops_only_a_running_render(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rendering: bool
+) -> None:
+    service = VideoGenieService(tmp_path / "state")
+    project_id = service.create_project("Render", "render").project_id
+    own = Project("hang", name=resolve.project_name(project_id))
+    own.rendering = rendering
+    monkeypatch.setattr(resolve, "connect", lambda timeout: App(own))
+    monkeypatch.setattr(resolve_render, "POLL_SECONDS", 0.01)
+    result = _dispatch(service, "resolve.render.cancel", {"project_id": project_id})
+    assert isinstance(result, CancelledRender)
+    assert result.was_rendering == rendering and result.cancelled == rendering
+    assert own.stopped == rendering and not own.rendering
+
+
+@pytest.mark.parametrize("allow_switch", [False, True])
+def test_cancel_never_touches_another_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, allow_switch: bool
+) -> None:
+    other = Project("hang", name="Someone's film")
+    other.rendering = True
+    with pytest.raises(VideoGenieError) as caught:
+        cancel(monkeypatch, tmp_path, other, allow_switch=allow_switch)
+    assert caught.value.code == "LEASE_HELD"
+    assert other.rendering and not other.stopped
+
+
+def test_cancel_may_switch_from_an_idle_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    other = Project("idle", name="Someone's film")
+    result, current = cancel(monkeypatch, tmp_path, other, allow_switch=True)
+    assert isinstance(result, CancelledRender) and not result.cancelled
+    assert current is not other and not other.stopped
 
 
 def test_bad_requests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

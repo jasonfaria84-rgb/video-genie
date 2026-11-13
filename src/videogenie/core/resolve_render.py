@@ -9,7 +9,12 @@ from uuid import uuid4
 
 from videogenie.adapters import resolve
 from videogenie.contracts.models import VideoGenieError
-from videogenie.contracts.resolve_render import RenderedTimeline, RenderTimelineInput
+from videogenie.contracts.resolve_render import (
+    CancelledRender,
+    CancelRenderInput,
+    RenderedTimeline,
+    RenderTimelineInput,
+)
 from videogenie.core.service import VideoGenieService
 from videogenie.workers.probe import fingerprint
 from videogenie.workers.silence import _media, _tool
@@ -42,8 +47,17 @@ def _timeline(project: Any, name: str) -> Any:
     raise VideoGenieError("NOT_FOUND", "No timeline with that name in the Resolve project")
 
 
+def _cancelled() -> VideoGenieError:
+    return VideoGenieError(
+        "MEDIA_UNAVAILABLE",
+        "Resolve render was cancelled; nothing was published",
+        retry_class="reconcile",
+        details={"status": "Cancelled"},
+    )
+
+
 def render_timeline(service: VideoGenieService, request: RenderTimelineInput) -> RenderedTimeline:
-    """Render through Resolve's queue; stop on deadline and publish only a verified file."""
+    """Render through Resolve's queue; stop any unfinished render; publish only a verified file."""
     started = time.monotonic()
     deadline = started + request.timeout_seconds
     service.get_project(request.project_id)
@@ -62,6 +76,7 @@ def render_timeline(service: VideoGenieService, request: RenderTimelineInput) ->
     staging = service.data_dir / "renders" / uuid4().hex
     staging.mkdir(parents=True, mode=0o700)
     job: str | None = None
+    rendering = False
     try:
         if not project.LoadRenderPreset(request.preset):
             raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not load the preset")
@@ -72,19 +87,30 @@ def render_timeline(service: VideoGenieService, request: RenderTimelineInput) ->
         if not project.SetRenderSettings(settings):
             raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve rejected the render settings")
         job = project.AddRenderJob()
+        rendering = bool(job)
         if not job or not project.StartRendering([job], isInteractiveMode=False):
             raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not start rendering")
+        idle = 0
         while True:
             status = project.GetRenderJobStatus(job) or {}
             state = str(status.get("JobStatus", ""))
             if state == "Complete":
+                rendering = False
                 break
-            if state in {"Failed", "Cancelled"}:
+            if state == "Cancelled":
+                rendering = False
+                raise _cancelled()
+            if state == "Failed":
+                rendering = False
                 raise VideoGenieError(
                     "MEDIA_UNAVAILABLE", "Resolve render failed", details={"status": state}
                 )
+            # Resolve stopped without finishing this job on two polls in a row: cancelled.
+            idle = 0 if project.IsRenderingInProgress() else idle + 1
+            if idle >= 2:
+                rendering = False
+                raise _cancelled()
             if time.monotonic() > deadline:
-                project.StopRendering()
                 raise VideoGenieError("MEDIA_UNAVAILABLE", "Render exceeded its deadline")
             time.sleep(POLL_SECONDS)
         rendered = [path for path in staging.iterdir() if path.is_file()]
@@ -109,16 +135,28 @@ def render_timeline(service: VideoGenieService, request: RenderTimelineInput) ->
         except OSError:
             # Hard links fail across volumes; copy without ever replacing a file.
             try:
-                with rendered[0].open("rb") as source, output.open("xb") as target:
-                    shutil.copyfileobj(source, target)
+                target = output.open("xb")
             except FileExistsError as exc:
                 raise VideoGenieError(
                     "INVALID_ARGUMENT", "output_path already exists; choose a new name"
                 ) from exc
             except OSError as exc:
-                output.unlink(missing_ok=True)
                 raise VideoGenieError("ACCESS_DENIED", "Output file could not be written") from exc
+            try:
+                with rendered[0].open("rb") as source, target:
+                    shutil.copyfileobj(source, target)
+            except BaseException as exc:
+                # Never leave a partial file, even when interrupted mid-copy.
+                output.unlink(missing_ok=True)
+                if isinstance(exc, OSError):
+                    raise VideoGenieError(
+                        "ACCESS_DENIED", "Output file could not be written"
+                    ) from exc
+                raise
     finally:
+        # Any exit before Complete, including KeyboardInterrupt, leaves Resolve idle.
+        if rendering:
+            project.StopRendering()
         if job:
             project.DeleteRenderJob(job)
         shutil.rmtree(staging, ignore_errors=True)
@@ -133,3 +171,35 @@ def render_timeline(service: VideoGenieService, request: RenderTimelineInput) ->
         expected_duration_seconds=round(expected, 3),
         render_seconds=round(time.monotonic() - started, 3),
     )
+
+
+def cancel_render(service: VideoGenieService, request: CancelRenderInput) -> CancelledRender:
+    """Stop rendering in the project's own Resolve project and wait until Resolve is idle."""
+    deadline = time.monotonic() + request.timeout_seconds
+    service.get_project(request.project_id)
+    app = resolve.connect(request.timeout_seconds)
+    manager = app.GetProjectManager()
+    current = None if manager is None else manager.GetCurrentProject()
+    if (
+        request.allow_switch
+        and current is not None
+        and current.GetName() != resolve.project_name(request.project_id)
+        and current.IsRenderingInProgress()
+    ):
+        # Switching projects could stop someone else's render; leave it alone.
+        raise VideoGenieError(
+            "LEASE_HELD",
+            "Another Resolve project is rendering; it was left alone",
+            details={"open_project": str(current.GetName())},
+        )
+    project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
+    if not project.IsRenderingInProgress():
+        return CancelledRender(project_id=request.project_id, was_rendering=False, cancelled=False)
+    project.StopRendering()
+    while project.IsRenderingInProgress():
+        if time.monotonic() > deadline:
+            raise VideoGenieError(
+                "DEPENDENCY_UNAVAILABLE", "Resolve did not stop rendering in time"
+            )
+        time.sleep(POLL_SECONDS)
+    return CancelledRender(project_id=request.project_id, was_rendering=True, cancelled=True)

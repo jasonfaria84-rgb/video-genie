@@ -15,7 +15,8 @@ which keeps "um"/"uh" as words, or Resolve transcription; FFmpeg-checked gaps; k
 "sound" marks audible untranscribed stretches, cut only with `cut_sounds`),
 `resolve.timeline.assemble` (new timeline from cut plans, optionally with an SRT on
 subtitle track 1; never edits an existing one), `resolve.render` (private render,
-verified, published without overwriting), `resolve.color.apply` (looks and bounded
+verified, published without overwriting), `resolve.render.cancel` (stops a render in the
+project's own Resolve project only; the render then publishes nothing), `resolve.color.apply` (looks and bounded
 adjustments as CDL in a separate color version; LUTs only from Resolve's library),
 `edit.cuts.plan`/`get` (fillers, false starts and pauses from a transcript),
 `captions.create` (SRT, optional FFmpeg burn-in that needs libass), `render.check`
