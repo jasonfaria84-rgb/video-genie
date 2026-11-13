@@ -612,6 +612,17 @@ The look and adjustments become ASC CDL values on node 1. Resolve only applies
 LUTs from its own LUT library, so install new LUTs through Resolve first. Raw
 filter text and arbitrary file paths aren't accepted.
 
+### Store a grade in a recipe
+
+Recipe content can carry an optional `color` section with the same `look` and
+`adjustments` fields and bounds as `resolve color apply`, for example
+`"color":{"look":"warm_cinematic","adjustments":{"temperature":0.2}}`. It's checked
+like every other recipe field and has its own `schema_version`. LUTs aren't part of
+it, because they name files in one machine's Resolve library. Recipes without
+`color` keep exactly the content and digest they had before the section existed.
+Nothing applies the stored grade automatically yet: read it from the recipe and pass
+`look` and `adjustments` to `resolve color apply` yourself.
+
 ## Render a timeline from DaVinci Resolve
 
 `resolve render` renders one timeline of the project's own Resolve project to a
