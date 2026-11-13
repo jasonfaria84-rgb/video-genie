@@ -42,6 +42,65 @@ def _timeline_names(project: Any) -> set[str]:
     return names
 
 
+Size = tuple[int, int]
+
+
+def parse_resolution(value: object) -> Size | None:
+    """Resolve's clip "Resolution" property, such as "1920x1080", as (width, height)."""
+    width, _, height = str(value or "").partition("x")
+    if width.isdecimal() and height.isdecimal() and int(width) > 0 and int(height) > 0:
+        return int(width), int(height)
+    return None
+
+
+def resolution_warning(source: Size | None, actual: Size) -> str | None:
+    """Explain when the timeline frame differs from the footage, so nobody assumes a match."""
+    if source is None:
+        return f"The footage resolution is unknown; the timeline is {actual[0]}x{actual[1]}"
+    if source == actual:
+        return None
+    return (
+        f"Resolve made the timeline {actual[0]}x{actual[1]}, not the footage's "
+        f"{source[0]}x{source[1]} (Resolve timelines are at least 256 pixels on each side), "
+        "so renders are letterboxed or scaled"
+    )
+
+
+def _apply_format(timeline: Any, fps: float, source: Size | None) -> Size:
+    """Set custom frame rate and size in the order Resolve needs, then read back what stuck.
+
+    Resolution settings are refused until useCustomSettings is on, and Resolve silently raises
+    each side to at least 256 pixels while still reporting success, so only read-back is trusted.
+    """
+    if not timeline.SetSetting("useCustomSettings", "1"):
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve refused custom settings for the new timeline"
+        )
+    timeline.SetSetting("timelineFrameRate", f"{fps:g}")
+    try:
+        actual_fps = float(str(timeline.GetSetting("timelineFrameRate") or "0").split()[0])
+    except (ValueError, IndexError):
+        actual_fps = 0.0
+    if abs(actual_fps - fps) > 0.01:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Resolve did not keep the footage frame rate on the new timeline",
+            details={"footage_fps": fps, "timeline_fps": actual_fps},
+        )
+    if source is not None:
+        timeline.SetSetting("timelineResolutionWidth", str(source[0]))
+        timeline.SetSetting("timelineResolutionHeight", str(source[1]))
+    actual = parse_resolution(
+        f"{timeline.GetSetting('timelineResolutionWidth')}"
+        f"x{timeline.GetSetting('timelineResolutionHeight')}"
+    )
+    if actual is None:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve did not report the new timeline's resolution"
+        )
+    return actual
+
+
 def assemble_timeline(
     service: VideoGenieService, request: AssembleTimelineInput
 ) -> AssembledTimeline:
@@ -93,13 +152,8 @@ def assemble_timeline(
     if timeline is None:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not create the timeline")
     project.SetCurrentTimeline(timeline)
-    timeline.SetSetting("useCustomSettings", "1")
-    timeline.SetSetting("timelineFrameRate", f"{fps:g}")
-    resolution = str(clips[0].GetClipProperty("Resolution") or "")
-    width, _, height = resolution.partition("x")
-    if width.isdecimal() and height.isdecimal():
-        timeline.SetSetting("timelineResolutionWidth", width)
-        timeline.SetSetting("timelineResolutionHeight", height)
+    source = parse_resolution(clips[0].GetClipProperty("Resolution"))
+    size = _apply_format(timeline, fps, source)
     appended = pool.AppendToTimeline(infos) or []
     if not appended:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not append the takes")
@@ -142,4 +196,9 @@ def assemble_timeline(
         segment_count=len(infos),
         cut_points_seconds=tuple(points),
         cut_plan_ids=tuple(plan.plan_id for plan, _ in takes),
+        width=size[0],
+        height=size[1],
+        source_width=source[0] if source else None,
+        source_height=source[1] if source else None,
+        resolution_warning=resolution_warning(source, size),
     )
