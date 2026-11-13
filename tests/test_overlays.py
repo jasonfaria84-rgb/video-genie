@@ -634,7 +634,7 @@ RED_BOX_COMP = """Composition {
 
 
 def frame_pixels(path: Path, seconds: float) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """RGB at the frame centre and near the top-left corner of one decoded frame."""
+    """RGB at the frame centre and at the left edge of the centre row (inside any letterbox)."""
     ffprobe, ffmpeg = shutil.which("ffprobe"), shutil.which("ffmpeg")
     assert ffprobe is not None and ffmpeg is not None
     probe = subprocess.run(
@@ -659,7 +659,7 @@ def frame_pixels(path: Path, seconds: float) -> tuple[tuple[int, ...], tuple[int
         offset = (y * width + x) * 3
         return tuple(raw[offset : offset + 3])
 
-    return at(width // 2, height // 2), at(width // 10, height // 10)
+    return at(width // 2, height // 2), at(width // 10, height // 2)
 
 
 @pytest.mark.skipif(
@@ -719,8 +719,8 @@ def test_live_fusion_comp_renders_over_footage(tmp_path: Path) -> None:
             "timeout_seconds": 600,
         },
     )
-    inside_centre, inside_corner = frame_pixels(output, 1.25)
+    inside_centre, inside_side = frame_pixels(output, 1.25)
     after_centre, _ = frame_pixels(output, 2.5)
     assert inside_centre[0] > 180 and inside_centre[2] < 80, inside_centre
-    for blue in (inside_corner, after_centre):
+    for blue in (inside_side, after_centre):
         assert blue[2] > 150 and blue[0] < 80, blue
