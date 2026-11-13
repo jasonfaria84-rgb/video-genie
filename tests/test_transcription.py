@@ -186,9 +186,10 @@ def test_resolve_refusal_fails_fast(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 # A stand-in for mlx_whisper: records its arguments and writes Whisper-shaped JSON.
 FAKE_WHISPER = """#!{python}
-import json, pathlib, sys
+import json, os, pathlib, sys
 args = sys.argv[1:]
-pathlib.Path({log!r}).write_text(json.dumps(args))
+facts = {{"cwd": os.getcwd(), "offline": os.environ.get("HF_HUB_OFFLINE")}}
+pathlib.Path({log!r}).write_text(json.dumps({{"args": args, **facts}}))
 if {fail!r}:
     print("model not found", file=sys.stderr)
     sys.exit(3)
@@ -221,6 +222,7 @@ def test_whisper_engine_keeps_fillers_as_words(
     source = make_clip(tmp_path / "talk.m4a")
     binary, log = fake_whisper(tmp_path)
     monkeypatch.setenv("VIDEOGENIE_WHISPER_BIN", str(binary))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "empty-hub"))
     monkeypatch.setattr(resolve, "connect", lambda timeout: pytest.fail("Resolve not needed"))
     service = VideoGenieService(tmp_path / "state")
     project_id = service.create_project("Talk", "talk").project_id
@@ -232,9 +234,13 @@ def test_whisper_engine_keeps_fillers_as_words(
     assert isinstance(created, Transcript) and created.engine == "whisper"
     assert created.engine_version == "mlx-community/whisper-large-v3-turbo"
     spoken = [(w.text, w.start_seconds) for w in created.words if w.kind == "word"]
-    # Times past the end of the 3 s source are clamped to it.
-    assert spoken == [("Hello.", 0.5), ("Um,", 1.3), ("world.", 2.0), ("beyond", 3.0)]
-    args = json.loads(log.read_text())
+    # A word timed past the end of the 3 s source is dropped.
+    assert spoken == [("Hello.", 0.5), ("Um,", 1.3), ("world.", 2.0)]
+    facts = json.loads(log.read_text())
+    args = facts["args"]
+    # Not cached here, so the Hub may be used; runs from the private scratch directory.
+    assert facts["offline"] is None
+    assert Path(facts["cwd"]).resolve().parent == (service.data_dir / "work").resolve()
     assert args[0] == str(source.resolve()) and args[args.index("--language") + 1] == "en"
     assert "um" in args[args.index("--initial-prompt") + 1]
     assert args[args.index("--word-timestamps") + 1] == "True"
@@ -273,9 +279,61 @@ def test_whisper_words_are_ordered_and_clamped() -> None:
             {"words": [{"word": " a", "start": -1, "end": 0.4}, {"word": " c", "start": "x"}]},
         ]
     }
-    assert whisper.words(raw, 1.8) == [(0.0, 0.4, "a", None), (1.8, 1.8, "b", None)]
+    assert whisper.words(raw, 1.8) == [(0.0, 0.4, "a", None)]
+    assert whisper.words(raw, 2.5) == [(0.0, 0.4, "a", None), (2.0, 2.0, "b", None)]
     with pytest.raises(VideoGenieError):
         whisper.words({"text": "no segments"}, 1.0)
+
+
+def test_cached_model_runs_offline_and_records_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    hub = tmp_path / "hub" / "models--mlx-community--whisper-large-v3-turbo"
+    (hub / "refs").mkdir(parents=True)
+    (hub / "refs" / "main").write_text("abc123")
+    (hub / "snapshots" / "abc123").mkdir(parents=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    binary, log = fake_whisper(tmp_path)
+    monkeypatch.setenv("VIDEOGENIE_WHISPER_BIN", str(binary))
+    source = make_clip(tmp_path / "talk.m4a")
+    _, identity = whisper.transcribe(
+        source,
+        model="mlx-community/whisper-large-v3-turbo",
+        language=None,
+        timeout_seconds=60,
+        work_dir=tmp_path / "work",
+    )
+    assert identity == "mlx-community/whisper-large-v3-turbo@abc123"
+    assert json.loads(log.read_text())["offline"] == "1"
+
+
+def test_whisper_timeout_kills_the_whole_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import time
+
+    marker = tmp_path / "child.pid"
+    slow = tmp_path / "slow_whisper"
+    slow.write_text(f"#!/bin/sh\nsleep 60 &\necho $! > {marker}\nwait\n")
+    slow.chmod(0o755)
+    monkeypatch.setenv("VIDEOGENIE_WHISPER_BIN", str(slow))
+    started = time.monotonic()
+    with pytest.raises(VideoGenieError, match="deadline"):
+        whisper.transcribe(
+            tmp_path / "x.wav", model="a/b", language=None, timeout_seconds=1, work_dir=tmp_path
+        )
+    assert time.monotonic() - started < 10
+    child = int(marker.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("Whisper's child process survived the timeout")
 
 
 @pytest.mark.parametrize(

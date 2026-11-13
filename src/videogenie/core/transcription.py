@@ -179,7 +179,7 @@ def _whisper_transcription(
     service: VideoGenieService, request: CreateTranscriptInput, path: str, deadline: float
 ) -> tuple[Any, str | None, str]:
     """Run local Whisper; returns its raw output (words come later), language, version."""
-    result = whisper.transcribe(
+    result, identity = whisper.transcribe(
         Path(path),
         model=request.whisper_model,
         language=request.language,
@@ -187,7 +187,7 @@ def _whisper_transcription(
         work_dir=service.data_dir / "work",
     )
     language = result.get("language")
-    return result, language if isinstance(language, str) else None, request.whisper_model
+    return result, language if isinstance(language, str) else None, identity
 
 
 def create_transcript(service: VideoGenieService, request: CreateTranscriptInput) -> Transcript:
