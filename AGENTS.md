@@ -6,7 +6,7 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 78 shared agent operations, including local recipe/brand drafts, immutable
+expose 79 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and the editing toolkit that follows them:
 `media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
