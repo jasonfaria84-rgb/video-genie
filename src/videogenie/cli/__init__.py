@@ -92,6 +92,7 @@ from videogenie.contracts.transcripts import (
     Transcript,
     TranscriptInput,
 )
+from videogenie.contracts.workflow import GetWorkflowInput, RunWorkflowInput
 from videogenie.core import transcripts
 from videogenie.core import transcripts as transcript_store
 from videogenie.core.activity import ActivityService
@@ -112,6 +113,7 @@ from videogenie.core.service import VideoGenieService
 from videogenie.core.studio import StudioService
 from videogenie.core.transcription import create_transcript
 from videogenie.core.transcripts import load as load_record
+from videogenie.core.workflow import get_workflow, run_workflow
 from videogenie.workers.captions import create_captions
 from videogenie.workers.overlay_renderers import detect_renderers
 from videogenie.workers.render_check import check_render
@@ -255,6 +257,8 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "render.check": CheckRenderInput,
     "overlay.renderers": OverlayRenderersInput,
     "overlay.place": PlaceOverlayInput,
+    "workflow.run": RunWorkflowInput,
+    "workflow.get": GetWorkflowInput,
 }
 OPERATIONS = tuple(INPUT_MODELS)
 
@@ -506,6 +510,8 @@ def _dispatch(
                 "render.check",
                 "overlay.renderers",
                 "overlay.place",
+                "workflow.run",
+                "workflow.get",
             ],
             "supported_providers": ["local-pillow-ffmpeg"],
             "paid_providers_supported": False,
@@ -547,6 +553,13 @@ def _dispatch(
         )
     if operation == "resolve.color.apply":
         return apply_color(service, ApplyColorInput.model_validate_json(_strict_json(payload)))
+    if operation == "workflow.run":
+        return run_workflow(
+            service,
+            RunWorkflowInput.model_validate_json(_strict_json(payload, ("folder", "output_path"))),
+        )
+    if operation == "workflow.get":
+        return get_workflow(service, GetWorkflowInput.model_validate_json(_strict_json(payload)))
     if operation == "overlay.renderers":
         wanted_renderers = OverlayRenderersInput.model_validate_json(_strict_json(payload))
         return detect_renderers(wanted_renderers.timeout_seconds)
@@ -682,12 +695,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         nargs="?",
         help="capabilities, project, client, asset, media, recipe, brand, graphics, render, "
         "artifact, cost, approval, grant, output, resolve, edit, captions, overlay, "
-        "or explicit owner launch",
+        "workflow, or explicit owner launch",
     )
     parser.add_argument(
         "action",
         nargs="?",
-        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts/check/...",
+        help="create/list/get/rename/archive/restore/probe/resume/silence/cuts/check/run/...",
     )
     parser.add_argument(
         "detail", nargs="?", help="get/assign/open/close/set/detect/remove/plan/assemble/apply"
