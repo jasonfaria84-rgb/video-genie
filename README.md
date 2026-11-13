@@ -10,15 +10,15 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 77 shared agent operations: projects and clients, cycles and
+This source exposes 78 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests and output selection, plus an editing toolkit:
 dead-space removal, word-level transcripts made in DaVinci Resolve, cut plans that
 remove filler words and false starts, timeline assembly, color grading and
-rendering in Resolve, subtitles, motion graphics overlays placed on Resolve
-timelines, a self-check of every cut in a render, and a resumable workflow that
-turns a folder of takes into a finished video. Seven
+cancellable rendering in Resolve, subtitles, motion graphics overlays placed on
+Resolve timelines, a self-check of every cut in a render, and a resumable workflow
+that turns a folder of takes into a finished video. Seven
 additive discovery reads preserve the earlier 54 operation schemas and results; the
 editing operations follow them. A separate supervised owner console handles
 enrollment, publication, budget grants, and final review.
@@ -257,7 +257,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 77 agent operations. Replace spaces in each CLI command
+The server exposes the same 78 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -686,12 +686,24 @@ Nothing applies the stored grade automatically yet: read it from the recipe and 
 new `.mp4` or `.mov` file with H.264, using a Resolve render preset (default
 `H.264 Master`). Resolve renders into a private folder under the data directory;
 VideoGenie checks that the file's duration matches the timeline, then publishes it
-to `output_path`, which must not exist. If the render fails or passes
-`timeout_seconds`, it is stopped and nothing is published.
+to `output_path`, which must not exist. If the render fails, passes
+`timeout_seconds`, is interrupted or is cancelled, it is stopped and nothing is
+published.
 
 ```bash
 printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","output_path":"/absolute/final.mp4"}' \
   | videogenie resolve render --json --input-json -
+```
+
+`resolve render cancel` stops a render in the project's own Resolve project and
+waits until Resolve is idle. The `resolve render` call that started it then fails
+with "Resolve render was cancelled; nothing was published". It never touches
+another Resolve project: if a different project is open, it refuses unless
+`allow_switch` is true, and even then it refuses while that project is rendering.
+When nothing is rendering, it returns `cancelled: false`.
+
+```bash
+printf '%s' '{"project_id":"<uuid>"}' | videogenie resolve render cancel --json --input-json -
 ```
 
 ## Place motion graphics overlays
