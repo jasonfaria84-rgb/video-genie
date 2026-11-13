@@ -25,7 +25,8 @@ class CheckRenderInput(ContractModel):
     than max_audio_jump_db; audio_click: the waveform step at the cut is more than max_click_db
     above the surrounding signal), on a black frame just before or after it, or on a frozen
     picture (three frames on one side that barely differ). The file fails when audio and video
-    stream durations differ by more than max_av_drift_seconds or cannot be measured.
+    stream durations (first to last presented packet, AAC priming excluded) differ by more
+    than max_av_drift_seconds or cannot be measured.
     contact_sheet_path optionally writes a new .png or .jpg grid of the frames just before and
     after each cut; existing files are never overwritten. Uses local FFmpeg only.
     """
