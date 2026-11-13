@@ -63,9 +63,10 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "render.check": ("rendered_path", "contact_sheet_path"),
                 "overlay.place": ("source_path",),
                 "workflow.run": ("folder", "output_path"),
+                "resolve.timeline.assemble": ("subtitles_path",),
             }.get(operation, ())
             # Optional outputs; workflow folder/output_path are omitted when resuming.
-            optional = {"contact_sheet_path", "folder", "output_path"}
+            optional = {"contact_sheet_path", "folder", "output_path", "subtitles_path"}
             for path_field in path_fields:
                 parent_name, _, name = path_field.rpartition(".")
                 holder = raw.get(parent_name) if parent_name else raw

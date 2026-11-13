@@ -460,7 +460,8 @@ plans into a Resolve timeline, then `resolve render` to make the file.
 cues: two spoken words per cue in UPPERCASE by default. Give `cut_plan_id` (a plan
 made from the same transcript) to time cues to the edited output instead of the
 source; words inside cuts are dropped and no cue spans a cut. The SRT is plain UTF-8
-and imports into DaVinci Resolve as a subtitle track. Add `burn_in` to also render
+and imports into DaVinci Resolve as a subtitle track; `resolve timeline assemble` can
+place it for you (see below). Add `burn_in` to also render
 the subtitles into a new copy of a video with local FFmpeg.
 
 ```bash
@@ -598,6 +599,31 @@ adds audio fades at each join. `timeline_name` must be new; existing timelines a
 never edited. The result reports the timeline's ID, length in frames and seconds,
 and `cut_points_seconds`, the output times of every join, which `render.check`-style
 reviews can use.
+
+### Put subtitles on the timeline
+
+Add `subtitles_path`, an absolute `.srt` file, to place its cues on subtitle track 1
+of the new timeline. The SRT's times must already be in the output time of this exact
+assembly, in seconds from the timeline start. `captions create` with the same cut plan
+gives you that for a single-take edit; for several takes, write an SRT timed to the
+combined edit.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"}],"subtitles_path":"/absolute/talk.srt"}' \
+  | videogenie resolve timeline assemble --json --input-json -
+```
+
+VideoGenie adds the subtitles while the new timeline is still empty, reads every cue
+back, and checks that each one starts within one frame of its SRT time. Then it places
+the takes from the timeline start. A cue that ends after the assembled length is
+refused before Resolve is touched. If Resolve places the cues anywhere else, the new
+timeline is deleted, so you can retry with the same name. The result adds
+`subtitle_cue_count` and `subtitles_sha256`; both are null without subtitles.
+VideoGenie can't check that the SRT text matches the takes.
+
+Resolve 21.1's scripting API can't put SRT cues at their own times on a timeline
+that already has clips: it places them after the timeline's end. For an existing or
+hand-edited timeline, import the SRT in Resolve yourself (File > Import > Subtitle).
 
 ## Grade color in DaVinci Resolve
 

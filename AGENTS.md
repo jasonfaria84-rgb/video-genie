@@ -13,12 +13,13 @@ seven additive discovery reads, and the editing toolkit that follows them:
 never overwrites), `resolve.status`, `transcript.create`/`get` (local Whisper by default,
 which keeps "um"/"uh" as words, or Resolve transcription; FFmpeg-checked gaps; kind
 "sound" marks audible untranscribed stretches, cut only with `cut_sounds`),
-`resolve.timeline.assemble` (new timeline from cut plans; never edits an existing
-one), `resolve.render` (private render, verified, published without overwriting),
-`resolve.color.apply` (looks and bounded adjustments as CDL in a separate color
-version; LUTs only from Resolve's library), `edit.cuts.plan`/`get` (fillers, false
-starts and pauses from a transcript), `captions.create` (SRT, optional FFmpeg
-burn-in that needs libass), `render.check` (per-cut review and contact sheet), and
+`resolve.timeline.assemble` (new timeline from cut plans, optionally with an SRT on
+subtitle track 1; never edits an existing one), `resolve.render` (private render,
+verified, published without overwriting), `resolve.color.apply` (looks and bounded
+adjustments as CDL in a separate color version; LUTs only from Resolve's library),
+`edit.cuts.plan`/`get` (fillers, false starts and pauses from a transcript),
+`captions.create` (SRT, optional FFmpeg burn-in that needs libass), `render.check`
+(per-cut review and contact sheet),
 `overlay.renderers`/`overlay.place` (renderer detection; alpha .mov, .png or Fusion .comp
 on a transparent carrier, placed above the footage without overlapping existing items),
 and `workflow.run`/`get` (folder of takes to finished video through those steps in order,
