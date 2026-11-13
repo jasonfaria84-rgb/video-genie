@@ -437,7 +437,8 @@ printf '%s' '{"plan_id":"PLAN_UUID"}' | videogenie edit cuts get --json --input-
 | `transcript_id` | required | The stored transcript to plan from. |
 | `filler_words` | um, umm, uhm, uh, uhh, er, erm, ah, hmm, mm | Words to cut. Case, spaces and punctuation are ignored, so `" Um,"` matches `um`. A multi-word entry such as `"you know"` matches consecutive words; none are in the default list. |
 | `remove_false_starts` | true | Cut the earlier copy of a word or 1-4 word phrase repeated within about a second (`I I think`, `we should, we should go`). |
-| `max_filler_seconds` | 1.2 | Untranscribed sound (`kind: "sound"`) up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
+| `cut_sounds` | false | Also cut untranscribed sound (`kind: "sound"`) as a filler. Off by default: on real interviews much of it is speech the engine skipped. |
+| `max_filler_seconds` | 1.2 | With `cut_sounds`, sound up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
 | `min_pause_seconds` | 0.5 | Shortest gap between kept words to cut as a pause (0.2 to 30). |
 | `padding_seconds` | 0.15 | Gap kept beside speech on each side of a cut. Must be under half of `min_pause_seconds`. |
 
@@ -543,11 +544,10 @@ other than the default location. VideoGenie edits only Resolve projects named
 `VideoGenie <project ID>`, and it won't switch away from a project you have open
 unless the request explicitly allows it.
 
-## Transcribe with DaVinci Resolve
+## Transcribe speech word by word
 
-`transcript create` imports one local file into the project's own Resolve project
-(`VideoGenie <project_id>`), transcribes it word by word with Resolve Studio, and
-stores the result. `transcript get` reads it back by `transcript_id`.
+`transcript create` transcribes one local file word by word and stores the result.
+`transcript get` reads it back by `transcript_id`.
 
 ```bash
 printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
@@ -555,16 +555,29 @@ printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
 ```
 
 Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
-`kind`. Resolve leaves filler words such as "um" and "uh" out of its text, so
-VideoGenie checks every gap between words with FFmpeg: quiet stretches become
-`kind: "silence"` and audible ones `kind: "sound"`, which usually means a filler,
-breath or noise. Transcripts are tied to the source file's SHA-256.
+`kind`. Transcripts are tied to the source file's SHA-256. Choose the engine with
+`engine`:
 
-The call refuses when you have a different Resolve project open; pass
-`"allow_switch": true` after saving your work to let VideoGenie open its own
-project. `speaker_detection` (default true), `noise_threshold_db` (default -35)
-and `timeout_seconds` (default 900) are optional. The file must be a format Resolve
-imports; Resolve rejects the AIFF files written by macOS `say`, for example.
+- `whisper` (default) runs local Whisper ([mlx-whisper](https://pypi.org/project/mlx-whisper/),
+  Apple silicon) on this machine. It keeps filler words such as "um" and "uh" as
+  words with their own timings, which is what precise filler removal needs. Install it
+  with `pip install mlx-whisper`, or point `VIDEOGENIE_WHISPER_BIN` at its `mlx_whisper`
+  command. The model (`whisper_model`, default `mlx-community/whisper-large-v3-turbo`)
+  downloads once on first use; audio never leaves the machine. `language` (such as
+  `en`) skips language detection.
+- `resolve` imports the file into the project's own Resolve project
+  (`VideoGenie <project_id>`) and uses Resolve Studio's transcription, with
+  `speaker_detection` (default true). Resolve leaves fillers out of its text, and on
+  real interviews it also skips some real words. VideoGenie switches Resolve to the
+  Edit page first, because Resolve won't transcribe on the Deliver page, and fails
+  straight away if Resolve refuses. The call refuses when you have a different Resolve
+  project open; pass `"allow_switch": true` after saving your work. The file must be a
+  format Resolve imports; Resolve rejects the AIFF files written by macOS `say`.
+
+With either engine, VideoGenie checks every gap between words with FFmpeg: quiet
+stretches become `kind: "silence"` and audible ones `kind: "sound"` (a filler, breath,
+noise or speech the engine skipped). `noise_threshold_db` (default -35) and
+`timeout_seconds` (default 900) are optional.
 
 ## Assemble an edit in DaVinci Resolve
 

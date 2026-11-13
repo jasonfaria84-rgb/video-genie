@@ -160,7 +160,7 @@ def test_false_start_limits_gap_speaker_and_filler_between() -> None:
     assert result.cuts[0].word_ids == ("w000000", "w000001", "w000002")
 
 
-def test_sound_is_a_filler_only_when_short() -> None:
+def test_sound_is_kept_unless_asked_then_cut_only_when_short() -> None:
     record = transcript(
         [
             (1.0, 1.5, " Hello"),
@@ -172,7 +172,9 @@ def test_sound_is_a_filler_only_when_short() -> None:
         ],
         duration=8.0,
     )
-    result = plan(record)
+    # By default untranscribed sound stays: it may be speech the engine skipped.
+    assert removed(plan(record)) == {}
+    result = plan(record, cut_sounds=True)
     assert removed(result) == {"w000001": "filler"}
     assert [(c.start_seconds, c.end_seconds, c.reason) for c in result.cuts] == [
         (0.0, 0.85, "leading_silence"),
@@ -182,7 +184,7 @@ def test_sound_is_a_filler_only_when_short() -> None:
         (6.65, 8.0, "trailing_silence"),
     ]
     # The 2 s sound (laughter, music) stays whole; raising the limit allows cutting it.
-    assert removed(plan(record, max_filler_seconds=2.5)) == {
+    assert removed(plan(record, cut_sounds=True, max_filler_seconds=2.5)) == {
         "w000001": "filler",
         "w000003": "filler",
     }
@@ -233,6 +235,7 @@ def test_random_transcripts_keep_contract() -> None:
             position = max(start, end + generator.uniform(-0.2, 1.5))
         duration = round(max([e[1] for e in entries] + [0.5]) + generator.uniform(0, 1), 3)
         plan(transcript(entries, duration=duration))
+        plan(transcript(entries, duration=duration), cut_sounds=True)
 
 
 def test_input_bounds() -> None:
@@ -245,6 +248,7 @@ def test_input_bounds() -> None:
         {"filler_words": ["..."]},
         {"filler_words": [""]},
         {"remove_false_starts": "yes"},
+        {"cut_sounds": "yes"},
         {"extra": 1},
     ):
         with pytest.raises(ValidationError):

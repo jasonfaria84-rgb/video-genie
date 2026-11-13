@@ -10,8 +10,9 @@ expose 75 shared agent operations, including local recipe/brand drafts, immutabl
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and the editing toolkit that follows them:
 `media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
-never overwrites), `resolve.status`, `transcript.create`/`get` (Resolve transcription
-with FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches),
+never overwrites), `resolve.status`, `transcript.create`/`get` (local Whisper by default,
+which keeps "um"/"uh" as words, or Resolve transcription; FFmpeg-checked gaps; kind
+"sound" marks audible untranscribed stretches, cut only with `cut_sounds`),
 `resolve.timeline.assemble` (new timeline from cut plans; never edits an existing
 one), `resolve.render` (private render, verified, published without overwriting),
 `resolve.color.apply` (looks and bounded adjustments as CDL in a separate color

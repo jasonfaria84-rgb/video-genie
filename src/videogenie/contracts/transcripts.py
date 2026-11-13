@@ -46,7 +46,7 @@ class Transcript(ContractModel):
     source_path: str = Field(min_length=1, max_length=4096)
     source_sha256: Sha256
     duration_seconds: Seconds
-    engine: Literal["resolve", "fixture"]
+    engine: Literal["resolve", "whisper", "fixture"]
     engine_version: str = Field(max_length=500)
     language: str | None = Field(default=None, max_length=50)
     words: tuple[TranscriptWord, ...] = Field(max_length=200_000)
@@ -68,16 +68,28 @@ class Transcript(ContractModel):
 
 
 class CreateTranscriptInput(ContractModel):
-    """Transcribe one local media file word by word in DaVinci Resolve Studio and store it.
+    """Transcribe one local media file word by word and store it.
 
-    The file is imported into the VideoGenie project's own Resolve project
-    ("VideoGenie <project_id>"). If you have another Resolve project open, the call
-    refuses unless allow_switch is true. Gaps between words are checked with FFmpeg:
-    quiet stretches become kind "silence", audible ones kind "sound" (likely fillers).
+    engine "whisper" (default) runs local Whisper (mlx-whisper) on this machine and keeps
+    filler words such as "um" and "uh" as words with their own timings, so edit.cuts.plan
+    can remove them precisely. engine "resolve" uses DaVinci Resolve Studio's transcription,
+    importing the file into the project's own Resolve project ("VideoGenie <project_id>");
+    if you have another Resolve project open, the call refuses unless allow_switch is true.
+    Resolve drops fillers and some real words from its text. With either engine, gaps
+    between words are checked with FFmpeg: quiet stretches become kind "silence" and
+    audible ones kind "sound" (a filler, breath, noise or untranscribed speech).
     """
 
     project_id: Identifier
     source_path: str = Field(min_length=1, max_length=4096)
+    engine: Literal["whisper", "resolve"] = "whisper"
+    whisper_model: str = Field(
+        default="mlx-community/whisper-large-v3-turbo",
+        min_length=3,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
     speaker_detection: bool = True
     allow_switch: bool = False
     noise_threshold_db: float = Field(default=-35, ge=-90, le=-10, allow_inf_nan=False)

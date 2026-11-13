@@ -1,10 +1,11 @@
-"""Word-level transcription through DaVinci Resolve Studio, checked against real audio."""
+"""Word-level transcription with local Whisper or DaVinci Resolve, checked against real audio."""
 
 import math
 import re
 import time
 from datetime import UTC, datetime
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from videogenie.contracts.silence import DetectSilenceInput
 from videogenie.contracts.transcripts import CreateTranscriptInput, Transcript, TranscriptWord
 from videogenie.core import transcripts as store
 from videogenie.core.service import VideoGenieService
+from videogenie.workers import whisper
 from videogenie.workers.probe import absolute_media_path, fingerprint, require_unchanged
 from videogenie.workers.silence import detect_silence
 
@@ -128,27 +130,35 @@ def media_pool_clip(pool: Any, path: str) -> Any:
     return imported[0]
 
 
-def create_transcript(service: VideoGenieService, request: CreateTranscriptInput) -> Transcript:
-    """Transcribe in Resolve, verify gaps with FFmpeg, and store the transcript."""
-    deadline = time.monotonic() + request.timeout_seconds
-    service.get_project(request.project_id)
-    path = absolute_media_path(request.source_path)
-    source = fingerprint(path, request.timeout_seconds)
-    status = resolve.resolve_status(min(30.0, request.timeout_seconds))
-    app = resolve.connect(min(30.0, request.timeout_seconds))
+def _resolve_transcription(
+    request: CreateTranscriptInput, path: str, deadline: float
+) -> tuple[list[tuple[float, float, str, str | None]], str | None, str]:
+    """Transcribe in the project's own Resolve project; returns words, language, version."""
+    status = resolve.resolve_status(min(30.0, max(1.0, deadline - time.monotonic())))
+    app = resolve.connect(min(30.0, max(1.0, deadline - time.monotonic())))
     project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
-    clip = media_pool_clip(project.GetMediaPool(), str(path))
+    clip = media_pool_clip(project.GetMediaPool(), path)
     fps = float(clip.GetClipProperty("FPS") or 0)
     start_tc = str(clip.GetClipProperty("Start TC") or "00:00:00:00")
     transcription: Any = clip.GetTranscription()
     if not (isinstance(transcription, dict) and transcription.get("segments")):
-        finished, _ = resolve.call_with_timeout(
+        # Resolve refuses to transcribe while the Deliver page is showing (where a render
+        # leaves it), so switch to the Edit page first.
+        if app.GetCurrentPage() != "edit":
+            app.OpenPage("edit")
+        finished, accepted = resolve.call_with_timeout(
             lambda: clip.TranscribeAudio(request.speaker_detection),
             max(1.0, deadline - time.monotonic()),
         )
         if not finished:
             raise VideoGenieError(
                 "MEDIA_UNAVAILABLE", "Resolve transcription exceeded its deadline"
+            )
+        if accepted is not True:
+            raise VideoGenieError(
+                "DEPENDENCY_UNAVAILABLE",
+                "Resolve refused to transcribe the clip; close any open dialog in Resolve "
+                "and check that its Edit page can be shown",
             )
         while time.monotonic() < deadline:
             transcription = clip.GetTranscription()
@@ -157,6 +167,43 @@ def create_transcript(service: VideoGenieService, request: CreateTranscriptInput
             time.sleep(1)
     if not (isinstance(transcription, dict) and transcription.get("segments")):
         raise VideoGenieError("MEDIA_UNAVAILABLE", "Resolve returned no transcription")
+    language = transcription.get("language")
+    return (
+        resolve_words(transcription, fps, start_tc),
+        language if isinstance(language, str) else None,
+        status.version or "unknown",
+    )
+
+
+def _whisper_transcription(
+    service: VideoGenieService, request: CreateTranscriptInput, path: str, deadline: float
+) -> tuple[Any, str | None, str]:
+    """Run local Whisper; returns its raw output (words come later), language, version."""
+    result = whisper.transcribe(
+        Path(path),
+        model=request.whisper_model,
+        language=request.language,
+        timeout_seconds=max(1.0, deadline - time.monotonic()),
+        work_dir=service.data_dir / "work",
+    )
+    language = result.get("language")
+    return result, language if isinstance(language, str) else None, request.whisper_model
+
+
+def create_transcript(service: VideoGenieService, request: CreateTranscriptInput) -> Transcript:
+    """Transcribe with the requested engine, verify gaps with FFmpeg, and store the transcript."""
+    deadline = time.monotonic() + request.timeout_seconds
+    service.get_project(request.project_id)
+    path = absolute_media_path(request.source_path)
+    source = fingerprint(path, request.timeout_seconds)
+    raw: Any = None
+    if request.engine == "resolve":
+        found, language, engine_version = _resolve_transcription(request, str(path), deadline)
+    else:
+        raw, language, engine_version = _whisper_transcription(
+            service, request, str(path), deadline
+        )
+        found = []
     remaining = deadline - time.monotonic()
     if remaining <= 1:
         raise VideoGenieError("MEDIA_UNAVAILABLE", "Transcription exceeded its deadline")
@@ -169,10 +216,11 @@ def create_transcript(service: VideoGenieService, request: CreateTranscriptInput
             timeout_seconds=min(3600.0, remaining),
         )
     )
+    duration = plan.source.duration_seconds
+    if raw is not None:
+        found = whisper.words(raw, duration)
     quiet = [(item.start_seconds, item.end_seconds) for item in plan.silences]
-    words = classify(
-        resolve_words(transcription, fps, start_tc), plan.source.duration_seconds, quiet
-    )
+    words = classify(found, duration, quiet)
     require_unchanged(path, source)
     if plan.source.sha256 != source.sha256:
         raise VideoGenieError("INPUT_CHANGED", "Media changed during transcription")
@@ -180,12 +228,10 @@ def create_transcript(service: VideoGenieService, request: CreateTranscriptInput
         transcript_id=str(uuid4()),
         source_path=str(path),
         source_sha256=source.sha256,
-        duration_seconds=plan.source.duration_seconds,
-        engine="resolve",
-        engine_version=status.version or "unknown",
-        language=transcription.get("language")
-        if isinstance(transcription.get("language"), str)
-        else None,
+        duration_seconds=duration,
+        engine=request.engine,
+        engine_version=engine_version,
+        language=language,
         words=tuple(words),
         created_at=datetime.now(UTC).isoformat(),
     )
