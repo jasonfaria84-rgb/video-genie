@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BeforeValidator, Field, model_validator
 
 from videogenie.contracts.assets import AssetPin, LiteralText, Sha256
+from videogenie.contracts.color import ColorAdjustments, Look
 from videogenie.contracts.models import ContractModel, Identifier
 from videogenie.contracts.studio import Timestamp
 
@@ -123,8 +124,24 @@ class BrandContent(ContractModel):
     role_color: Color
 
 
+class RecipeColor(ContractModel):
+    """A grade the recipe asks for, in resolve.color.apply's terms.
+
+    look is one of resolve.color.apply's named looks, and adjustments has the same bounds.
+    Like every recipe section it carries schema_version, so later shapes can be told apart.
+    LUTs are left out: they name files in one machine's Resolve library.
+    """
+
+    look: Look = "neutral"
+    adjustments: ColorAdjustments = Field(default_factory=ColorAdjustments)
+
+
 class RecipeContent(ContractModel):
-    """One typed capability, with JSON schemas supplied by the named input/output models."""
+    """One typed capability, with JSON schemas supplied by the named input/output models.
+
+    color is optional. When it is absent the section is left out of the content entirely,
+    so recipes made before it existed keep their content and digests unchanged.
+    """
 
     capability: Literal["graphics.render_lower_third"] = "graphics.render_lower_third"
     capability_version: Literal["1"] = "1"
@@ -133,6 +150,7 @@ class RecipeContent(ContractModel):
     output: LowerThirdOutput = Field(default_factory=LowerThirdOutput)
     layout: LowerThirdLayout = Field(default_factory=LowerThirdLayout)
     resources: ResourceBounds
+    color: RecipeColor | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class _ContentRecord(ContractModel):
