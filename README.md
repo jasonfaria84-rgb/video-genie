@@ -10,14 +10,15 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 75 shared agent operations: projects and clients, cycles and
+This source exposes 77 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests and output selection, plus an editing toolkit:
 dead-space removal, word-level transcripts made in DaVinci Resolve, cut plans that
 remove filler words and false starts, timeline assembly, color grading and
 rendering in Resolve, subtitles, motion graphics overlays placed on Resolve
-timelines, and a self-check of every cut in a render. Seven
+timelines, a self-check of every cut in a render, and a resumable workflow that
+turns a folder of takes into a finished video. Seven
 additive discovery reads preserve the earlier 54 operation schemas and results; the
 editing operations follow them. A separate supervised owner console handles
 enrollment, publication, budget grants, and final review.
@@ -256,7 +257,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 75 agent operations. Replace spaces in each CLI command
+The server exposes the same 77 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -681,6 +682,80 @@ frame rate and be at least `duration_seconds` long. The result gives the new
 item's `timeline_item_id`, `track_index`, record frames (end exclusive) and the
 properties read back from Resolve. If any check fails after placing, the item
 (and any track it added) is removed.
+
+## Folder to finished video
+
+`workflow run` turns a folder of takes into a finished video in one call. It runs
+the editing operations above in order and stores a record of every step, so a run
+that stops part-way can carry on later without redoing finished work:
+
+1. `transcribe`: `transcript.create` for each take.
+2. `plan_cuts`: `edit.cuts.plan` for each transcript.
+3. `assemble`: joins the takes' kept ranges, in take order.
+4. `color`: a look and adjustments, as ASC CDL values.
+5. `render`: the new output file.
+6. `captions`: an SRT beside the output, optionally burned in.
+7. `check`: `render.check` at every join, with a contact sheet.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","folder":"/absolute/takes","output_path":"/absolute/final.mp4",
+  "backend":"ffmpeg","color":{"look":"warm_cinematic"}}' \
+  | videogenie workflow run --json --input-json -
+printf '%s' '{"workflow_id":"<uuid>"}' | videogenie workflow get --json --input-json -
+```
+
+With `backend` `resolve` (the default), assemble, color and render happen in the
+project's own Resolve project, as `resolve timeline assemble`, `resolve color apply`
+and `resolve render` do. With `ffmpeg`, they happen locally in one FFmpeg render:
+kept ranges are trimmed to whole frames, joins get a 30 ms audio fade, and the
+output is H.264 (CRF 18) with AAC audio. There is no timeline, so `timeline_name`
+stays null. Both backends grade with the same CDL values; FFmpeg applies them with
+`lutrgb` per channel and saturation with `hue`. Takes with a different picture size
+or frame rate from the first are scaled, padded and retimed to match it.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `folder` | required | Folder holding the takes. |
+| `files` | all media | File names inside `folder`, in edit order. Without it, every `.mp4` `.mov` `.m4v` `.mxf` `.wav` `.m4a` file directly in the folder is used, sorted by name (up to 200). Names can't contain path separators. |
+| `output_path` | required | A new `.mp4` or `.mov`. The SRT (`<name>.srt`), contact sheet (`<name>-cuts.png`) and burned-in copy (`<name>-captioned.mp4`) go beside it. None of these may exist yet. |
+| `backend` | `resolve` | `resolve` or `ffmpeg`, for assemble, color and render. |
+| `transcribe` | whisper | `engine` (`whisper` or `resolve`), `language`, `whisper_model`, as in `transcript create`. |
+| `cuts` | plan defaults | The `edit cuts plan` settings: `filler_words`, `remove_false_starts`, `cut_sounds`, `max_filler_seconds`, `min_pause_seconds`, `padding_seconds`. |
+| `color` | null | `look` and `adjustments`, as in `resolve color apply`. Null skips grading. LUTs aren't offered here. |
+| `captions` | 2 words, uppercase | `words_per_cue`, `uppercase`, `max_cue_seconds`, `min_cue_seconds`, `burn` (false), `font_size`. |
+| `check` | contact sheet on | `contact_sheet` turns the contact sheet on or off. |
+| `skip` | none | Steps to leave out, by name. |
+| `allow_switch` | false | Let Resolve steps switch away from the Resolve project you have open. |
+| `timeout_seconds` | 7200 | Deadline for this call. Steps unfinished at the deadline can be resumed. |
+| `resume_workflow_id` | none | Resume a stored workflow; see below. |
+
+Skipping a step also skips the steps that need it, and the record says why. Without
+`transcribe` there are no `plan_cuts` or `captions`, and backend `resolve` can't
+assemble, so it needs `ffmpeg` or `assemble` skipped too. Without `plan_cuts`, whole
+takes are used. Without `assemble`, nothing after it runs. Without `render`, there's
+no `check`, and `burn` is skipped while the SRT is still written.
+
+The result is the stored workflow record: `status` (`running`, `done` or `failed`),
+the takes, the request, each step's `status`, `attempts`, times, `result` (IDs, paths
+and measurements) or `error`, and `links`: `transcript_ids`, `cut_plan_ids`,
+`timeline_name`, `render_path`, `captions_path`, `captioned_video_path` and `review`
+(the check's verdict, failed cuts, reasons, A/V drift and contact sheet). A failing
+step doesn't fail the call: the envelope succeeds, `status` is `failed`, and that step
+holds the error code and message. Invalid requests still fail before anything runs.
+Records live under the data directory in `workflows/`.
+
+To resume, fix the cause and call `workflow run` again with `project_id` and
+`resume_workflow_id`. The run continues at the first unfinished step; finished steps,
+and takes already transcribed or planned, aren't repeated. Omit the other fields or
+repeat them unchanged; only `timeout_seconds` and `allow_switch` may change. A finished
+workflow is returned as it is. Only one call can run a workflow at a time; another
+gets `LEASE_HELD`. A `running` step in a stored record was interrupted (or is still
+running elsewhere) and runs again on resume. If the interrupted step had already
+published its file, remove that file before resuming.
+
+Burning in captions needs an FFmpeg with libass. Without it the captions step fails
+with `DEPENDENCY_UNAVAILABLE` and its SRT isn't kept. MCP paths must be absolute; CLI
+paths may be relative to the current folder.
 
 ## Recover a probe job
 

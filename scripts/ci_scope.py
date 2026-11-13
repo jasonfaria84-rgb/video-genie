@@ -89,6 +89,7 @@ KNOWN_TESTS = {
     "tests/test_studio_contracts.py",
     "tests/test_transcription.py",
     "tests/test_transcripts.py",
+    "tests/test_workflow.py",
 }
 TRANSPORT_TESTS = {
     "tests/test_cli.py",
@@ -111,6 +112,7 @@ TRANSPORT_TESTS = {
     "tests/test_captions.py",
     "tests/test_render_check.py",
     "tests/test_overlays.py",
+    "tests/test_workflow.py",
 }
 OWNER_TESTS = {
     "tests/test_owner_auth.py",
@@ -223,7 +225,7 @@ PATH_TESTS = {
     },
     "src/videogenie/workers/lower_third.py": RENDER_TESTS,
     "src/videogenie/workers/artifact_preview.py": RENDER_TESTS,
-    "src/videogenie/workers/silence.py": {"tests/test_silence.py"},
+    "src/videogenie/workers/silence.py": {"tests/test_silence.py", "tests/test_workflow.py"},
     "src/videogenie/adapters/resolve.py": {
         "tests/test_resolve.py",
         "tests/test_transcription.py",
@@ -236,14 +238,16 @@ PATH_TESTS = {
         "tests/test_transcription.py",
         "tests/test_assembly.py",
         "tests/test_overlays.py",
+        "tests/test_workflow.py",
     },
-    "src/videogenie/core/assembly.py": {"tests/test_assembly.py"},
+    "src/videogenie/core/assembly.py": {"tests/test_assembly.py", "tests/test_workflow.py"},
     "src/videogenie/core/resolve_render.py": {
         "tests/test_resolve_render.py",
         "tests/test_color.py",
         "tests/test_overlays.py",
+        "tests/test_workflow.py",
     },
-    "src/videogenie/core/color.py": {"tests/test_color.py"},
+    "src/videogenie/core/color.py": {"tests/test_color.py", "tests/test_workflow.py"},
     "src/videogenie/core/overlays.py": {"tests/test_overlays.py"},
     "src/videogenie/contracts/overlays.py": {"tests/test_overlays.py"} | TRANSPORT_TESTS,
     "src/videogenie/workers/overlay_renderers.py": {"tests/test_overlays.py"},
@@ -254,13 +258,21 @@ PATH_TESTS = {
         "tests/test_cut_planning.py",
         "tests/test_captions.py",
         "tests/test_render_check.py",
+        "tests/test_workflow.py",
     },
-    "src/videogenie/core/cut_planning.py": {"tests/test_cut_planning.py"},
-    "src/videogenie/workers/captions.py": {"tests/test_captions.py"},
-    "src/videogenie/core/captions.py": {"tests/test_captions.py"},
+    "src/videogenie/core/cut_planning.py": {"tests/test_cut_planning.py", "tests/test_workflow.py"},
+    "src/videogenie/workers/captions.py": {"tests/test_captions.py", "tests/test_workflow.py"},
+    "src/videogenie/core/captions.py": {"tests/test_captions.py", "tests/test_workflow.py"},
     # Docstrings and fields are the published CLI/MCP schema.
     "src/videogenie/contracts/captions.py": TRANSPORT_TESTS,
-    "src/videogenie/workers/render_check.py": {"tests/test_render_check.py"},
+    "src/videogenie/workers/render_check.py": {
+        "tests/test_render_check.py",
+        "tests/test_workflow.py",
+    },
+    "src/videogenie/core/workflow.py": {"tests/test_workflow.py"},
+    "src/videogenie/workers/concat.py": {"tests/test_workflow.py"},
+    # Docstrings and fields are the published CLI/MCP schema.
+    "src/videogenie/contracts/workflow.py": {"tests/test_workflow.py"} | TRANSPORT_TESTS,
     "scripts/dogfood_external_agent.py": {
         "tests/test_ci_scope.py",
         "tests/test_external_install.py",
