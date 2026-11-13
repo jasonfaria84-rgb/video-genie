@@ -512,7 +512,11 @@ Each cut gets a pass or fail with reasons:
 
 The whole file also fails with `av_drift` when its audio and video stream durations
 differ by more than `max_av_drift_seconds` (default 0.05), or with
-`av_drift_unmeasured` when the container doesn't report them. Calibration on generated
+`av_drift_unmeasured` when they can't be measured. Each duration runs from the stream's
+first to its last presented packet, read from the first few packets and the last few
+seconds only. AAC encoder priming (`skip_samples`) doesn't count as audio, because
+Resolve's MP4 edit lists include it in the container's audio duration. If the packets
+can't be read, the container's stream duration is used instead. Calibration on generated
 media: clean silence-removal cuts measure a 0 dB jump and a -40 dB click score; an
 abrupt quiet-to-loud join measured a 34 dB jump, and a same-level phase jump a 21 dB click
 score. Frames in a freeze differ by under 0.01; moving test video by 2 or more.
