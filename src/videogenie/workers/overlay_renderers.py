@@ -21,7 +21,7 @@ FIXES = {
 }
 NOTES: dict[RendererName, str] = {
     "pil": "Renders lower thirds as qtrle alpha MOVs (graphics.render_lower_third).",
-    "fusion": "Fusion runs inside Resolve; placing .comp files is not yet supported.",
+    "fusion": "Fusion runs inside Resolve; overlay.place attaches .comp files to a clip.",
     "lottie": "Native Lottie import needs Resolve 21 or newer and is unverified; placing Lottie "
     "files is not yet supported.",
     "remotion": "Detection only. Remotion's license is free only for individuals and companies "
@@ -92,7 +92,7 @@ def detect_renderers(timeout_seconds: float) -> OverlayRenderers:
         version=status.version,
         missing=() if studio else ("davinci-resolve-studio",),
         fix=status.fix,
-        rendering_supported=False,
+        rendering_supported=studio,
         note=NOTES["fusion"],
     )
     lottie_ready = studio and _major(status.version) >= 21
@@ -102,6 +102,7 @@ def detect_renderers(timeout_seconds: float) -> OverlayRenderers:
             "available": lottie_ready,
             "missing": () if lottie_ready else ("davinci-resolve-studio-21",),
             "fix": None if lottie_ready else status.fix or "Update to DaVinci Resolve Studio 21",
+            "rendering_supported": False,
             "note": NOTES["lottie"],
         }
     )

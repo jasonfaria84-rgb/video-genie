@@ -1,6 +1,7 @@
 """Self-checking renders on real generated media: clean edits pass, bad joins fail."""
 
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,10 @@ from videogenie.core import transcripts
 from videogenie.core.service import VideoGenieService
 from videogenie.workers.render_check import (
     THUMB_BOX,
+    _Packet,
     measure_audio,
     plan_cut_points,
+    presented_span,
     sheet_layout,
 )
 
@@ -236,3 +239,96 @@ def test_mcp_requires_absolute_paths(tmp_path: Path) -> None:
             assert relative.error is not None and relative.error.code == "INVALID_ARGUMENT"
 
     asyncio.run(scenario())
+
+
+def packet(pts: str, length: str, skip: int = 0) -> _Packet:
+    side = [{"skip_samples": skip, "discard_padding": 0}] if skip else []
+    return _Packet.model_validate(
+        {"pts_time": pts, "duration_time": length, "side_data_list": side}
+    )
+
+
+def test_presented_span_applies_priming_and_reordering() -> None:
+    # Packet timing from a real Resolve 21.1 AAC render (2112 priming samples at 48 kHz).
+    audio = [
+        packet("-0.044000", "0.021333", 2112),
+        packet("-0.022667", "0.021333"),
+        packet("-0.001333", "0.021333"),
+        packet("156.926667", "0.021333"),
+        packet("156.948000", "0.021333"),
+    ]
+    assert presented_span(audio, 48000) == pytest.approx((0.0, 156.969333))
+    # Without a sample rate the skip can't be converted; negative time is still not shown.
+    assert presented_span(audio, None) == pytest.approx((0.0, 156.969333))
+    # B-frames arrive out of presentation order; the latest end wins.
+    video = [packet("0.000000", "0.041708"), packet("0.166833", "0.041708")]
+    video += [packet("156.906750", "0.041708"), packet("156.865042", "0.041708")]
+    assert presented_span(video, None) == pytest.approx((0.0, 156.948458))
+    assert presented_span([packet("N/A", "0.02"), packet("1.0", "N/A")], 48000) is None
+    assert presented_span([], 48000) is None
+
+
+def make_synced(path: Path, audio_seconds: float = 2.0) -> Path:
+    subprocess.run(
+        [ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:d=2"]
+        + ["-f", "lavfi", "-i", f"sine=f=440:d={audio_seconds}:sample_rate=48000"]
+        + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    return path
+
+
+def probe_audio_duration(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    assert ffprobe is not None, "Real ffprobe is required for media acceptance"
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a:0"]
+        + ["-show_entries", "stream=duration", "-of", "csv=p=0", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return float(out.stdout.strip())
+
+
+def count_priming_like_resolve(path: Path) -> None:
+    """Make the audio edit list span the priming samples too, as Resolve 21.1's MP4s do."""
+    data = bytearray(path.read_bytes())
+    lists = [i for i in range(len(data) - 4) if data[i : i + 4] == b"elst"]
+    assert len(lists) == 2, "expected video and audio edit lists"
+    at = lists[1] + 12  # after type, version/flags and entry count: segment_duration (u32)
+    segment = int.from_bytes(data[at : at + 4], "big")
+    media_time = int.from_bytes(data[at + 4 : at + 8], "big")
+    assert segment > 0 and media_time == 1024, "FFmpeg's AAC encoder primes 1024 samples"
+    data[at : at + 4] = (segment + media_time).to_bytes(4, "big")
+    path.write_bytes(bytes(data))
+
+
+def test_aac_priming_is_not_counted_as_drift(tmp_path: Path) -> None:
+    rendered = make_synced(tmp_path / "primed.mp4")
+    count_priming_like_resolve(rendered)
+    # The container now claims one priming frame of extra audio, like Resolve's renders.
+    assert probe_audio_duration(rendered) == pytest.approx(2.021333, abs=1e-4)
+    state, cwd = tmp_path / "state", tmp_path / "cwd"
+    cwd.mkdir()
+    checked = run(
+        state, cwd, "render.check", {"rendered_path": str(rendered), "cut_points_seconds": [1.0]}
+    )["data"]
+    assert checked["rendered"]["audio_duration_seconds"] == pytest.approx(2.0, abs=0.001)
+    assert checked["rendered"]["video_duration_seconds"] == pytest.approx(2.0, abs=0.001)
+    assert checked["av_drift_seconds"] <= 0.001
+    assert "av_drift" not in checked["reasons"]
+
+
+def test_audio_longer_than_video_still_fails_drift(tmp_path: Path) -> None:
+    rendered = make_synced(tmp_path / "long-audio.mp4", audio_seconds=2.2)
+    state, cwd = tmp_path / "state", tmp_path / "cwd"
+    cwd.mkdir()
+    checked = run(
+        state, cwd, "render.check", {"rendered_path": str(rendered), "cut_points_seconds": [1.0]}
+    )["data"]
+    assert checked["av_drift_seconds"] == pytest.approx(0.2, abs=0.01)
+    assert checked["passed"] is False and "av_drift" in checked["reasons"]

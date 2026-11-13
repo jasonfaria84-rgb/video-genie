@@ -45,8 +45,11 @@ class PlaceOverlayInput(ContractModel):
     """Place an existing overlay file on a named timeline of the project's own Resolve project.
 
     source_path is an absolute path to a .mov with alpha (such as the qtrle MOV from
-    graphics.render_lower_third) or a .png still. .comp Fusion compositions are not yet
-    supported. The file is imported into the media pool once and reused afterwards. It is
+    graphics.render_lower_third), a .png still, or a Fusion composition (.comp, up to 16 MiB).
+    A .comp is attached to a fully transparent carrier clip at the timeline's size, rate and
+    the requested length, so Fusion draws it over the footage; Resolve evaluates the
+    composition as it would when you import it yourself, so pass only compositions you trust.
+    Files are imported into the media pool once and reused afterwards. The overlay is
     placed at start_seconds (from the timeline start) for duration_seconds on a video track:
     "auto" picks the lowest track above every video item in that time range, adding a track
     when none is free; an explicit track must be 2 or higher, at most one above the current
@@ -74,6 +77,7 @@ class PlacedOverlay(ContractModel):
     """Where the overlay landed, with properties read back from Resolve after setting them.
 
     record_end_frame is exclusive. timeline_item_id is Resolve's unique ID for the new item.
+    fusion_comp_name is the active composition on that item when source_path was a .comp.
     """
 
     project_id: Identifier
@@ -88,3 +92,4 @@ class PlacedOverlay(ContractModel):
     source_path: str
     source_sha256: Sha256
     properties: dict[str, float]
+    fusion_comp_name: str | None = None

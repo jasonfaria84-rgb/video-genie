@@ -10,14 +10,15 @@ SQLite storage, stable project and storyline UUIDs, revision checks, idempotency
 keys, and durable ffprobe jobs. No source checkout, CLEO installation, or previous
 agent conversation is needed at runtime.
 
-This source exposes 75 shared agent operations: projects and clients, cycles and
+This source exposes 77 shared agent operations: projects and clients, cycles and
 duration, media probes, immutable assets, recipe and brand drafts/versions,
 fictional previews, explicit render bindings, bounded local lower-third rendering,
 artifacts, costs, approval requests and output selection, plus an editing toolkit:
 dead-space removal, word-level transcripts made in DaVinci Resolve, cut plans that
 remove filler words and false starts, timeline assembly, color grading and
 rendering in Resolve, subtitles, motion graphics overlays placed on Resolve
-timelines, and a self-check of every cut in a render. Seven
+timelines, a self-check of every cut in a render, and a resumable workflow that
+turns a folder of takes into a finished video. Seven
 additive discovery reads preserve the earlier 54 operation schemas and results; the
 editing operations follow them. A separate supervised owner console handles
 enrollment, publication, budget grants, and final review.
@@ -256,7 +257,7 @@ Respect the host's approval policy; the owner can consent to the specific tools
 and data directory needed for a session. Don't disable approvals globally.
 Ensure the server's environment can find ffprobe.
 
-The server exposes the same 75 agent operations. Replace spaces in each CLI command
+The server exposes the same 77 agent operations. Replace spaces in each CLI command
 with underscores and prefix `videogenie_`: `project client assign` becomes
 `videogenie_project_client_assign`, and `project duration` becomes
 `videogenie_project_duration`. `capabilities` is `videogenie_capabilities`.
@@ -437,7 +438,8 @@ printf '%s' '{"plan_id":"PLAN_UUID"}' | videogenie edit cuts get --json --input-
 | `transcript_id` | required | The stored transcript to plan from. |
 | `filler_words` | um, umm, uhm, uh, uhh, er, erm, ah, hmm, mm | Words to cut. Case, spaces and punctuation are ignored, so `" Um,"` matches `um`. A multi-word entry such as `"you know"` matches consecutive words; none are in the default list. |
 | `remove_false_starts` | true | Cut the earlier copy of a word or 1-4 word phrase repeated within about a second (`I I think`, `we should, we should go`). |
-| `max_filler_seconds` | 1.2 | Untranscribed sound (`kind: "sound"`) up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
+| `cut_sounds` | false | Also cut untranscribed sound (`kind: "sound"`) as a filler. Off by default: on real interviews much of it is speech the engine skipped. |
+| `max_filler_seconds` | 1.2 | With `cut_sounds`, sound up to this long is cut as a filler (0.1 to 3). Longer sound, such as laughter or music, stays. |
 | `min_pause_seconds` | 0.5 | Shortest gap between kept words to cut as a pause (0.2 to 30). |
 | `padding_seconds` | 0.15 | Gap kept beside speech on each side of a cut. Must be under half of `min_pause_seconds`. |
 
@@ -458,7 +460,8 @@ plans into a Resolve timeline, then `resolve render` to make the file.
 cues: two spoken words per cue in UPPERCASE by default. Give `cut_plan_id` (a plan
 made from the same transcript) to time cues to the edited output instead of the
 source; words inside cuts are dropped and no cue spans a cut. The SRT is plain UTF-8
-and imports into DaVinci Resolve as a subtitle track. Add `burn_in` to also render
+and imports into DaVinci Resolve as a subtitle track; `resolve timeline assemble` can
+place it for you (see below). Add `burn_in` to also render
 the subtitles into a new copy of a video with local FFmpeg.
 
 ```bash
@@ -512,7 +515,11 @@ Each cut gets a pass or fail with reasons:
 
 The whole file also fails with `av_drift` when its audio and video stream durations
 differ by more than `max_av_drift_seconds` (default 0.05), or with
-`av_drift_unmeasured` when the container doesn't report them. Calibration on generated
+`av_drift_unmeasured` when they can't be measured. Each duration runs from the stream's
+first to its last presented packet, read from the first few packets and the last few
+seconds only. AAC encoder priming (`skip_samples`) doesn't count as audio, because
+Resolve's MP4 edit lists include it in the container's audio duration. If the packets
+can't be read, the container's stream duration is used instead. Calibration on generated
 media: clean silence-removal cuts measure a 0 dB jump and a -40 dB click score; an
 abrupt quiet-to-loud join measured a 34 dB jump, and a same-level phase jump a 21 dB click
 score. Frames in a freeze differ by under 0.01; moving test video by 2 or more.
@@ -543,11 +550,10 @@ other than the default location. VideoGenie edits only Resolve projects named
 `VideoGenie <project ID>`, and it won't switch away from a project you have open
 unless the request explicitly allows it.
 
-## Transcribe with DaVinci Resolve
+## Transcribe speech word by word
 
-`transcript create` imports one local file into the project's own Resolve project
-(`VideoGenie <project_id>`), transcribes it word by word with Resolve Studio, and
-stores the result. `transcript get` reads it back by `transcript_id`.
+`transcript create` transcribes one local file word by word and stores the result.
+`transcript get` reads it back by `transcript_id`.
 
 ```bash
 printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
@@ -555,16 +561,31 @@ printf '%s' '{"project_id":"<uuid>","source_path":"/absolute/talk.mp4"}' \
 ```
 
 Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
-`kind`. Resolve leaves filler words such as "um" and "uh" out of its text, so
-VideoGenie checks every gap between words with FFmpeg: quiet stretches become
-`kind: "silence"` and audible ones `kind: "sound"`, which usually means a filler,
-breath or noise. Transcripts are tied to the source file's SHA-256.
+`kind`. Transcripts are tied to the source file's SHA-256. Choose the engine with
+`engine`:
 
-The call refuses when you have a different Resolve project open; pass
-`"allow_switch": true` after saving your work to let VideoGenie open its own
-project. `speaker_detection` (default true), `noise_threshold_db` (default -35)
-and `timeout_seconds` (default 900) are optional. The file must be a format Resolve
-imports; Resolve rejects the AIFF files written by macOS `say`, for example.
+- `whisper` (default) runs local Whisper ([mlx-whisper](https://pypi.org/project/mlx-whisper/),
+  Apple silicon) on this machine. It keeps filler words such as "um" and "uh" as
+  words with their own timings, which is what precise filler removal needs. Install it
+  with `pip install mlx-whisper`, or point `VIDEOGENIE_WHISPER_BIN` at its `mlx_whisper`
+  command. Audio never leaves the machine. The model (`whisper_model`, default
+  `mlx-community/whisper-large-v3-turbo`) is fetched from the Hugging Face Hub the first
+  time, which counts against `timeout_seconds`; once it is in the local Hub cache, runs
+  are forced offline and the transcript records the cached revision in
+  `engine_version`. `language` (such as `en`) skips language detection.
+- `resolve` imports the file into the project's own Resolve project
+  (`VideoGenie <project_id>`) and uses Resolve Studio's transcription, with
+  `speaker_detection` (default true). Resolve leaves fillers out of its text, and on
+  real interviews it also skips some real words. VideoGenie switches Resolve to the
+  Edit page first, because Resolve won't transcribe on the Deliver page, and fails
+  straight away if Resolve refuses. The call refuses when you have a different Resolve
+  project open; pass `"allow_switch": true` after saving your work. The file must be a
+  format Resolve imports; Resolve rejects the AIFF files written by macOS `say`.
+
+With either engine, VideoGenie checks every gap between words with FFmpeg: quiet
+stretches become `kind: "silence"` and audible ones `kind: "sound"` (a filler, breath,
+noise or speech the engine skipped). `noise_threshold_db` (default -35) and
+`timeout_seconds` (default 900) are optional.
 
 ## Assemble an edit in DaVinci Resolve
 
@@ -579,11 +600,47 @@ printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"},{"cut_plan
 ```
 
 The timeline uses the first take's frame rate and resolution, and every take must
-share that frame rate. `fade_frames` (default 1, the shortest fade Resolve allows)
+share that frame rate. Resolve accepts fractional rates such as 23.976 or 29.97 only
+as a project setting, so VideoGenie first sets its own `VideoGenie <project ID>`
+project's default frame rate to the footage rate; the new timeline inherits it.
+The reported `frame_rate` is read back from the timeline, and a rate that doesn't
+stick is an error. Resolve timelines are at least 256 pixels on each side, so
+smaller footage (such as 320x180) gets a larger frame and renders letterboxed. The
+result's `width` and `height` are read back from Resolve, next to the footage's
+`source_width` and `source_height`, and `resolution_warning` explains any
+difference. `fade_frames` (default 1, the shortest fade Resolve allows)
 adds audio fades at each join. `timeline_name` must be new; existing timelines are
 never edited. The result reports the timeline's ID, length in frames and seconds,
 and `cut_points_seconds`, the output times of every join, which `render.check`-style
 reviews can use.
+
+### Put subtitles on the timeline
+
+Add `subtitles_path`, an absolute `.srt` file, to place its cues on subtitle track 1
+of the new timeline. The SRT's times must already be in the output time of this exact
+assembly, in seconds from the timeline start. `captions create` with the same cut plan
+gives you that for a single-take edit; for several takes, write an SRT timed to the
+combined edit.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","takes":[{"cut_plan_id":"<uuid>"}],"subtitles_path":"/absolute/talk.srt"}' \
+  | videogenie resolve timeline assemble --json --input-json -
+```
+
+VideoGenie adds the subtitles while the new timeline is still empty, reads every cue
+back, and checks that each one starts within one frame of its SRT time. Then it places
+the takes from the timeline start. A cue that ends after the assembled length is
+refused before Resolve is touched. If Resolve places the cues anywhere else, or any
+later step fails, the new timeline is deleted, so you can retry with the same name.
+Resolve keeps an imported SRT's cues in its media pool, so VideoGenie imports a private
+copy named by the file's SHA-256 (`subtitles/<sha256>.srt` in the data directory):
+an edited SRT always gets a fresh import. The result adds `subtitle_cue_count` and
+`subtitles_sha256`; both are null without subtitles. VideoGenie can't check that the
+SRT text matches the takes.
+
+Resolve 21.1's scripting API can't put SRT cues at their own times on a timeline
+that already has clips: it places them after the timeline's end. For an existing or
+hand-edited timeline, import the SRT in Resolve yourself (File > Import > Subtitle).
 
 ## Grade color in DaVinci Resolve
 
@@ -611,6 +668,17 @@ printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","look":"warm_cinem
 The look and adjustments become ASC CDL values on node 1. Resolve only applies
 LUTs from its own LUT library, so install new LUTs through Resolve first. Raw
 filter text and arbitrary file paths aren't accepted.
+
+### Store a grade in a recipe
+
+Recipe content can carry an optional `color` section with the same `look` and
+`adjustments` fields and bounds as `resolve color apply`, for example
+`"color":{"look":"warm_cinematic","adjustments":{"temperature":0.2}}`. It's checked
+like every other recipe field and has its own `schema_version`. LUTs aren't part of
+it, because they name files in one machine's Resolve library. Recipes without
+`color` keep exactly the content and digest they had before the section existed.
+Nothing applies the stored grade automatically yet: read it from the recipe and pass
+`look` and `adjustments` to `resolve color apply` yourself.
 
 ## Render a timeline from DaVinci Resolve
 
@@ -643,9 +711,14 @@ printf '{}' | videogenie overlay renderers --json --input-json -
 
 `overlay place` puts an existing overlay file on a named timeline in the
 project's own Resolve project: a `.mov` with alpha (such as the lower third's
-QuickTime Animation file) or a `.png` still. The file is imported into the media
-pool once and reused after that. Fusion `.comp` files aren't supported yet and
-return `DEPENDENCY_UNAVAILABLE`.
+QuickTime Animation file), a `.png` still, or a Fusion composition (`.comp`, up
+to 16 MiB). The file is imported into the media pool once and reused after that.
+A `.comp` goes on a fully transparent carrier clip that VideoGenie makes with
+FFmpeg at the timeline's size and frame rate (kept in the data directory under
+`overlay-carriers/`), and the composition is attached to that clip so Fusion
+draws it over the footage. Resolve evaluates the composition just as it would
+if you imported it yourself, so pass only compositions you trust. The result's
+`fusion_comp_name` names the active composition on the new item.
 
 ```bash
 printf '%s' '{"project_id":"<uuid>","timeline_name":"My edit","source_path":"/absolute/lower-third.mov","start_seconds":2,"duration_seconds":5}' \
@@ -663,6 +736,87 @@ frame rate and be at least `duration_seconds` long. The result gives the new
 item's `timeline_item_id`, `track_index`, record frames (end exclusive) and the
 properties read back from Resolve. If any check fails after placing, the item
 (and any track it added) is removed.
+
+## Folder to finished video
+
+`workflow run` turns a folder of takes into a finished video in one call. It runs
+the editing operations above in order and stores a record of every step, so a run
+that stops part-way can carry on later without redoing finished work:
+
+1. `transcribe`: `transcript.create` for each take.
+2. `plan_cuts`: `edit.cuts.plan` for each transcript.
+3. `assemble`: joins the takes' kept ranges, in take order.
+4. `color`: a look and adjustments, as ASC CDL values.
+5. `render`: the new output file.
+6. `captions`: an SRT beside the output, optionally burned in.
+7. `check`: `render.check` at every join, with a contact sheet.
+
+```bash
+printf '%s' '{"project_id":"<uuid>","folder":"/absolute/takes","output_path":"/absolute/final.mp4",
+  "backend":"ffmpeg","color":{"look":"warm_cinematic"}}' \
+  | videogenie workflow run --json --input-json -
+printf '%s' '{"workflow_id":"<uuid>"}' | videogenie workflow get --json --input-json -
+```
+
+With `backend` `resolve` (the default), assemble, color and render happen in the
+project's own Resolve project, as `resolve timeline assemble`, `resolve color apply`
+and `resolve render` do. With `ffmpeg`, they happen locally in one FFmpeg render:
+kept ranges are trimmed to whole frames, joins get a 30 ms audio fade, and the
+output is H.264 (CRF 18) with AAC audio. There is no timeline, so `timeline_name`
+stays null. Both backends grade with the same CDL values; FFmpeg applies them with
+`lutrgb` per channel and saturation with `hue`. The output takes its picture size and
+frame rate from the first take that keeps anything. Every take is retimed to that
+frame rate before trimming, so variable frame rate footage stays in sync, and takes
+of another size are scaled and padded to fit.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `folder` | required | Folder holding the takes. |
+| `files` | all media | File names inside `folder`, in edit order. Without it, every `.mp4` `.mov` `.m4v` `.mxf` `.wav` `.m4a` file directly in the folder is used, sorted by name (up to 200). Names can't contain path separators. |
+| `output_path` | required | A new `.mp4` or `.mov`. The SRT (`<name>.srt`), contact sheet (`<name>-cuts.png`) and burned-in copy (`<name>-captioned` with the output's `.mp4` or `.mov`) go beside it. None of these may exist yet. |
+| `backend` | `resolve` | `resolve` or `ffmpeg`, for assemble, color and render. |
+| `transcribe` | whisper | `engine` (`whisper` or `resolve`), `language`, `whisper_model`, as in `transcript create`. |
+| `cuts` | plan defaults | The `edit cuts plan` settings: `filler_words`, `remove_false_starts`, `cut_sounds`, `max_filler_seconds`, `min_pause_seconds`, `padding_seconds`. |
+| `color` | null | `look` and `adjustments`, as in `resolve color apply`. Null skips grading. LUTs aren't offered here. |
+| `captions` | 2 words, uppercase | `words_per_cue`, `uppercase`, `max_cue_seconds`, `min_cue_seconds`, `burn` (false), `font_size`. |
+| `check` | contact sheet on | `contact_sheet` turns the contact sheet on or off. |
+| `skip` | none | Steps to leave out, by name. |
+| `allow_switch` | false | Let Resolve steps switch away from the Resolve project you have open. |
+| `timeout_seconds` | 7200 | Deadline for this call. Steps unfinished at the deadline can be resumed. |
+| `resume_workflow_id` | none | Resume a stored workflow; see below. |
+
+Skipping a step also skips the steps that need it, and the record says why. Without
+`transcribe` there are no `plan_cuts` or `captions`, and backend `resolve` can't
+assemble, so it needs `ffmpeg` or `assemble` skipped too. Without `plan_cuts`, whole
+takes are used. Without `assemble`, nothing after it runs. Without `render`, there's
+no `check`, and `burn` is skipped while the SRT is still written.
+
+The result is the stored workflow record: `status` (`running`, `done` or `failed`),
+the takes, the request, each step's `status`, `attempts`, times, `result` (IDs, paths
+and measurements) or `error`, and `links`: `transcript_ids`, `cut_plan_ids`,
+`timeline_name`, `render_path`, `captions_path`, `captioned_video_path` and `review`
+(the check's verdict, failed cuts, reasons, A/V drift and contact sheet). A failing
+step doesn't fail the call: the envelope succeeds, `status` is `failed`, and that step
+holds the error code and message. Invalid requests still fail before anything runs.
+Records live under the data directory in `workflows/`.
+
+To resume, fix the cause and call `workflow run` again with `project_id` and
+`resume_workflow_id`. The run continues at the first unfinished step; finished steps,
+and takes already transcribed or planned, aren't repeated. Omit the other fields or
+repeat them unchanged; only `timeout_seconds` and `allow_switch` may change. A finished
+workflow is returned as it is. Only one call can run a workflow at a time; another
+gets `LEASE_HELD`. A `running` step in a stored record was interrupted (or is still
+running elsewhere) and runs again on resume. A local FFmpeg render that was published
+just before an interruption is kept when its SHA-256 matches the digest recorded
+before publishing. Other files an interrupted step already wrote (a Resolve render,
+the SRT, the burned-in copy, the contact sheet) must be removed before resuming.
+Captions and check refuse with `INPUT_CHANGED` if the render changed since the
+render step.
+
+Burning in captions needs an FFmpeg with libass. Without it the captions step fails
+with `DEPENDENCY_UNAVAILABLE` and its SRT isn't kept. Audio-only takes skip grading
+and burn-in, and the record says why. MCP paths must be absolute; CLI
+paths may be relative to the current folder.
 
 ## Recover a probe job
 

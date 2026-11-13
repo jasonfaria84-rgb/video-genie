@@ -375,3 +375,77 @@ def test_network_constant_requires_a_real_boolean(value: object) -> None:
         ResourceBounds.model_validate(values)
     with pytest.raises(ValidationError):
         ResourceBounds.model_validate_json(json.dumps(values))
+
+
+# Digest of default content computed on origin/main 967ef06, before the color section existed.
+PRE_COLOR_DIGEST = "d8f9fb9126545883a23eba32f088ffbaa66cfa3d293eda6fb70a7dcd8770091c"
+PRE_COLOR_KEYS = {
+    "capability",
+    "capability_version",
+    "input_schema_version",
+    "layout",
+    "output",
+    "provider",
+    "resources",
+    "schema_version",
+}
+
+
+def plain_recipe(**extra: object) -> RecipeContent:
+    payload = {"resources": {"timeout_seconds": 30, "max_artifact_bytes": 1000000}} | extra
+    return RecipeContent.model_validate_json(json.dumps(payload))
+
+
+def test_recipes_without_color_keep_their_content_and_digest() -> None:
+    content = plain_recipe()
+    assert content.color is None
+    assert set(json.loads(canonical_content_json(content))) == PRE_COLOR_KEYS
+    assert content_sha256(content) == PRE_COLOR_DIGEST
+    stored = RecipeDraft(
+        recipe_id=str(uuid4()),
+        content_sha256=PRE_COLOR_DIGEST,
+        content=content,
+        draft_revision=1,
+        created_at=STAMP,
+        updated_at=STAMP,
+    )
+    assert RecipeDraft.model_validate_json(stored.model_dump_json()) == stored
+    assert content_sha256(plain_recipe(color=None)) == PRE_COLOR_DIGEST
+
+
+def test_color_section_is_versioned_and_round_trips() -> None:
+    color = {"look": "warm_cinematic", "adjustments": {"exposure_stops": 0.5, "saturation": 1.2}}
+    content = plain_recipe(color=color)
+    assert content.color is not None and content.color.look == "warm_cinematic"
+    dumped = json.loads(canonical_content_json(content))
+    assert dumped["color"]["schema_version"] == "1"
+    assert dumped["color"]["adjustments"] == {
+        "schema_version": "1",
+        "exposure_stops": 0.5,
+        "contrast": 1.0,
+        "saturation": 1.2,
+        "temperature": 0.0,
+        "tint": 0.0,
+    }
+    assert content_sha256(content) != PRE_COLOR_DIGEST
+    assert RecipeContent.model_validate_json(canonical_content_json(content)) == content
+    neutral = plain_recipe(color={})
+    assert neutral.color is not None and neutral.color.look == "neutral"
+    assert content_sha256(neutral) != PRE_COLOR_DIGEST
+
+
+@pytest.mark.parametrize(
+    "color",
+    [
+        {"look": "sepia"},
+        {"adjustments": {"exposure_stops": 2.5}},
+        {"adjustments": {"contrast": 0.4}},
+        {"adjustments": {"temperature": "0.2"}},
+        {"lut": "Blackmagic Design/Film.cube"},
+        {"schema_version": "2"},
+        "warm_cinematic",
+    ],
+)
+def test_color_section_is_validated_like_other_fields(color: object) -> None:
+    with pytest.raises(ValidationError):
+        plain_recipe(color=color)

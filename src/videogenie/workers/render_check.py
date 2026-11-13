@@ -44,6 +44,8 @@ LEVEL_SECONDS = 0.01  # RMS window on each side
 GUARD_SECONDS = 0.005  # tolerated cut-time error; the click zone is +/- this around the cut
 LEVEL_FLOOR_DB = -60.0  # quieter than this counts as silence, so room tone can't "jump"
 CLICK_FLOOR = 0.01  # sample steps under -40 dBFS are treated as inaudible
+HEAD_PACKETS = 8  # enough to see the first presented packet despite B-frame reordering
+TAIL_SECONDS = 4.0  # packet window read before the container end to find the last packet
 FRAMES_PER_SIDE = 3
 BLACK_PIXEL_RATIO = 0.98  # like FFmpeg blackdetect: 98% of pixels at or below the threshold
 THUMB_BOX = 160
@@ -57,12 +59,31 @@ SHEET_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG"}
 
 class _Stream(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
+    index: int | None = None
     codec_type: str | None = None
+    sample_rate: str | None = None
     duration: str | None = None
     avg_frame_rate: str | None = None
     width: int | None = None
     height: int | None = None
     disposition: dict[str, int] = Field(default_factory=dict)
+
+
+class _SideData(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    skip_samples: int | None = None
+
+
+class _Packet(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    pts_time: str | None = None
+    duration_time: str | None = None
+    side_data_list: list[_SideData] = Field(default_factory=list, max_length=64)
+
+
+class _Packets(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    packets: list[_Packet] = Field(default_factory=list, max_length=100_000)
 
 
 class _Format(BaseModel):
@@ -124,6 +145,82 @@ def _fit(width: int, height: int, box: int) -> tuple[int, int]:
     return max(2, round(width * scale / 2) * 2), max(2, round(height * scale / 2) * 2)
 
 
+def presented_span(
+    packets: Sequence[_Packet], sample_rate: int | None
+) -> tuple[float, float] | None:
+    """First and last presented instants of a stream from its packets, or None if unknown.
+
+    The start applies AAC priming signalled as skip_samples and never goes below zero;
+    the end is the latest pts + duration. Container stream durations can't be trusted for
+    this: Resolve's MP4 audio edit list counts the encoder priming as playable audio.
+    """
+    starts: list[float] = []
+    ends: list[float] = []
+    for packet in packets:
+        pts = _time(packet.pts_time)
+        length = _time(packet.duration_time)
+        if pts is None or length is None or length < 0:
+            continue
+        skip = next((d.skip_samples for d in packet.side_data_list if d.skip_samples), 0)
+        offset = skip / sample_rate if skip > 0 and sample_rate else 0.0
+        starts.append(pts + offset)
+        ends.append(pts + length)
+    if not ends:
+        return None
+    start, end = max(0.0, min(starts)), max(ends)
+    return (start, end) if end > start else None
+
+
+def _time(value: str | None) -> float | None:
+    try:
+        seconds = float(value) if value is not None else math.nan
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) else None
+
+
+def _stream_duration(
+    ffprobe: str, path: Path, stream: _Stream, container_end: float, deadline: float
+) -> float | None:
+    """Presented duration from the first few and the last few seconds of packets only.
+
+    Falls back to the container's stream duration when packets can't be read or the tail
+    window did not reach the end (for example when the file can't be seeked).
+    """
+    fallback = _seconds(stream.duration)
+    if stream.index is None:
+        return fallback
+    tail_from = max(0.0, container_end - TAIL_SECONDS)
+    raw = bounded_process(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-select_streams",
+            str(stream.index),
+            "-read_intervals",
+            f"%+#{HEAD_PACKETS},{tail_from:.6f}%+{2 * TAIL_SECONDS:g}",
+            "-show_entries",
+            "packet=pts_time,duration_time:packet_side_data=skip_samples",
+            "-of",
+            "json",
+            str(path),
+        ],
+        _left(deadline),
+    )
+    try:
+        packets = _Packets.model_validate(json.loads(raw)).packets
+    except (ValueError, ValidationError):
+        return fallback
+    rate = stream.sample_rate
+    span = presented_span(packets, int(rate) if rate and rate.isdecimal() else None)
+    if span is None or span[1] < tail_from:
+        return fallback
+    return span[1] - span[0]
+
+
 def _media(ffprobe: str, path: Path, deadline: float) -> _Media:
     raw = bounded_process(
         [
@@ -133,7 +230,8 @@ def _media(ffprobe: str, path: Path, deadline: float) -> _Media:
             "-protocol_whitelist",
             "file",
             "-show_entries",
-            "format=duration:stream=codec_type,duration,avg_frame_rate,width,height"
+            "format=duration:stream=index,codec_type,duration,avg_frame_rate,width,height,"
+            "sample_rate"
             ":stream_disposition=attached_pic",
             "-of",
             "json",
@@ -173,9 +271,13 @@ def _media(ffprobe: str, path: Path, deadline: float) -> _Media:
     return _Media(
         duration=duration,
         has_audio=bool(audios),
-        audio_duration=_seconds(audios[0].duration) if audios else None,
+        audio_duration=_stream_duration(ffprobe, path, audios[0], duration, deadline)
+        if audios
+        else None,
         has_video=bool(videos),
-        video_duration=_seconds(videos[0].duration) if videos else None,
+        video_duration=_stream_duration(ffprobe, path, videos[0], duration, deadline)
+        if videos
+        else None,
         frame_rate=frame_rate,
         thumb=thumb,
     )

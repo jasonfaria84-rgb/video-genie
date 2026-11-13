@@ -3,7 +3,14 @@
 from typing import Any
 
 from videogenie.adapters import resolve
-from videogenie.contracts.color import AppliedColor, ApplyColorInput, CDLValues, GradedItem, Look
+from videogenie.contracts.color import (
+    AppliedColor,
+    ApplyColorInput,
+    CDLValues,
+    ColorAdjustments,
+    GradedItem,
+    Look,
+)
 from videogenie.contracts.models import VideoGenieError
 from videogenie.core.resolve_render import _timeline
 from videogenie.core.service import VideoGenieService
@@ -21,8 +28,12 @@ LOOKS: dict[Look, tuple[Triple, Triple, Triple, float]] = {
 
 def cdl_values(request: ApplyColorInput) -> CDLValues:
     """Combine the look with adjustments; every value stays inside Resolve's CDL range."""
-    slope, offset, power, saturation = LOOKS[request.look]
-    adjust = request.adjustments
+    return look_cdl(request.look, request.adjustments)
+
+
+def look_cdl(look: Look, adjust: ColorAdjustments) -> CDLValues:
+    """CDL values for a look plus adjustments, shared by Resolve and local FFmpeg grading."""
+    slope, offset, power, saturation = LOOKS[look]
     gain = 2**adjust.exposure_stops
     balance = (1 + 0.08 * adjust.temperature, 1 - 0.06 * adjust.tint, 1 - 0.08 * adjust.temperature)
     new_slope = tuple(round(s * gain * b, 4) for s, b in zip(slope, balance, strict=True))
