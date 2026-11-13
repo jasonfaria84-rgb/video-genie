@@ -33,8 +33,10 @@ class PlanCutsInput(ContractModel):
 
     Reads the transcript made by transcript.create and saves a new cut plan; media is never
     read or changed. Fillers are words in filler_words (case and punctuation ignored; a
-    multi-word entry such as "you know" matches consecutive words) and short untranscribed
-    sounds (kind "sound", at most max_filler_seconds; longer sound such as laughter stays).
+    multi-word entry such as "you know" matches consecutive words). Use a transcript made
+    with engine "whisper", which keeps fillers as words. Untranscribed sound (kind "sound")
+    is kept unless cut_sounds is true: it is often real speech the engine skipped. With
+    cut_sounds, sound up to max_filler_seconds is cut as a filler (laughter stays).
     A false start is a word or 1-4 word phrase immediately repeated within about a second
     ("I I think", "we should, we should go"); the earlier copy is cut. Gaps between kept
     words of at least min_pause_seconds are cut, keeping padding_seconds beside speech.
@@ -44,6 +46,7 @@ class PlanCutsInput(ContractModel):
     transcript_id: Identifier
     filler_words: tuple[FillerPhrase, ...] = Field(default=DEFAULT_FILLER_WORDS, max_length=100)
     remove_false_starts: bool = True
+    cut_sounds: bool = False
     max_filler_seconds: float = Field(default=1.2, ge=0.1, le=3)
     min_pause_seconds: float = Field(default=0.5, ge=0.2, le=30)
     padding_seconds: float = Field(default=0.15, ge=0, le=2)

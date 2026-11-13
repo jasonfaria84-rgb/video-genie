@@ -554,3 +554,33 @@ def test_partial_schema_and_missing_immutability_guard_fail_closed(tmp_path: Pat
     with pytest.raises(VideoGenieError) as guard:
         RecipeService(complete.studio)
     assert guard.value.code == "UNSUPPORTED_SCHEMA"
+
+
+def test_color_section_persists_through_drafts_and_old_drafts_stay_valid(
+    tmp_path: Path,
+) -> None:
+    service = registry(tmp_path)
+    old = service.create_recipe_draft(
+        CreateRecipeDraftInput(content=content(), idempotency_key="no-color")
+    )
+    graded = RecipeContent.model_validate(
+        content().model_dump() | {"color": {"look": "cool_clean", "adjustments": {"tint": -0.1}}}
+    )
+    updated = service.update_recipe_draft(
+        UpdateRecipeDraftInput(
+            recipe_id=old.recipe_id,
+            expected_draft_revision=1,
+            content=graded,
+            idempotency_key="add-color",
+        )
+    )
+    assert updated.content_sha256 != old.content_sha256
+    reopened = registry(tmp_path)
+    stored = reopened.get_recipe_draft(RecipeDraftInput(recipe_id=old.recipe_id))
+    assert stored == updated and stored.content.color is not None
+    assert stored.content.color.look == "cool_clean"
+    assert stored.content.color.adjustments.tint == -0.1
+    plain = reopened.create_recipe_draft(
+        CreateRecipeDraftInput(content=content(), idempotency_key="no-color")
+    )
+    assert plain == old and plain.content.color is None

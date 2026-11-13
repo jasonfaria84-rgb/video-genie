@@ -112,10 +112,10 @@ def plan_ranges(
     tokens = [normalize_token(word.text) if word.kind == "word" else "" for word in content]
     spoken = [index for index, word in enumerate(content) if word.kind == "word"]
     removed = _mark_fillers(tokens, spoken, _filler_sequences(request.filler_words))
+    longest_sound = round(request.max_filler_seconds * 1000)
     for index, word in enumerate(content):
-        if word.kind == "sound" and spans[index][1] - spans[index][0] <= round(
-            request.max_filler_seconds * 1000
-        ):
+        short = spans[index][1] - spans[index][0] <= longest_sound
+        if request.cut_sounds and word.kind == "sound" and short:
             removed[index] = "filler"
     if request.remove_false_starts:
         remaining = [index for index in spoken if index not in removed]

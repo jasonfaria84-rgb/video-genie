@@ -12,10 +12,12 @@ from videogenie.contracts.overlays import PlacedOverlay, PlaceOverlayInput
 from videogenie.core.resolve_render import _timeline
 from videogenie.core.service import VideoGenieService
 from videogenie.core.transcription import _rate, media_pool_clip
+from videogenie.workers.overlay_carrier import transparent_carrier
 from videogenie.workers.probe import absolute_media_path, fingerprint
 
 MEDIA_SUFFIXES = {".mov", ".png"}
 FUSION_SUFFIX = ".comp"
+MAX_COMP_BYTES = 16 * 1024 * 1024
 VIDEO_ONLY = 1
 Range = tuple[int, int]
 
@@ -95,6 +97,50 @@ def mismatched(wanted: dict[str, float], actual: dict[str, Any]) -> list[str]:
     return wrong
 
 
+def check_fusion_comp(data: bytes) -> None:
+    """Accept only a Fusion composition file: UTF-8 Lua-table text, never a binary or script."""
+    if len(data) > MAX_COMP_BYTES:
+        raise VideoGenieError("INVALID_ARGUMENT", "The Fusion composition is larger than 16 MiB")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise VideoGenieError("INVALID_ARGUMENT", "The .comp file is not UTF-8 text") from exc
+    lines = [line.strip() for line in text.splitlines()]
+    body = " ".join(line for line in lines if line and not line.startswith("--")).lstrip()
+    if not (body.startswith("Composition {") or body.startswith("{")) or "Tools" not in body:
+        raise VideoGenieError("INVALID_ARGUMENT", "The .comp file is not a Fusion composition")
+
+
+def _remaining(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Placing the overlay exceeded timeout_seconds"
+        )
+    return left
+
+
+def _import_comp(item: Any, path: str, deadline: float) -> str:
+    """Attach the composition to the carrier item and make it the item's active composition."""
+    done, comp = resolve.call_with_timeout(
+        lambda: item.ImportFusionComp(path), _remaining(deadline)
+    )
+    if not done:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve did not finish importing the Fusion composition"
+        )
+    names = [str(name) for name in item.GetFusionCompNameList() or []]
+    if comp is None or not names:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve could not import the Fusion composition"
+        )
+    if item.LoadFusionCompByName(names[-1]) is None:
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve could not activate the Fusion composition"
+        )
+    return names[-1]
+
+
 def _timeline_rate(timeline: Any) -> Fraction:
     try:
         fps = float(str(timeline.GetSetting("timelineFrameRate") or "0").split()[0])
@@ -125,19 +171,22 @@ def _apply(item: Any, wanted: dict[str, float]) -> dict[str, float]:
 
 
 def place_overlay(service: VideoGenieService, request: PlaceOverlayInput) -> PlacedOverlay:
-    """Import once, append on a free video track, set and verify properties, or undo it all."""
+    """Import once, append on a free video track, set and verify properties, or undo it all.
+
+    A .comp is checked, then placed on a transparent carrier clip sized to the timeline that
+    carries the composition, so it gets the same time, track and overwrite rules as a movie.
+    """
     deadline = time.monotonic() + request.timeout_seconds
     service.get_project(request.project_id)
     path = absolute_media_path(request.source_path)
     suffix = path.suffix.lower()
     if suffix not in MEDIA_SUFFIXES | {FUSION_SUFFIX}:
         raise VideoGenieError("INVALID_ARGUMENT", "source_path must be a .mov, .png or .comp file")
-    if suffix == FUSION_SUFFIX:
-        raise VideoGenieError(
-            "DEPENDENCY_UNAVAILABLE",
-            "Placing Fusion .comp files is not yet supported; render the overlay to a .mov first",
-        )
+    fusion = suffix == FUSION_SUFFIX
     source = fingerprint(path, request.timeout_seconds)
+    if fusion:
+        with path.open("rb") as comp_file:
+            check_fusion_comp(comp_file.read(MAX_COMP_BYTES + 1))
     app = resolve.connect(min(30.0, max(1.0, deadline - time.monotonic())))
     project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
     timeline = _timeline(project, request.timeline_name)
@@ -149,7 +198,19 @@ def place_overlay(service: VideoGenieService, request: PlaceOverlayInput) -> Pla
     )
     length = end - start
     pool = project.GetMediaPool()
-    clip = media_pool_clip(pool, str(path))
+    media = (
+        transparent_carrier(
+            service.data_dir / "overlay-carriers",
+            int(timeline.GetSetting("timelineResolutionWidth") or 0),
+            int(timeline.GetSetting("timelineResolutionHeight") or 0),
+            fps,
+            length,
+            min(60.0, _remaining(deadline)),
+        )
+        if fusion
+        else path
+    )
+    clip = media_pool_clip(pool, str(media))
     if suffix == ".mov":
         clip_fps = float(clip.GetClipProperty("FPS") or 0)
         if abs(clip_fps - float(fps)) > 0.01:
@@ -210,6 +271,7 @@ def place_overlay(service: VideoGenieService, request: PlaceOverlayInput) -> Pla
                     "actual": [placed[0][-1], placed[1], placed[2]],
                 },
             )
+        comp_name = _import_comp(item, str(path), deadline) if fusion else None
         wanted = overlay_properties(
             request.position_x, request.position_y, request.scale, request.opacity
         )
@@ -234,4 +296,5 @@ def place_overlay(service: VideoGenieService, request: PlaceOverlayInput) -> Pla
         source_path=str(path),
         source_sha256=source.sha256,
         properties=properties,
+        fusion_comp_name=comp_name,
     )

@@ -46,7 +46,7 @@ class Transcript(ContractModel):
     source_path: str = Field(min_length=1, max_length=4096)
     source_sha256: Sha256
     duration_seconds: Seconds
-    engine: Literal["resolve", "fixture"]
+    engine: Literal["resolve", "whisper", "fixture"]
     engine_version: str = Field(max_length=500)
     language: str | None = Field(default=None, max_length=50)
     words: tuple[TranscriptWord, ...] = Field(max_length=200_000)
@@ -68,16 +68,28 @@ class Transcript(ContractModel):
 
 
 class CreateTranscriptInput(ContractModel):
-    """Transcribe one local media file word by word in DaVinci Resolve Studio and store it.
+    """Transcribe one local media file word by word and store it.
 
-    The file is imported into the VideoGenie project's own Resolve project
-    ("VideoGenie <project_id>"). If you have another Resolve project open, the call
-    refuses unless allow_switch is true. Gaps between words are checked with FFmpeg:
-    quiet stretches become kind "silence", audible ones kind "sound" (likely fillers).
+    engine "whisper" (default) runs local Whisper (mlx-whisper) on this machine and keeps
+    filler words such as "um" and "uh" as words with their own timings, so edit.cuts.plan
+    can remove them precisely. engine "resolve" uses DaVinci Resolve Studio's transcription,
+    importing the file into the project's own Resolve project ("VideoGenie <project_id>");
+    if you have another Resolve project open, the call refuses unless allow_switch is true.
+    Resolve drops fillers and some real words from its text. With either engine, gaps
+    between words are checked with FFmpeg: quiet stretches become kind "silence" and
+    audible ones kind "sound" (a filler, breath, noise or untranscribed speech).
     """
 
     project_id: Identifier
     source_path: str = Field(min_length=1, max_length=4096)
+    engine: Literal["whisper", "resolve"] = "whisper"
+    whisper_model: str = Field(
+        default="mlx-community/whisper-large-v3-turbo",
+        min_length=3,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
     speaker_detection: bool = True
     allow_switch: bool = False
     noise_threshold_db: float = Field(default=-35, ge=-90, le=-10, allow_inf_nan=False)
@@ -149,12 +161,22 @@ class AssembleTimelineInput(ContractModel):
     the plan's SHA-256. The timeline is created in the project's own Resolve project, at the
     first take's frame rate and resolution, and an existing timeline is never edited.
     fade_frames adds audio fades at every join so cuts don't click.
+
+    subtitles_path, if given, is an absolute .srt file whose times are already in the
+    output time of this exact assembly, seconds from the timeline start: captions.create
+    with the same cut plan matches a single-take assembly. VideoGenie cannot check that the
+    text matches the takes, only that no cue ends after the assembled length. Its cues go
+    on subtitle track 1 of the new timeline, and every cue start is read back and checked.
+    Resolve can only place SRT cues at their own times on a timeline that is still empty,
+    so subtitles are added here, during assembly; for an existing timeline, import the SRT
+    in Resolve by hand.
     """
 
     project_id: Identifier
     takes: tuple[AssembleTake, ...] = Field(min_length=1, max_length=200)
     timeline_name: str | None = Field(default=None, min_length=1, max_length=200)
     fade_frames: int = Field(default=1, ge=0, le=10)
+    subtitles_path: str | None = Field(default=None, min_length=1, max_length=4096)
     allow_switch: bool = False
     timeout_seconds: float = Field(default=600, gt=0, le=7200, allow_inf_nan=False)
 
@@ -166,6 +188,7 @@ class AssembledTimeline(ContractModel):
     least 256 pixels on each side, so smaller footage gets a larger frame: then
     resolution_warning says so and renders are letterboxed or scaled. source_width and
     source_height are the first take's size, or null when Resolve doesn't report it.
+    subtitle_cue_count and subtitles_sha256 describe the placed SRT, or are null without one.
     """
 
     project_id: Identifier
@@ -184,6 +207,8 @@ class AssembledTimeline(ContractModel):
     source_width: int | None = Field(default=None, gt=0)
     source_height: int | None = Field(default=None, gt=0)
     resolution_warning: str | None = None
+    subtitle_cue_count: int | None = Field(default=None, ge=1)
+    subtitles_sha256: Sha256 | None = None
 
 
 def output_time(plan: CutPlan, source_seconds: float) -> float | None:

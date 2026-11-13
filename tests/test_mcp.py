@@ -98,6 +98,8 @@ EXPECTED_OPERATIONS = [
     "render.check",
     "overlay.renderers",
     "overlay.place",
+    "workflow.run",
+    "workflow.get",
 ]
 
 
