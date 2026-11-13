@@ -6,7 +6,7 @@ audience: agent
 
 Confirm the checkout, branch, and Git status before changing files. Read README.md
 and the relevant source/tests. The installed CLI and stdio MCP server currently
-expose 77 shared agent operations, including local recipe/brand drafts, immutable
+expose 78 shared agent operations, including local recipe/brand drafts, immutable
 versions/assets, bounded lower-third rendering, costs, output review preparation,
 seven additive discovery reads, and the editing toolkit that follows them:
 `media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
@@ -25,7 +25,8 @@ on a transparent carrier, placed above the footage without overlapping existing 
 and `workflow.run`/`get` (folder of takes to finished video through those steps in order,
 on Resolve or local FFmpeg; each step is recorded under `workflows/`, a failed step is
 returned rather than raised, and `resume_workflow_id` continues at the first unfinished
-step).
+step; a render that fails its check ends as `needs_review`, never `done`, until
+`workflow.review` approves or rejects it with a note).
 Resolve work happens only in Resolve projects named
 `VideoGenie <project ID>`; never switch away from a person's open project unless
 the request explicitly allows it. General editing/templates, paid provider

@@ -21,6 +21,7 @@ STEP_ORDER: tuple[StepName, ...] = (
     "check",
 )
 StepStatus = Literal["pending", "running", "done", "skipped", "failed"]
+WorkflowStatus = Literal["running", "done", "failed", "needs_review", "rejected"]
 Backend = Literal["resolve", "ffmpeg"]
 MEDIA_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".mxf", ".wav", ".m4a"})
 MAX_TAKES = 200
@@ -143,7 +144,9 @@ class RunWorkflowInput(ContractModel):
     with project_id and resume_workflow_id: finished steps are kept and the run continues at
     the first unfinished step. With resume_workflow_id, omit the other fields or repeat
     them unchanged; only timeout_seconds and allow_switch may differ. workflow.get reads a
-    record again.
+    record again. When every step finished but render.check found a bad cut, status is
+    "needs_review", not "done": the output is not final until workflow.review approves
+    (or rejects) it with a note.
     """
 
     project_id: Identifier
@@ -176,6 +179,28 @@ class GetWorkflowInput(ContractModel):
     """Read a stored workflow record by workflow_id. Reads only; changes nothing."""
 
     workflow_id: Identifier
+
+
+class ReviewWorkflowInput(ContractModel):
+    """Decide on a workflow whose render failed its check (status "needs_review").
+
+    Look at the review (failed cuts, reasons, contact sheet) first. "approve" accepts the
+    output as final anyway and sets status "done"; "reject" sets status "rejected" and the
+    output is never reported as final (start a new workflow to redo it). note says why and
+    is stored with the decision. Only a "needs_review" workflow can be decided, once.
+    Files are never changed or deleted.
+    """
+
+    project_id: Identifier
+    workflow_id: Identifier
+    decision: Literal["approve", "reject"]
+    note: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def _note(self) -> Self:
+        if not self.note.strip():
+            raise ValueError("note must say why")
+        return self
 
 
 class StepError(ContractModel):
@@ -215,6 +240,14 @@ class WorkflowReview(ContractModel):
     contact_sheet_path: str | None
 
 
+class WorkflowDecision(ContractModel):
+    """A reviewer's decision on a workflow whose render failed its check."""
+
+    decision: Literal["approved", "rejected"]
+    note: str = Field(min_length=1, max_length=2000)
+    decided_at: Timestamp
+
+
 class WorkflowLinks(ContractModel):
     """Everything the workflow produced: transcripts, cut plans, timeline, files, review."""
 
@@ -230,19 +263,23 @@ class WorkflowLinks(ContractModel):
 class WorkflowRecord(ContractModel):
     """A stored workflow: its request, takes, step-by-step progress and links to the results.
 
-    status is "running" while steps run, "done" when every step is done or skipped, and
-    "failed" when a step failed; resume with run's resume_workflow_id.
+    status is "running" while steps run, "done" when every step is done or skipped and the
+    render check passed (or was skipped, or a reviewer approved it), "failed" when a step
+    failed (resume with run's resume_workflow_id), "needs_review" when the render failed
+    its check and nobody has decided yet, and "rejected" when a reviewer rejected it. Only
+    "done" means the output is final. decision holds the workflow.review decision.
     """
 
     workflow_id: Identifier
     project_id: Identifier
-    status: Literal["running", "done", "failed"]
+    status: WorkflowStatus
     backend: Backend
     takes: tuple[str, ...] = Field(min_length=1, max_length=MAX_TAKES)
     output_path: str
     request: RunWorkflowInput
     steps: tuple[WorkflowStep, ...] = Field(min_length=len(STEP_ORDER), max_length=len(STEP_ORDER))
     links: WorkflowLinks
+    decision: WorkflowDecision | None = None
     created_at: Timestamp
     updated_at: Timestamp
 
@@ -250,4 +287,13 @@ class WorkflowRecord(ContractModel):
     def _ordered_steps(self) -> Self:
         if tuple(step.name for step in self.steps) != STEP_ORDER:
             raise ValueError("Steps must be listed once each, in order")
+        failed_check = self.links.review is not None and not self.links.review.passed
+        if self.decision is not None and not failed_check:
+            raise ValueError("Only a workflow whose render failed its check has a decision")
+        if self.status == "needs_review" and (not failed_check or self.decision is not None):
+            raise ValueError("needs_review is only for an undecided failed render check")
+        if self.status == "rejected" and (
+            self.decision is None or self.decision.decision != "rejected"
+        ):
+            raise ValueError("A rejected workflow carries the rejecting decision")
         return self

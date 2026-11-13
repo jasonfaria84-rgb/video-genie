@@ -281,6 +281,119 @@ def test_failed_step_is_recorded_and_resume_skips_finished_work(
     assert again == resumed  # a finished workflow is returned unchanged
 
 
+def failing_check(*args: Any, **kwargs: Any) -> Any:
+    """The real check, then the first cut reported as a click."""
+    checked = check_render(*args, **kwargs)
+    first = checked.cuts[0].model_copy(update={"passed": False, "reasons": ("audio_click",)})
+    return checked.model_copy(
+        update={"passed": False, "cuts": (first, *checked.cuts[1:]), "failed_cuts": (0,)}
+    )
+
+
+def needs_review(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path], name: str
+) -> tuple[WorkflowRecord, dict[str, JsonValue]]:
+    service, project_id, root = studio
+    monkeypatch.setattr(workflow, "check_render", failing_check)
+    request: dict[str, JsonValue] = {
+        "project_id": project_id,
+        "folder": str(root / "takes"),
+        "output_path": str(root / "out" / name),
+        "backend": "ffmpeg",
+        "check": {"contact_sheet": False},
+    }
+    return run(service, request), request
+
+
+def test_a_failed_check_is_held_for_review_and_approval_makes_it_final(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
+) -> None:
+    service, project_id, _ = studio
+    held, request = needs_review(monkeypatch, studio, "held.mp4")
+    # T326 AC3: every step finished, but a failed check keeps the output from being final.
+    assert set(steps(held).values()) == {"done", "skipped"}  # color: none requested
+    assert held.status == "needs_review" and held.decision is None
+    review = held.links.review
+    assert review is not None and not review.passed and review.failed_cuts == (0,)
+    assert "audio_click" in review.reasons
+    output = Path(held.output_path)
+    assert output.is_file()  # nothing is deleted; it is just not final
+    # Resuming does not finish it; only a decision does.
+    assert run(service, {"project_id": project_id, "resume_workflow_id": held.workflow_id}) == held
+    review_request: dict[str, JsonValue] = {
+        "project_id": project_id,
+        "workflow_id": held.workflow_id,
+        "decision": "approve",
+        "note": "  The click is a door in the room; acceptable.  ",
+    }
+    approved = _dispatch(service, "workflow.review", review_request)
+    assert isinstance(approved, WorkflowRecord)
+    assert approved.status == "done" and approved.decision is not None
+    assert approved.decision.decision == "approved"
+    assert approved.decision.note == "The click is a door in the room; acceptable."
+    assert approved.links == held.links and approved.steps == held.steps
+    assert _dispatch(service, "workflow.get", {"workflow_id": held.workflow_id}) == approved
+    assert output.is_file()
+    # Decided once: a second decision is refused and changes nothing.
+    with pytest.raises(VideoGenieError) as caught:
+        _dispatch(service, "workflow.review", {**review_request, "decision": "reject"})
+    assert caught.value.code == "INVALID_ARGUMENT"
+    assert caught.value.details == {"status": "done"}
+    assert _dispatch(service, "workflow.get", {"workflow_id": held.workflow_id}) == approved
+
+
+def test_a_rejected_workflow_is_never_final_and_reviews_are_validated(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
+) -> None:
+    service, project_id, root = studio
+    held, request = needs_review(monkeypatch, studio, "rejected.mp4")
+    base: dict[str, JsonValue] = {
+        "project_id": project_id,
+        "workflow_id": held.workflow_id,
+        "decision": "reject",
+    }
+    for note in ("", "   "):
+        with pytest.raises((ValidationError, VideoGenieError)):
+            _dispatch(service, "workflow.review", {**base, "note": note})
+    other = service.create_project("Other", "other").project_id
+    with pytest.raises(VideoGenieError) as caught:
+        _dispatch(service, "workflow.review", {**base, "project_id": other, "note": "no"})
+    assert caught.value.code == "NOT_FOUND"
+    rejected = _dispatch(service, "workflow.review", {**base, "note": "Click on a word; redo"})
+    assert isinstance(rejected, WorkflowRecord) and rejected.status == "rejected"
+    assert rejected.decision is not None and rejected.decision.decision == "rejected"
+    assert run(service, {"project_id": project_id, "resume_workflow_id": held.workflow_id}) == (
+        rejected
+    )
+    # A passing workflow is final at once and has nothing to decide.
+    monkeypatch.setattr(workflow, "check_render", check_render)
+    passing = run(service, {**request, "output_path": str(root / "out" / "passing.mp4")})
+    assert passing.status == "done" and passing.decision is None
+    assert passing.links.review is not None and passing.links.review.passed
+    with pytest.raises(VideoGenieError) as caught:
+        _dispatch(
+            service,
+            "workflow.review",
+            {**base, "workflow_id": passing.workflow_id, "note": "Looks fine"},
+        )
+    assert caught.value.code == "INVALID_ARGUMENT" and caught.value.details == {"status": "done"}
+    # Stored records stay coherent: no rejection without its decision, no stray decisions.
+    stored = json.loads(held.model_dump_json())
+    for change in (
+        {"status": "rejected"},
+        {"status": "needs_review", "decision": json.loads(rejected.model_dump_json())["decision"]},
+    ):
+        with pytest.raises(ValidationError):
+            WorkflowRecord.model_validate_json(json.dumps({**stored, **change}))
+    passing_stored = json.loads(passing.model_dump_json())
+    passing_stored["decision"] = stored_decision = json.loads(rejected.model_dump_json())[
+        "decision"
+    ]
+    assert stored_decision is not None
+    with pytest.raises(ValidationError):
+        WorkflowRecord.model_validate_json(json.dumps(passing_stored))
+
+
 def test_interrupted_take_is_not_transcribed_again(
     monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
 ) -> None:
