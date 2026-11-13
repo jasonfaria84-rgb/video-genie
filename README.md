@@ -564,9 +564,11 @@ Each entry has `word_id`, `start_seconds`, `end_seconds`, `text`, `speaker` and
   Apple silicon) on this machine. It keeps filler words such as "um" and "uh" as
   words with their own timings, which is what precise filler removal needs. Install it
   with `pip install mlx-whisper`, or point `VIDEOGENIE_WHISPER_BIN` at its `mlx_whisper`
-  command. The model (`whisper_model`, default `mlx-community/whisper-large-v3-turbo`)
-  downloads once on first use; audio never leaves the machine. `language` (such as
-  `en`) skips language detection.
+  command. Audio never leaves the machine. The model (`whisper_model`, default
+  `mlx-community/whisper-large-v3-turbo`) is fetched from the Hugging Face Hub the first
+  time, which counts against `timeout_seconds`; once it is in the local Hub cache, runs
+  are forced offline and the transcript records the cached revision in
+  `engine_version`. `language` (such as `en`) skips language detection.
 - `resolve` imports the file into the project's own Resolve project
   (`VideoGenie <project_id>`) and uses Resolve Studio's transcription, with
   `speaker_detection` (default true). Resolve leaves fillers out of its text, and on

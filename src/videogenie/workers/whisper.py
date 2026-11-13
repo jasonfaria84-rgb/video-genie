@@ -2,13 +2,15 @@
 
 Whisper usually tidies speech, dropping "um" and "uh". An initial prompt written in the
 same disfluent style makes it keep them as words with their own timings, which is
-what filler removal needs. Nothing leaves the machine: mlx-whisper runs locally and
-only downloads the model weights on first use.
+what filler removal needs. Audio never leaves the machine: mlx-whisper runs locally.
+The model weights come from the Hugging Face Hub the first time; once they are in the
+local cache, runs are forced offline (HF_HUB_OFFLINE=1) so nothing is contacted.
 """
 
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -18,6 +20,7 @@ from videogenie.contracts.models import VideoGenieError
 
 FILLER_PROMPT = "Umm, let me think, uh, like, hmm. So, um, I was, uh, you know, I was like..."
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_LOG_TAIL = 4096
 FIX = "Install mlx-whisper (pip install mlx-whisper) or set VIDEOGENIE_WHISPER_BIN"
 
 
@@ -28,6 +31,23 @@ def executable() -> str:
     if not found or not os.access(found, os.X_OK):
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", f"Local Whisper is not available. {FIX}")
     return found
+
+
+def _hub_cache() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    home = os.environ.get("HF_HOME")
+    return (Path(home) if home else Path.home() / ".cache" / "huggingface") / "hub"
+
+
+def cached_revision(model: str) -> str | None:
+    """The locally cached snapshot of a Hub model ("owner/name"), or None if not cached."""
+    folder = _hub_cache() / ("models--" + model.replace("/", "--"))
+    try:
+        revision = (folder / "refs" / "main").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return revision if revision and (folder / "snapshots" / revision).is_dir() else None
 
 
 def command(
@@ -54,43 +74,76 @@ def words(result: Any, duration: float) -> list[tuple[float, float, str, str | N
             start, end = word.get("start"), word.get("end")
             if not text or not isinstance(start, int | float) or not isinstance(end, int | float):
                 continue
-            start = min(max(float(start), 0.0), duration)
-            end = min(max(float(end), start), duration)
-            flat.append((start, end, text, None))
+            start, end = max(float(start), 0.0), float(end)
+            if start >= duration:
+                continue  # timed past the end of the audio: not something that was said
+            flat.append((start, min(max(end, start), duration), text, None))
     flat.sort(key=lambda item: item[0])
     return flat
 
 
-def transcribe(
-    source: Path, *, model: str, language: str | None, timeout_seconds: float, work_dir: Path
-) -> dict[str, Any]:
-    """Run mlx_whisper on one file in a private temporary directory and return its JSON."""
-    binary = executable()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=work_dir, prefix="whisper-") as scratch:
-        output_dir = Path(scratch)
+def _run(argv: list[str], cwd: Path, env: dict[str, str], timeout_seconds: float) -> str | None:
+    """Run in its own process group with output to a file; kill the whole group on timeout.
+
+    Returns None on success, else the last line of output, for the error message.
+    """
+    log_path = cwd / "whisper.log"
+    with log_path.open("wb") as log:
         try:
-            completed = subprocess.run(
-                command(binary, source, output_dir, model, language),
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise VideoGenieError(
-                "MEDIA_UNAVAILABLE", "Whisper transcription exceeded its deadline"
-            ) from exc
         except OSError as exc:
             raise VideoGenieError(
                 "DEPENDENCY_UNAVAILABLE", f"Local Whisper could not start. {FIX}"
             ) from exc
-        output = output_dir / "transcript.json"
-        if completed.returncode != 0 or not output.is_file():
-            detail = completed.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+        try:
+            code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
             raise VideoGenieError(
-                "MEDIA_UNAVAILABLE", f"Whisper failed: {detail[0][:300]}".rstrip(": ")
-            )
+                "MEDIA_UNAVAILABLE", "Whisper transcription exceeded its deadline"
+            ) from exc
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+    if code == 0:
+        return None
+    with log_path.open("rb") as log:
+        log.seek(max(0, log_path.stat().st_size - MAX_LOG_TAIL))
+        lines = log.read().decode("utf-8", "replace").replace("\r", "\n").strip().splitlines()
+    return lines[-1][:300] if lines else f"exit code {code}"
+
+
+def transcribe(
+    source: Path, *, model: str, language: str | None, timeout_seconds: float, work_dir: Path
+) -> tuple[dict[str, Any], str]:
+    """Run mlx_whisper on one file in a private temporary directory.
+
+    Returns its JSON and the model identity ("owner/name@revision" when cached).
+    """
+    binary = executable()
+    revision = cached_revision(model)
+    env = dict(os.environ)
+    if revision:
+        env["HF_HUB_OFFLINE"] = "1"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=work_dir, prefix="whisper-") as scratch:
+        output_dir = Path(scratch)
+        argv = command(binary, source, output_dir, model, language)
+        failure = _run(argv, output_dir, env, timeout_seconds)
+        output = output_dir / "transcript.json"
+        if failure is not None or not output.is_file():
+            raise VideoGenieError("MEDIA_UNAVAILABLE", f"Whisper failed: {failure or 'no output'}")
         if output.stat().st_size > MAX_OUTPUT_BYTES:
             raise VideoGenieError("MEDIA_UNAVAILABLE", "Whisper output is too large")
         try:
@@ -101,4 +154,6 @@ def transcribe(
             ) from exc
     if not isinstance(parsed, dict):
         raise VideoGenieError("MEDIA_UNAVAILABLE", "Whisper returned unreadable output")
-    return parsed
+    # Revision is read again: a first run downloads the model during transcription.
+    revision = cached_revision(model)
+    return parsed, f"{model}@{revision}" if revision else model
