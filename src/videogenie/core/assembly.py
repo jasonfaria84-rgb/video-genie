@@ -1,7 +1,10 @@
 """Assemble kept ranges from cut plans into a new DaVinci Resolve timeline."""
 
+import hashlib
+import os
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from videogenie.adapters import resolve
@@ -36,8 +39,13 @@ def source_frames(plan: CutPlan, fps: float) -> list[tuple[int, int]]:
     return frames
 
 
-def _read_subtitles(value: str, timeout_seconds: float) -> Subtitles:
-    """The SRT's resolved path, fingerprint and cue times, or INVALID_ARGUMENT."""
+def _read_subtitles(value: str, data_dir: Path, timeout_seconds: float) -> Subtitles:
+    """A private copy of the SRT named by its content, its fingerprint and cue times.
+
+    Resolve keeps an imported SRT's cues in its media pool item, so importing the caller's
+    path again after an edit would reuse the old cues. The copy at
+    <data_dir>/subtitles/<sha256>.srt gives every distinct content its own pool item.
+    """
     path = absolute_media_path(value)
     if path.suffix.lower() != ".srt":
         raise VideoGenieError("INVALID_ARGUMENT", "subtitles_path must be an .srt file")
@@ -45,14 +53,37 @@ def _read_subtitles(value: str, timeout_seconds: float) -> Subtitles:
     if written.size > MAX_SRT_BYTES:
         raise VideoGenieError("INVALID_ARGUMENT", "subtitles_path is larger than 10 MB")
     try:
-        times = srt_times(path.read_bytes().decode("utf-8"))
+        data = path.read_bytes()
+        times = srt_times(data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise VideoGenieError(
             "INVALID_ARGUMENT", "subtitles_path is not a readable UTF-8 SRT file"
         ) from exc
-    if fingerprint(path, timeout_seconds).sha256 != written.sha256:
+    if hashlib.sha256(data).hexdigest() != written.sha256:
         raise VideoGenieError("INPUT_CHANGED", "subtitles_path changed while it was read")
-    return str(path), written, times
+    copy = _private_copy(data_dir / "subtitles", written.sha256, data, timeout_seconds)
+    return str(copy), written, times
+
+
+def _private_copy(folder: Path, sha256: str, data: bytes, timeout_seconds: float) -> Path:
+    """<folder>/<sha256>.srt holding exactly data: reused when its bytes match, else rewritten.
+
+    The name is the content's hash, so the only correct bytes for it are these; a missing or
+    damaged copy is replaced atomically and nothing else is ever written there.
+    """
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    copy = folder / f"{sha256}.srt"
+    if copy.is_file() and not copy.is_symlink():
+        if fingerprint(copy, timeout_seconds).sha256 == sha256:
+            return copy
+    partial = folder / f".{sha256}.{os.getpid()}.{time.monotonic_ns()}.partial"
+    try:
+        with partial.open("xb") as handle:
+            handle.write(data)
+        os.replace(partial, copy)
+    finally:
+        partial.unlink(missing_ok=True)
+    return copy
 
 
 def cue_frames(times: list[tuple[int, int]], fps: float) -> list[int]:
@@ -65,41 +96,35 @@ def _place_subtitles(
 ) -> None:
     """Put the SRT on the still-empty timeline, check every cue start, then pin the takes.
 
-    On any failure the new timeline is deleted so a retry can reuse its name.
+    The caller deletes the new timeline on any failure, so a retry can reuse its name.
     """
     path, _, times = subtitles
-    try:
-        item = media_pool_clip(pool, path)
-        if item.GetClipProperty("Type") != "Subtitle":
-            raise VideoGenieError(
-                "DEPENDENCY_UNAVAILABLE", "Resolve did not import the SRT as subtitles"
-            )
-        # Pass only mediaPoolItem. Resolve 21.1 ignores trackIndex and recordFrame for
-        # subtitle items (cues always follow the timeline's current end, which is why the
-        # timeline must still be empty here), and startFrame/endFrame crash Resolve.
-        if not pool.AppendToTimeline([{"mediaPoolItem": item}]):
-            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not add the subtitles")
-        start = int(timeline.GetStartFrame())
-        expected = [start + offset for offset in cue_frames(times, fps)]
-        placed = sorted(
-            int(cue.GetStart()) for cue in timeline.GetItemListInTrack("subtitle", 1) or []
+    item = media_pool_clip(pool, path)
+    if item.GetClipProperty("Type") != "Subtitle":
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE", "Resolve did not import the SRT as subtitles"
         )
-        if len(placed) != len(expected) or any(
-            abs(got - want) > 1 for got, want in zip(placed, expected, strict=True)
-        ):
-            raise VideoGenieError(
-                "DEPENDENCY_UNAVAILABLE",
-                "Resolve placed the subtitles at other times; the new timeline was removed",
-                details={
-                    "expected_cues": len(expected),
-                    "placed_cues": len(placed),
-                    "expected_first_frame": expected[0],
-                    "placed_first_frame": placed[0] if placed else None,
-                },
-            )
-    except BaseException:
-        pool.DeleteTimelines([timeline])
-        raise
+    # Pass only mediaPoolItem. Resolve 21.1 ignores trackIndex and recordFrame for
+    # subtitle items (cues always follow the timeline's current end, which is why the
+    # timeline must still be empty here), and startFrame/endFrame crash Resolve.
+    if not pool.AppendToTimeline([{"mediaPoolItem": item}]):
+        raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not add the subtitles")
+    start = int(timeline.GetStartFrame())
+    expected = [start + offset for offset in cue_frames(times, fps)]
+    placed = sorted(int(cue.GetStart()) for cue in timeline.GetItemListInTrack("subtitle", 1) or [])
+    if len(placed) != len(expected) or any(
+        abs(got - want) > 1 for got, want in zip(placed, expected, strict=True)
+    ):
+        raise VideoGenieError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Resolve placed the subtitles at other times; the new timeline was removed",
+            details={
+                "expected_cues": len(expected),
+                "placed_cues": len(placed),
+                "expected_first_frame": expected[0],
+                "placed_first_frame": placed[0] if placed else None,
+            },
+        )
     # A plain append would now land after the last cue, so place every take explicitly.
     for info in infos:
         info |= {"trackIndex": 1, "recordFrame": start}
@@ -227,7 +252,9 @@ def assemble_timeline(
     subtitles = (
         None
         if request.subtitles_path is None
-        else _read_subtitles(request.subtitles_path, max(1.0, deadline - time.monotonic()))
+        else _read_subtitles(
+            request.subtitles_path, service.data_dir, max(1.0, deadline - time.monotonic())
+        )
     )
     app = resolve.connect(min(30.0, request.timeout_seconds))
     project = resolve.open_project(app, request.project_id, allow_switch=request.allow_switch)
@@ -267,32 +294,37 @@ def assemble_timeline(
     timeline = pool.CreateEmptyTimeline(name)
     if timeline is None:
         raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not create the timeline")
-    project.SetCurrentTimeline(timeline)
-    source = parse_resolution(clips[0].GetClipProperty("Resolution"))
-    timeline_fps, size = _apply_format(timeline, fps, source)
-    if subtitles is not None:
-        _place_subtitles(pool, timeline, subtitles, timeline_fps, infos)
-    appended = pool.AppendToTimeline(infos) or []
-    if not appended:
-        raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not append the takes")
-    duration = int(timeline.GetEndFrame()) - int(timeline.GetStartFrame())
-    if duration != total:
-        raise VideoGenieError(
-            "MEDIA_UNAVAILABLE",
-            "The assembled timeline length does not match the cut plans",
-            details={"expected_frames": total, "actual_frames": duration},
+    try:
+        project.SetCurrentTimeline(timeline)
+        source = parse_resolution(clips[0].GetClipProperty("Resolution"))
+        timeline_fps, size = _apply_format(timeline, fps, source)
+        if subtitles is not None:
+            _place_subtitles(pool, timeline, subtitles, timeline_fps, infos)
+        appended = pool.AppendToTimeline(infos) or []
+        if not appended:
+            raise VideoGenieError("DEPENDENCY_UNAVAILABLE", "Resolve could not append the takes")
+        duration = int(timeline.GetEndFrame()) - int(timeline.GetStartFrame())
+        if duration != total:
+            raise VideoGenieError(
+                "MEDIA_UNAVAILABLE",
+                "The assembled timeline length does not match the cut plans",
+                details={"expected_frames": total, "actual_frames": duration},
+            )
+        audio = sorted(
+            (item for item in appended if item.GetTrackTypeAndIndex()[0] == "audio"),
+            key=lambda item: item.GetStart(),
         )
-    audio = sorted(
-        (item for item in appended if item.GetTrackTypeAndIndex()[0] == "audio"),
-        key=lambda item: item.GetStart(),
-    )
-    if request.fade_frames:
-        for index, item in enumerate(audio):
-            fades = {
-                "FadeIn": request.fade_frames if index > 0 else 0,
-                "FadeOut": request.fade_frames if index < len(audio) - 1 else 0,
-            }
-            item.SetFades(fades)
+        if request.fade_frames:
+            for index, item in enumerate(audio):
+                fades = {
+                    "FadeIn": request.fade_frames if index > 0 else 0,
+                    "FadeOut": request.fade_frames if index < len(audio) - 1 else 0,
+                }
+                item.SetFades(fades)
+    except BaseException:
+        # Never leave a half-made timeline behind: a retry may reuse the same name.
+        pool.DeleteTimelines([timeline])
+        raise
     lengths = [
         end - start for info in infos for start, end in [(info["startFrame"], info["endFrame"])]
     ]
