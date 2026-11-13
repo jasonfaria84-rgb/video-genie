@@ -12,12 +12,13 @@ seven additive discovery reads, and the editing toolkit that follows them:
 `media.silence.detect`/`remove` (FFmpeg dead space; remove writes a new file and
 never overwrites), `resolve.status`, `transcript.create`/`get` (Resolve transcription
 with FFmpeg-checked gaps; kind "sound" marks audible untranscribed stretches),
-`resolve.timeline.assemble` (new timeline from cut plans; never edits an existing
-one), `resolve.render` (private render, verified, published without overwriting),
-`resolve.color.apply` (looks and bounded adjustments as CDL in a separate color
-version; LUTs only from Resolve's library), `edit.cuts.plan`/`get` (fillers, false
-starts and pauses from a transcript), `captions.create` (SRT, optional FFmpeg
-burn-in that needs libass), `render.check` (per-cut review and contact sheet), and
+`resolve.timeline.assemble` (new timeline from cut plans, optionally with an SRT on
+subtitle track 1; never edits an existing one), `resolve.render` (private render,
+verified, published without overwriting), `resolve.color.apply` (looks and bounded
+adjustments as CDL in a separate color version; LUTs only from Resolve's library),
+`edit.cuts.plan`/`get` (fillers, false starts and pauses from a transcript),
+`captions.create` (SRT, optional FFmpeg burn-in that needs libass), `render.check`
+(per-cut review and contact sheet), and
 `overlay.renderers`/`overlay.place` (renderer detection; alpha .mov or .png placed above
 the footage without overlapping existing items).
 Resolve work happens only in Resolve projects named

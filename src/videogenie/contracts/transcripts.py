@@ -149,18 +149,31 @@ class AssembleTimelineInput(ContractModel):
     the plan's SHA-256. The timeline is created in the project's own Resolve project, at the
     first take's frame rate and resolution, and an existing timeline is never edited.
     fade_frames adds audio fades at every join so cuts don't click.
+
+    subtitles_path, if given, is an absolute .srt file whose times are already in the
+    output time of this exact assembly, seconds from the timeline start: captions.create
+    with the same cut plan matches a single-take assembly. VideoGenie cannot check that the
+    text matches the takes, only that no cue ends after the assembled length. Its cues go
+    on subtitle track 1 of the new timeline, and every cue start is read back and checked.
+    Resolve can only place SRT cues at their own times on a timeline that is still empty,
+    so subtitles are added here, during assembly; for an existing timeline, import the SRT
+    in Resolve by hand.
     """
 
     project_id: Identifier
     takes: tuple[AssembleTake, ...] = Field(min_length=1, max_length=200)
     timeline_name: str | None = Field(default=None, min_length=1, max_length=200)
     fade_frames: int = Field(default=1, ge=0, le=10)
+    subtitles_path: str | None = Field(default=None, min_length=1, max_length=4096)
     allow_switch: bool = False
     timeout_seconds: float = Field(default=600, gt=0, le=7200, allow_inf_nan=False)
 
 
 class AssembledTimeline(ContractModel):
-    """The created timeline and where its cuts land, for rendering and checking."""
+    """The created timeline and where its cuts land, for rendering and checking.
+
+    subtitle_cue_count and subtitles_sha256 describe the placed SRT, or are null without one.
+    """
 
     project_id: Identifier
     resolve_project: str
@@ -173,6 +186,8 @@ class AssembledTimeline(ContractModel):
     segment_count: int = Field(ge=0)
     cut_points_seconds: tuple[Seconds, ...]
     cut_plan_ids: tuple[Identifier, ...]
+    subtitle_cue_count: int | None = Field(default=None, ge=1)
+    subtitles_sha256: Sha256 | None = None
 
 
 def output_time(plan: CutPlan, source_seconds: float) -> float | None:

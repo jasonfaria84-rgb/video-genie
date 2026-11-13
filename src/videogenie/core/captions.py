@@ -3,6 +3,7 @@
 All timing works in integer milliseconds so the same input always yields the same file.
 """
 
+import re
 from dataclasses import dataclass, replace
 
 from videogenie.contracts.transcripts import CutPlan, Transcript, output_time
@@ -174,3 +175,36 @@ def to_srt(cues: list[Cue]) -> str:
         f"{number}\n{timestamp(cue.start_ms)} --> {timestamp(cue.end_ms)}\n{cue.text}\n\n"
         for number, cue in enumerate(cues, start=1)
     )
+
+
+_SRT_TIME = re.compile(
+    r"^(\d{2,}):([0-5]\d):([0-5]\d)[,.](\d{3}) --> (\d{2,}):([0-5]\d):([0-5]\d)[,.](\d{3})"
+)
+
+
+def srt_times(text: str) -> list[tuple[int, int]]:
+    """Cue (start_ms, end_ms) pairs in file order; ValueError unless every block is well formed.
+
+    Accepts what to_srt writes plus CRLF line endings, a UTF-8 BOM and trailing cue settings.
+    """
+    blocks = [block for block in re.split(r"\n\s*\n", text.lstrip("﻿").replace("\r\n", "\n"))]
+    times: list[tuple[int, int]] = []
+    for block in (block.strip("\n") for block in blocks):
+        if not block.strip():
+            continue
+        lines = block.split("\n")
+        timing = lines[1] if len(lines) > 1 and lines[0].strip().isdecimal() else lines[0]
+        match = _SRT_TIME.match(timing.strip())
+        if match is None:
+            raise ValueError(f"cue {len(times) + 1} has no valid timing line")
+        h1, m1, s1, f1, h2, m2, s2, f2 = (int(part) for part in match.groups())
+        start = ((h1 * 60 + m1) * 60 + s1) * 1000 + f1
+        end = ((h2 * 60 + m2) * 60 + s2) * 1000 + f2
+        if end <= start:
+            raise ValueError(f"cue {len(times) + 1} ends before it starts")
+        if times and start < times[-1][0]:
+            raise ValueError(f"cue {len(times) + 1} starts before the previous cue")
+        times.append((start, end))
+    if not times:
+        raise ValueError("the file has no cues")
+    return times

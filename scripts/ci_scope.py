@@ -257,7 +257,7 @@ PATH_TESTS = {
     },
     "src/videogenie/core/cut_planning.py": {"tests/test_cut_planning.py"},
     "src/videogenie/workers/captions.py": {"tests/test_captions.py"},
-    "src/videogenie/core/captions.py": {"tests/test_captions.py"},
+    "src/videogenie/core/captions.py": {"tests/test_captions.py", "tests/test_assembly.py"},
     # Docstrings and fields are the published CLI/MCP schema.
     "src/videogenie/contracts/captions.py": TRANSPORT_TESTS,
     "src/videogenie/workers/render_check.py": {"tests/test_render_check.py"},

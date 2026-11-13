@@ -62,8 +62,9 @@ def _tool(service: VideoGenieService, operation: str, model: type[BaseModel]) ->
                 "captions.create": ("output_path", "burn_in.video_path", "burn_in.output_path"),
                 "render.check": ("rendered_path", "contact_sheet_path"),
                 "overlay.place": ("source_path",),
+                "resolve.timeline.assemble": ("subtitles_path",),
             }.get(operation, ())
-            optional = {"contact_sheet_path"}
+            optional = {"contact_sheet_path", "subtitles_path"}
             for path_field in path_fields:
                 parent_name, _, name = path_field.rpartition(".")
                 holder = raw.get(parent_name) if parent_name else raw
