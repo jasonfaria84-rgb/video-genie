@@ -67,10 +67,12 @@ from videogenie.workers.captions import (
 )
 from videogenie.workers.captions import _output_path as _caption_output
 from videogenie.workers.concat import (
+    MAX_SEGMENTS,
     Segment,
     TakeMedia,
     cdl_filter,
     cut_points,
+    output_picture,
     probe_take,
     render_takes,
     segments_for,
@@ -419,6 +421,11 @@ class _Run:
             )
             try:
                 outcome = handlers[name]()
+                if isinstance(outcome, _Skip):
+                    self.update(name, status="skipped", reason=outcome.reason, finished_at=_now())
+                else:
+                    self.update(name, status="done", result=outcome, finished_at=_now())
+                continue
             except VideoGenieError as exc:
                 error = StepError(code=exc.code, message=exc.message, details=exc.details)
             except OSError:
@@ -429,12 +436,8 @@ class _Run:
                     message="The step failed unexpectedly; preserve the workflow ID for review",
                     details={"exception": type(exc).__name__},
                 )
-            else:
-                if isinstance(outcome, _Skip):
-                    self.update(name, status="skipped", reason=outcome.reason, finished_at=_now())
-                else:
-                    self.update(name, status="done", result=outcome, finished_at=_now())
-                continue
+            # A failed save of the finished step lands here too; record it if at all possible.
+            # Partial results (finished takes, a publish intent) stay on the step.
             self.update(name, status="failed", error=error, finished_at=_now())
             self._save(status="failed")
             return self.record
@@ -597,20 +600,32 @@ class _Run:
             raise VideoGenieError(
                 "MEDIA_UNAVAILABLE", "Takes mix video files and audio-only files; use one kind"
             )
-        rate = media[0].frame_rate
+        kept = [
+            [(k.start_seconds, k.end_seconds) for k in plans[index].kept]
+            if plans
+            else [(0.0, item.usable_seconds)]
+            for index, item in enumerate(media)
+        ]
+        # One output picture for assembly and render: the first take that keeps a frame.
+        picture = output_picture(media, kept) if media[0].has_video else None
+        rate = None if picture is None else picture[2]
         segments: list[Segment] = []
         for index, item in enumerate(media):
-            if plans:
-                kept = [(k.start_seconds, k.end_seconds) for k in plans[index].kept]
-            else:
-                kept = [(0.0, item.usable_seconds)]
-            segments += segments_for(index, kept, item.usable_seconds, rate)
+            segments += segments_for(index, kept[index], item.usable_seconds, rate)
         if not segments:
             raise VideoGenieError("INVALID_ARGUMENT", "The takes keep nothing to assemble")
+        if len(segments) > MAX_SEGMENTS:
+            raise VideoGenieError(
+                "INVALID_ARGUMENT",
+                "Too many kept segments for one local render; raise cuts.min_pause_seconds",
+                details={"segments": len(segments), "limit": MAX_SEGMENTS},
+            )
         return {
             "backend": "ffmpeg",
             "timeline_name": None,
             "frame_rate": None if rate is None else f"{rate.numerator}/{rate.denominator}",
+            "width": None if picture is None else picture[0],
+            "height": None if picture is None else picture[1],
             "whole_takes": not plans,
             "source_sha256": list(digests),
             "duration_seconds": round(sum(segment.seconds for segment in segments), 3),
@@ -664,6 +679,9 @@ class _Run:
             )
             self.link(render_path=rendered.path)
             return {"backend": "resolve", **rendered.model_dump(mode="json")}
+        adopted = self._adopt_render()
+        if adopted is not None:
+            return adopted
         sources = [Path(take) for take in self.record.takes]
         expected = _strings(self.result("assemble").get("source_sha256"))
         media: list[TakeMedia] = []
@@ -679,8 +697,33 @@ class _Run:
         color = None
         if settings is not None and self.done("color"):
             color = cdl_filter(look_cdl(settings.look, settings.adjustments))
+        assembly = self.result("assemble")
+        width, height, rate = (
+            assembly.get("width"),
+            assembly.get("height"),
+            assembly.get("frame_rate"),
+        )
+        picture = None
+        if isinstance(width, int) and isinstance(height, int) and isinstance(rate, str):
+            picture = (width, height, Fraction(rate))
+
+        def intent(sha256: str, size: int) -> None:
+            # Saved before the file is moved into place, so a crash right after publishing
+            # can be recognised on resume by this digest.
+            self.update(
+                "render",
+                result={"publishing": str(self.output), "sha256": sha256, "size": size},
+            )
+
         rendered_takes = render_takes(
-            sources, media, self.segments(), self.output, color=color, deadline=self.deadline
+            sources,
+            media,
+            self.segments(),
+            self.output,
+            picture=picture,
+            color=color,
+            deadline=self.deadline,
+            before_publish=intent,
         )
         self.link(render_path=rendered_takes.path)
         return {
@@ -689,10 +732,52 @@ class _Run:
             "sha256": rendered_takes.sha256,
             "size": rendered_takes.size,
             "duration_seconds": rendered_takes.duration_seconds,
-            "expected_duration_seconds": self.result("assemble").get("duration_seconds"),
+            "expected_duration_seconds": assembly.get("duration_seconds"),
             "color_filter": color,
             "ffmpeg_version": rendered_takes.ffmpeg_version,
         }
+
+    def _adopt_render(self) -> StepOutcome | None:
+        """Keep a local render published by an earlier attempt that stopped before saving.
+
+        Only a file at output_path whose SHA-256 equals the digest recorded just before
+        publishing is adopted; anything else is left alone and the render reports it.
+        """
+        prior = self.result("render")
+        digest = prior.get("sha256")
+        if prior.get("publishing") != str(self.output) or not isinstance(digest, str):
+            return None
+        if not self.output.is_file():
+            return None
+        found = fingerprint(self.output, self.remaining(3600))
+        if found.sha256 != digest:
+            return None
+        measured = probe_take(self.output, self.deadline)
+        self.link(render_path=str(self.output))
+        return {
+            "backend": "ffmpeg",
+            "path": str(self.output),
+            "sha256": found.sha256,
+            "size": found.size,
+            "duration_seconds": round(measured.duration, 3),
+            "expected_duration_seconds": self.result("assemble").get("duration_seconds"),
+            "adopted": True,
+        }
+
+    def _verified_render(self) -> Path:
+        """The rendered output, refused if it changed since the render step recorded it."""
+        rendered = self.record.links.render_path
+        digest = self.result("render").get("sha256")
+        if rendered is None or not isinstance(digest, str):
+            raise VideoGenieError("NOT_FOUND", "No render to use")
+        path = Path(rendered)
+        if fingerprint(path, self.remaining(3600)).sha256 != digest:
+            raise VideoGenieError(
+                "INPUT_CHANGED",
+                "The rendered output changed since the render step; start a new workflow",
+                details={"path": rendered},
+            )
+        return path
 
     def _captions(self) -> StepOutcome:
         settings = self.request.captions
@@ -732,10 +817,16 @@ class _Run:
         ffmpeg = ""
         burn_note: str | None = None
         burn_deadline = self.deadline
+        has_video = (
+            self.record.backend == "resolve"
+            or self.result("assemble").get("frame_rate") is not None
+        )
         if settings.burn and not self.done("render"):
             burn_note = "burn-in skipped: render was skipped"
+        elif settings.burn and not has_video:
+            burn_note = "burn-in skipped: the takes have no video"
         elif settings.burn:
-            video = Path(self.record.output_path)
+            video = self._verified_render()
             video_output = _caption_output(
                 str(captioned_path(self.output)), VIDEO_SUFFIXES, {video, srt_output}
             )
@@ -776,9 +867,7 @@ class _Run:
         }
 
     def _check(self) -> StepOutcome:
-        rendered = self.record.links.render_path
-        if rendered is None:
-            raise VideoGenieError("NOT_FOUND", "No render to check")
+        rendered = str(self._verified_render())
         assembly = self.result("assemble")
         points = _floats(assembly.get("cut_points_seconds"))
         has_video = self.record.backend == "resolve" or assembly.get("frame_rate") is not None

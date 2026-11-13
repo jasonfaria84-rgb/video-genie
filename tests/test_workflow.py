@@ -1,10 +1,13 @@
 """Folder to final video: ordered steps, resume after failure, skips, backends and links."""
 
+import hashlib
 import io
 import json
 import shutil
 import subprocess
 import sys
+import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +27,15 @@ from videogenie.core.assembly import source_frames
 from videogenie.core.color import look_cdl
 from videogenie.core.service import VideoGenieService
 from videogenie.core.transcription import create_transcript
-from videogenie.workers.concat import cdl_filter
+from videogenie.workers.concat import (
+    TakeMedia,
+    cdl_filter,
+    concat_graph,
+    output_picture,
+    probe_take,
+    render_takes,
+    segments_for,
+)
 from videogenie.workers.render_check import check_render
 
 # Speech is a tone; "um" sits between two words, then the take ends in silence.
@@ -252,10 +263,18 @@ def test_failed_step_is_recorded_and_resume_skips_finished_work(
     assert caught.value.code == "INVALID_ARGUMENT" and caught.value.details == {"field": "backend"}
 
     monkeypatch.setattr(workflow, "check_render", check_render)
+    # A render that changed since the render step is refused, not checked.
+    output = Path(failed.output_path)
+    original = output.read_bytes()
+    output.write_bytes(original + b"tampered")
+    changed = run(service, {**request, "resume_workflow_id": failed.workflow_id})
+    error = changed.steps[-1].error
+    assert changed.status == "failed" and error is not None and error.code == "INPUT_CHANGED"
+    output.write_bytes(original)
     resumed = run(service, {**request, "resume_workflow_id": failed.workflow_id})
     assert resumed.status == "done" and resumed.workflow_id == failed.workflow_id
     assert (len(transcribed), len(planned), len(rendered)) == (2, 2, 1)
-    assert resumed.steps[0].attempts == 1 and resumed.steps[-1].attempts == 2
+    assert resumed.steps[0].attempts == 1 and resumed.steps[-1].attempts == 3
     assert resumed.steps[-1].error is None and resumed.links.review is not None
     assert resumed.links.captions_path is not None
     again = run(service, {"project_id": project_id, "resume_workflow_id": failed.workflow_id})
@@ -409,7 +428,7 @@ def test_resolve_backend_records_the_timeline(
             timeline_name=request.timeline_name,
             preset=request.preset,
             path=request.output_path,
-            sha256="0" * 64,
+            sha256=hashlib.sha256(Path(request.output_path).read_bytes()).hexdigest(),
             size=1,
             duration_seconds=CLIP_SECONDS,
             expected_duration_seconds=CLIP_SECONDS,
@@ -528,3 +547,207 @@ def test_cli_anchors_relative_paths_and_lock_blocks_a_second_runner(
         with pytest.raises(VideoGenieError) as caught:
             run(service, {"project_id": project_id, "resume_workflow_id": data["workflow_id"]})
     assert caught.value.code == "LEASE_HELD"
+
+
+def media(width: int, height: int, rate: Fraction, seconds: float = 4.0) -> TakeMedia:
+    return TakeMedia(
+        duration=seconds,
+        usable_seconds=seconds,
+        has_audio=True,
+        has_video=True,
+        width=width,
+        height=height,
+        frame_rate=rate,
+    )
+
+
+def test_output_picture_comes_from_the_first_take_that_keeps_something() -> None:
+    takes = [media(1280, 720, Fraction(24)), media(1920, 1080, Fraction(30))]
+    kept: list[list[tuple[float, float]]] = [[], [(0.5, 2.0)]]
+    picture = output_picture(takes, kept)
+    assert picture == (1920, 1080, Fraction(30))
+    segments = segments_for(1, kept[1], 4.0, Fraction(30))
+    assert [(s.start_frame, s.end_frame) for s in segments] == [(15, 60)]
+    graph = concat_graph(
+        takes, segments, video=True, size=(1920, 1080), frame_rate=Fraction(30), color=None
+    )
+    # Every used take is retimed (even at the same nominal rate), then trimmed by time
+    # half a frame early, and audio is trimmed at the same source seconds.
+    assert "[1:v:0]fps=30/1,setsar=1,split=1[vs0]" in graph and "[0:v:0]" not in graph
+    assert "trim=start=0.483333:end=1.983333" in graph
+    assert "atrim=start=0.500000:end=2.000000" in graph
+    assert output_picture([media(1280, 720, Fraction(24))], [[]]) is None
+
+
+def test_variable_frame_rate_take_stays_in_sync(tmp_path: Path) -> None:
+    """Picture and sound switch together at 2.0 s in a phone-style clip with a frame gap."""
+    clip = tmp_path / "vfr.mp4"
+    subprocess.run(
+        [ffmpeg(), "-v", "error", "-f", "lavfi", "-i"]
+        + [
+            "color=black:s=64x64:r=30:d=4,geq=lum='if(gte(T,2),235,16)':cb=128:cr=128,"
+            "select='not(between(t,0.5,0.999))'",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc='if(gte(t,2),0.5*sin(2*PI*440*t),0)':s=48000:d=4",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(clip),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    deadline = time.monotonic() + 120
+    take = probe_take(clip, deadline)
+    assert take.frame_rate is not None and take.frame_rate != 30  # really variable
+    segments = segments_for(0, [(1.5, 3.0)], take.usable_seconds, take.frame_rate)
+    output = tmp_path / "cut.mp4"
+    picture = (64, 64, take.frame_rate)
+    render_takes([clip], [take], segments, output, picture=picture, color=None, deadline=deadline)
+    frames = subprocess.run(
+        [ffmpeg(), "-v", "error", "-i", str(output), "-vf", "scale=1:1,format=gray"]
+        + ["-f", "rawvideo", "-"],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    ).stdout
+    video_at = next(i for i, value in enumerate(frames) if value > 128) / float(take.frame_rate)
+    samples = subprocess.run(
+        [ffmpeg(), "-v", "error", "-i", str(output), "-ac", "1", "-ar", "48000"]
+        + ["-f", "s16le", "-"],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    ).stdout
+    levels = [
+        abs(int.from_bytes(samples[i : i + 2], "little", signed=True))
+        for i in range(0, len(samples), 2)
+    ]
+    audio_at = next(i for i, value in enumerate(levels) if value > 3000) / 48000
+    expected = 2.0 - segments[0].start_seconds
+    assert audio_at == pytest.approx(expected, abs=0.01)
+    assert video_at == pytest.approx(expected, abs=1.5 / float(take.frame_rate))
+
+
+def test_audio_only_takes_skip_color_and_burn_in(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
+) -> None:
+    service, project_id, root = studio
+    monkeypatch.setattr(
+        workflow, "_require_subtitles_filter", lambda *a: pytest.fail("no burn without video")
+    )
+    folder = root / "audio"
+    folder.mkdir()
+    for name, frequency in (("a.m4a", 300), ("b.wav", 500)):
+        subprocess.run(
+            [ffmpeg(), "-v", "error", "-f", "lavfi", "-i"]
+            + [f"aevalsrc='if({TONE},0.4*sin(2*PI*{frequency}*t),0)':s=48000:d=4"]
+            + [str(folder / name)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    record = run(
+        service,
+        {
+            "project_id": project_id,
+            "folder": str(folder),
+            "output_path": str(root / "out" / "audio.mp4"),
+            "backend": "ffmpeg",
+            "color": {"look": "mono"},
+            "captions": {"burn": True},
+        },
+    )
+    assert record.status == "done", record.steps
+    assert record.steps[3].reason == "the takes have no video to grade"
+    captions = record.steps[5].result or {}
+    assert captions["note"] == "burn-in skipped: the takes have no video"
+    assert record.links.captions_path is not None and record.links.captioned_video_path is None
+    review = record.links.review
+    assert review is not None and review.contact_sheet_path is None
+
+
+def test_published_render_is_adopted_after_a_crash(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
+) -> None:
+    service, project_id, root = studio
+
+    def crash_after_publish(*args: Any, **kwargs: Any) -> Any:
+        render_takes(*args, **kwargs)
+        raise RuntimeError("process died before the record was saved")
+
+    monkeypatch.setattr(workflow, "render_takes", crash_after_publish)
+    request: dict[str, JsonValue] = {
+        "project_id": project_id,
+        "folder": str(root / "takes"),
+        "output_path": str(root / "out" / "adopt.mp4"),
+        "backend": "ffmpeg",
+        "skip": ["transcribe"],
+        "check": {"contact_sheet": False},
+    }
+    failed = run(service, request)
+    render = failed.steps[4]
+    assert render.status == "failed" and render.error is not None
+    assert render.error.code == "INTERNAL_ERROR" and render.result is not None
+    assert render.result["publishing"] == failed.output_path
+    assert Path(failed.output_path).is_file() and failed.links.render_path is None
+    monkeypatch.setattr(workflow, "render_takes", lambda *a, **k: pytest.fail("render again"))
+    resumed = run(service, {"project_id": project_id, "resume_workflow_id": failed.workflow_id})
+    assert resumed.status == "done"  # without rendering again
+    result = resumed.steps[4].result or {}
+    assert result["adopted"] is True and result["sha256"] == render.result["sha256"]
+    assert resumed.links.render_path == failed.output_path and resumed.links.review is not None
+
+
+def test_a_failed_save_is_recorded_and_too_many_segments_are_refused(
+    monkeypatch: pytest.MonkeyPatch, studio: tuple[VideoGenieService, str, Path]
+) -> None:
+    service, project_id, root = studio
+    transcribed = counting(monkeypatch, "create_transcript")
+    real_save = workflow.save
+    broken: list[int] = []
+
+    def save_fails_once(service: VideoGenieService, record: WorkflowRecord) -> None:
+        if record.steps[0].status == "done" and not broken:
+            broken.append(1)
+            raise OSError("disk full")
+        real_save(service, record)
+
+    monkeypatch.setattr(workflow, "save", save_fails_once)
+    request: dict[str, JsonValue] = {
+        "project_id": project_id,
+        "folder": str(root / "takes"),
+        "output_path": str(root / "out" / "save.mp4"),
+        "backend": "ffmpeg",
+        "skip": ["plan_cuts", "assemble"],
+    }
+    failed = run(service, request)
+    first = failed.steps[0]
+    assert failed.status == "failed" and first.status == "failed" and first.error is not None
+    assert first.error.code == "ACCESS_DENIED" and len(failed.links.transcript_ids) == 2
+    assert workflow.load(service, failed.workflow_id) == failed
+    resumed = run(service, {"project_id": project_id, "resume_workflow_id": failed.workflow_id})
+    assert resumed.status == "done" and len(transcribed) == 2
+
+    monkeypatch.setattr(workflow, "MAX_SEGMENTS", 1)
+    many = run(
+        service,
+        {
+            "project_id": project_id,
+            "folder": str(root / "takes"),
+            "output_path": str(root / "out" / "many.mp4"),
+            "backend": "ffmpeg",
+            "skip": ["transcribe"],
+        },
+    )
+    assemble = many.steps[2]
+    assert many.status == "failed" and assemble.error is not None
+    assert assemble.error.code == "INVALID_ARGUMENT" and assemble.error.details["limit"] == 1

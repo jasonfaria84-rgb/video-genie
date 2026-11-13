@@ -11,6 +11,7 @@ import math
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -194,6 +195,22 @@ def segments_for(
     return segments
 
 
+def output_picture(
+    inputs: list[TakeMedia], kept: list[list[tuple[float, float]]]
+) -> tuple[int, int, Fraction] | None:
+    """Width, height and frame rate of the first take that keeps at least one frame.
+
+    Every take is trimmed, sized and retimed to this one picture, so assembly and the
+    render must both use it. None when the takes have no video.
+    """
+    for take, (media, ranges) in enumerate(zip(inputs, kept, strict=True)):
+        if media.width is None or media.height is None or media.frame_rate is None:
+            continue
+        if segments_for(take, ranges, media.usable_seconds, media.frame_rate):
+            return media.width, media.height, media.frame_rate
+    return None
+
+
 def cut_points(segments: list[Segment]) -> list[float]:
     """Output times of every join, for render.check."""
     points: list[float] = []
@@ -238,7 +255,13 @@ def concat_graph(
     color: str | None,
     fade: float = FADE_SECONDS,
 ) -> str:
-    """One filtergraph: per take normalise, split and trim; fade every join; concat; grade."""
+    """One filtergraph: per take normalise, split and trim; fade every join; concat; grade.
+
+    Every video take first goes through fps=<frame_rate>, which places frames on a
+    constant grid at their source times (variable frame rate phone footage included),
+    then video is trimmed by time half a frame early, which selects exactly the frames
+    start_frame..end_frame-1 while audio is trimmed at the same source seconds.
+    """
     parts: list[str] = []
     labels: list[str] = []
     for take, media in enumerate(inputs):
@@ -255,8 +278,7 @@ def concat_graph(
                     f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
                 )
-            if media.frame_rate != frame_rate:
-                chain.append(f"fps={frame_rate.numerator}/{frame_rate.denominator}")
+            chain.append(f"fps={frame_rate.numerator}/{frame_rate.denominator}")
             chain.append("setsar=1")
             outs = "".join(f"[vs{index}]" for index in mine)
             parts.append(f"[{take}:v:0]{','.join(chain)},split={count}{outs}")
@@ -268,9 +290,11 @@ def concat_graph(
     last = len(segments) - 1
     for index, segment in enumerate(segments):
         if video:
+            assert frame_rate is not None
+            half = 0.5 / float(frame_rate)
             parts.append(
-                f"[vs{index}]trim=start_frame={segment.start_frame}:end_frame={segment.end_frame},"
-                f"setpts=PTS-STARTPTS[v{index}]"
+                f"[vs{index}]trim=start={max(0.0, segment.start_seconds - half):.6f}"
+                f":end={segment.end_seconds - half:.6f},setpts=PTS-STARTPTS[v{index}]"
             )
         audio = (
             f"[as{index}]atrim=start={segment.start_seconds:.6f}:end={segment.end_seconds:.6f},"
@@ -298,10 +322,17 @@ def render_takes(
     segments: list[Segment],
     output: Path,
     *,
+    picture: tuple[int, int, Fraction] | None,
     color: str | None,
     deadline: float,
+    before_publish: Callable[[str, int], None] | None = None,
 ) -> RenderedTakes:
-    """Render the segments in order to output, which must not exist; verify, then publish."""
+    """Render the segments in order to output, which must not exist; verify, then publish.
+
+    picture is the (width, height, frame rate) chosen at assembly, or None for audio
+    only. before_publish receives the finished file's SHA-256 and size just before it is
+    moved into place, so a caller can record what it is about to publish.
+    """
     if not segments:
         raise VideoGenieError("INVALID_ARGUMENT", "The takes keep nothing to render")
     if len(segments) > MAX_SEGMENTS:
@@ -319,18 +350,14 @@ def render_takes(
             "MEDIA_UNAVAILABLE", "Takes mix video files and audio-only files; use one kind"
         )
     video = kinds.pop()
-    first = inputs[used[0]]
-    size: tuple[int, int] | None = None
-    if video:
-        if first.width is None or first.height is None or first.frame_rate is None:
-            raise VideoGenieError("MEDIA_UNAVAILABLE", "The first take has no usable picture")
-        size = (first.width, first.height)
+    if video != (picture is not None):
+        raise VideoGenieError("INVALID_ARGUMENT", "The output picture does not match the takes")
     graph = concat_graph(
         inputs,
         segments,
         video=video,
-        size=size,
-        frame_rate=first.frame_rate if video else None,
+        size=None if picture is None else (picture[0], picture[1]),
+        frame_rate=None if picture is None else picture[2],
         color=color if video else None,
     )
     ffmpeg, ffmpeg_version = _tool("ffmpeg", deadline)
@@ -409,6 +436,8 @@ def render_takes(
                 details={"expected": round(expected, 3), "measured": round(measured, 3)},
             )
         written = fingerprint(partial, _left(deadline))
+        if before_publish is not None:
+            before_publish(written.sha256, written.size)
         current = output.stat()
         if (current.st_dev, current.st_ino) != reserved or current.st_size != 0:
             raise VideoGenieError("INPUT_CHANGED", "output_path changed during the render")
